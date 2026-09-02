@@ -1925,11 +1925,15 @@ async def rankingsp(
     user="Which Discord member?",
     rank="Which position?"
 )
+@app_commands.choices(
+    weight=WEIGHT_CHOICES,
+    rank=RANK_CHOICES
+)
 async def rankingsu(
     interaction: discord.Interaction,
-    weight: str,
+    weight: app_commands.Choice[str],
     user: discord.Member,
-    rank: int
+    rank: app_commands.Choice[int]
 ):
 
     if not is_admin(interaction):
@@ -1946,17 +1950,13 @@ async def rankingsu(
         )
         return
 
-    if weight not in WEIGHTS:
-        await interaction.response.send_message(
-            "❌ Invalid ranking division.",
-            ephemeral=True
-        )
-        return
+    weight_value = weight.value
+    rank_value = rank.value
 
     # P4P cannot have champion.
-    if weight == P4P_WEIGHT:
+    if weight_value == P4P_WEIGHT:
 
-        if rank < 1 or rank > 15:
+        if rank_value < 1 or rank_value > 15:
             await interaction.response.send_message(
                 "❌ P4P only uses ranks **#1-#15**.",
                 ephemeral=True
@@ -1965,7 +1965,7 @@ async def rankingsu(
 
     else:
 
-        if rank < 0 or rank > 15:
+        if rank_value < 0 or rank_value > 15:
             await interaction.response.send_message(
                 "❌ Rank must be **Champion or #1-#15**.",
                 ephemeral=True
@@ -1980,36 +1980,33 @@ async def rankingsu(
 
         old_weight = update_ranking(
             interaction.guild.id,
-            weight,
+            weight_value,
             user.id,
-            rank
+            rank_value
         )
 
-        # Refresh target ranking.
         await refresh_ranking_message(
             interaction.guild,
-            weight
+            weight_value
         )
 
-        # If moved from another division,
-        # refresh the old division too.
-        if old_weight and old_weight != weight:
+        if old_weight and old_weight != weight_value:
 
             await refresh_ranking_message(
                 interaction.guild,
                 old_weight
             )
 
-        if weight == P4P_WEIGHT:
-            position_text = f"#{rank}"
-        elif rank == 0:
+        if weight_value == P4P_WEIGHT:
+            position_text = f"#{rank_value}"
+        elif rank_value == 0:
             position_text = "Champion"
         else:
-            position_text = f"#{rank}"
+            position_text = f"#{rank_value}"
 
         await interaction.followup.send(
             f"✅ **{user.display_name}** has been placed at "
-            f"**{position_text}** in **{weight}**.",
+            f"**{position_text}** in **{weight_value}**.",
             ephemeral=True
         )
 
