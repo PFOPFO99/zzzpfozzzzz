@@ -1953,7 +1953,6 @@ async def rankingsu(
     weight_value = weight.value
     rank_value = rank.value
 
-    # P4P cannot have champion.
     if weight_value == P4P_WEIGHT:
 
         if rank_value < 1 or rank_value > 15:
@@ -1991,7 +1990,6 @@ async def rankingsu(
         )
 
         if old_weight and old_weight != weight_value:
-
             await refresh_ranking_message(
                 interaction.guild,
                 old_weight
@@ -2020,7 +2018,6 @@ async def rankingsu(
             "❌ Something went wrong while updating the rankings.",
             ephemeral=True
         )
-
 
 # ============================================================
 # /RANKINGSR
