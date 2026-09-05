@@ -2035,7 +2035,7 @@ for number in range(1, 16):
 
 @bot.tree.command(
     name="rankingsp",
-    description="Create the PFO ranking boards."
+    description="Create or refresh the PFO ranking boards."
 )
 async def rankingsp(
     interaction: discord.Interaction
@@ -2050,88 +2050,136 @@ async def rankingsp(
 
         return
 
-    await interaction.response.send_message(
-        "Creating PFO ranking boards..."
-    )
+    await interaction.response.defer()
 
+    created = 0
+    updated = 0
+    failed = 0
+
+    # Always use the channel where /rankingsp is run.
+    # Ranking DATA in SQLite is not deleted by this command.
     for weight in WEIGHTS.keys():
 
-        existing = get_ranking_message(
+        embed = create_ranking_embed(
             interaction.guild.id,
             weight
         )
 
-        # ----------------------------------------------------
-        # Try saved message first.
-        # ----------------------------------------------------
+        try:
 
-        if existing:
-
-            success = await refresh_ranking_message(
-                interaction.guild,
+            saved = get_ranking_message(
+                interaction.guild.id,
                 weight
             )
 
-            if success:
+            # Use the saved message only when it belongs to
+            # the current channel.
+            if saved and saved["channel_id"] == interaction.channel.id:
 
-                continue
+                try:
 
-        # ----------------------------------------------------
-        # Search channel for an existing ranking box.
-        # ----------------------------------------------------
+                    message = await interaction.channel.fetch_message(
+                        saved["message_id"]
+                    )
 
-        existing_message = (
-            await find_existing_ranking_message(
+                    await message.edit(
+                        embed=embed,
+                        allowed_mentions=discord.AllowedMentions(
+                            users=True
+                        )
+                    )
+
+                    updated += 1
+                    continue
+
+                except discord.NotFound:
+
+                    # Old message was deleted; create a replacement.
+                    pass
+
+                except discord.Forbidden as error:
+
+                    print(
+                        f"Forbidden editing {weight}: {error}"
+                    )
+
+                    failed += 1
+                    continue
+
+            # Search this channel for an existing board before
+            # creating a duplicate.
+            existing_message = await find_existing_ranking_message(
                 interaction.channel,
                 weight
             )
-        )
 
-        if existing_message:
+            if existing_message:
 
-            save_ranking_message(
-                interaction.guild.id,
-                weight,
-                interaction.channel.id,
-                existing_message.id
-            )
+                await existing_message.edit(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True
+                    )
+                )
 
-            await existing_message.edit(
-                embed=create_ranking_embed(
+                save_ranking_message(
                     interaction.guild.id,
-                    weight
-                ),
+                    weight,
+                    interaction.channel.id,
+                    existing_message.id
+                )
+
+                updated += 1
+                continue
+
+            # No board exists in this channel, so create it.
+            message = await interaction.channel.send(
+                embed=embed,
                 allowed_mentions=discord.AllowedMentions(
                     users=True
                 )
             )
 
-            continue
-
-        # ----------------------------------------------------
-        # Create a new message only if none exists.
-        # ----------------------------------------------------
-
-        message = await interaction.channel.send(
-            embed=create_ranking_embed(
+            save_ranking_message(
                 interaction.guild.id,
-                weight
+                weight,
+                interaction.channel.id,
+                message.id
+            )
+
+            created += 1
+
+        except Exception as error:
+
+            print(
+                f"/rankingsp error for {weight}: "
+                f"{type(error).__name__}: {error}"
+            )
+
+            failed += 1
+
+    if failed:
+
+        await interaction.edit_original_response(
+            content=(
+                "⚠️ **PFO Rankings finished with some errors.**\n\n"
+                f"🆕 Created: **{created}**\n"
+                f"🔄 Updated: **{updated}**\n"
+                f"❌ Failed: **{failed}**\n\n"
+                "Check the Railway deploy logs for the exact error."
             )
         )
 
-        save_ranking_message(
-            interaction.guild.id,
-            weight,
-            interaction.channel.id,
-            message.id
-        )
+    else:
 
-    await interaction.edit_original_response(
-        content=(
-            "✅ **PFO Rankings have been created!**\n\n"
-            "The ranking boards are now ready."
+        await interaction.edit_original_response(
+            content=(
+                "✅ **PFO Rankings are ready!**\n\n"
+                f"🆕 Created: **{created}**\n"
+                f"🔄 Updated: **{updated}**\n\n"
+                "All ranking boards are in this channel."
+            )
         )
-    )
 
 
 # ============================================================
