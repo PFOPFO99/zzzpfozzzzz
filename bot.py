@@ -1405,11 +1405,34 @@ async def create_ranking_embed(
                 f"**#{rank}** Vacant ▫️"
             )
 
-    embed.add_field(
-        name="Rankings",
-        value="\n".join(lines),
-        inline=False
-    )
+    # Discord limits each embed field value to 1024 characters.
+    # Split the rankings across fields if the fighter names/links make
+    # the full list too long.
+    current_lines = []
+    current_length = 0
+
+    for line in lines:
+        line_length = len(line)
+        extra_length = line_length + (1 if current_lines else 0)
+
+        if current_lines and current_length + extra_length > 1024:
+            embed.add_field(
+                name="Rankings" if len(embed.fields) == 1 else "\u200b",
+                value="\n".join(current_lines),
+                inline=False
+            )
+            current_lines = []
+            current_length = 0
+
+        current_lines.append(line)
+        current_length += line_length + (1 if len(current_lines) > 1 else 0)
+
+    if current_lines:
+        embed.add_field(
+            name="Rankings" if len(embed.fields) == 1 else "\u200b",
+            value="\n".join(current_lines),
+            inline=False
+        )
 
     embed.set_footer(
         text=(
