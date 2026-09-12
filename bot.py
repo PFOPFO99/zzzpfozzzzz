@@ -52,6 +52,7 @@ P4P_WEIGHT = "P4P"
 # ============================================================
 
 intents = discord.Intents.default()
+intents.members = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -920,15 +921,11 @@ async def signuppaste(
         return
 
     # --------------------------------------------------------
-    # BUILD REAL DISCORD @ MENTIONS
+    # BUILD CLICKABLE SERVER DISPLAY NAMES
     #
-    # <@USER_ID>
-    #
-    # Discord turns this into:
-    #
-    # @Username
-    #
-    # even if their Discord display name changes.
+    # We resolve the member from this server so the current
+    # server display name/nickname is shown. The name links
+    # directly to their Discord profile.
     # --------------------------------------------------------
 
     lines = []
@@ -937,9 +934,22 @@ async def signuppaste(
         signups,
         start=1
     ):
+        member = await get_server_member(
+            interaction.guild,
+            signup["discord_user_id"]
+        )
+
+        if member:
+            fighter_name = member.display_name
+            fighter_link = (
+                f"[{fighter_name}]"
+                f"(https://discord.com/users/{member.id})"
+            )
+        else:
+            fighter_link = "Unknown Fighter"
 
         lines.append(
-            f"**{number}.** <@{signup['discord_user_id']}>"
+            f"**{number}.** {fighter_link}"
         )
 
     embed = discord.Embed(
@@ -954,15 +964,8 @@ async def signuppaste(
         text=f"Total Sign-Ups: {len(signups)}"
     )
 
-    # --------------------------------------------------------
-    # Allow Discord to process the mentions.
-    # --------------------------------------------------------
-
     await interaction.response.send_message(
-        embed=embed,
-        allowed_mentions=discord.AllowedMentions(
-            users=True
-        )
+        embed=embed
     )
 
 
@@ -1226,6 +1229,25 @@ async def find_existing_ranking_message(
 # RANKING DISPLAY
 # ============================================================
 
+async def get_server_member(
+    guild: discord.Guild,
+    user_id: int
+):
+    member = guild.get_member(user_id)
+
+    if member:
+        return member
+
+    try:
+        return await guild.fetch_member(user_id)
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+        return None
+
+
 def movement_icon(
     movement: int
 ):
@@ -1241,13 +1263,13 @@ def movement_icon(
     return "▫️"
 
 
-def create_ranking_embed(
-    guild_id: int,
+async def create_ranking_embed(
+    guild: discord.Guild,
     weight: str
 ):
 
     rankings = get_division_rankings(
-        guild_id,
+        guild.id,
         weight
     )
 
@@ -1261,7 +1283,6 @@ def create_ranking_embed(
     # ========================================================
 
     if weight == P4P_WEIGHT:
-
         embed = discord.Embed(
             title="🏆 PFO P4P RANKINGS",
             color=discord.Color.red()
@@ -1270,21 +1291,32 @@ def create_ranking_embed(
         lines = []
 
         for rank in range(1, 16):
-
             row = ranking_dict.get(
                 rank
             )
 
             if row:
+                member = await get_server_member(
+                    guild,
+                    row["discord_user_id"]
+                )
+
+                if member:
+                    fighter_name = member.display_name
+                    fighter_link = (
+                        f"[@{fighter_name}]"
+                        f"(https://discord.com/users/{member.id})"
+                    )
+                else:
+                    fighter_link = "Unknown Fighter"
 
                 lines.append(
                     f"**#{rank}** "
-                    f"<@{row['discord_user_id']}> "
+                    f"{fighter_link} "
                     f"{movement_icon(row['movement'])}"
                 )
 
             else:
-
                 lines.append(
                     f"**#{rank}** Vacant ▫️"
                 )
@@ -1319,13 +1351,19 @@ def create_ranking_embed(
     )
 
     if champion:
-
-        champion_text = (
-            f"🏆 <@{champion['discord_user_id']}>"
+        member = await get_server_member(
+            guild,
+            champion["discord_user_id"]
         )
 
+        if member:
+            champion_text = (
+                f"🏆 [@{member.display_name}]"
+                f"(https://discord.com/users/{member.id})"
+            )
+        else:
+            champion_text = "🏆 Unknown Fighter"
     else:
-
         champion_text = "🏆 Vacant"
 
     embed.add_field(
@@ -1337,21 +1375,32 @@ def create_ranking_embed(
     lines = []
 
     for rank in range(1, 16):
-
         row = ranking_dict.get(
             rank
         )
 
         if row:
+            member = await get_server_member(
+                guild,
+                row["discord_user_id"]
+            )
+
+            if member:
+                fighter_name = member.display_name
+                fighter_link = (
+                    f"[{fighter_name}]"
+                    f"(https://discord.com/users/{member.id})"
+                )
+            else:
+                fighter_link = "Unknown Fighter"
 
             lines.append(
                 f"**#{rank}** "
-                f"<@{row['discord_user_id']}> "
+                f"{fighter_link} "
                 f"{movement_icon(row['movement'])}"
             )
 
         else:
-
             lines.append(
                 f"**#{rank}** Vacant ▫️"
             )
@@ -2035,7 +2084,7 @@ for number in range(1, 16):
 
 @bot.tree.command(
     name="rankingsp",
-    description="Create or refresh the PFO ranking boards."
+    description="Create the PFO ranking boards."
 )
 async def rankingsp(
     interaction: discord.Interaction
@@ -2050,136 +2099,88 @@ async def rankingsp(
 
         return
 
-    await interaction.response.defer()
+    await interaction.response.send_message(
+        "Creating PFO ranking boards..."
+    )
 
-    created = 0
-    updated = 0
-    failed = 0
-
-    # Always use the channel where /rankingsp is run.
-    # Ranking DATA in SQLite is not deleted by this command.
     for weight in WEIGHTS.keys():
 
-        embed = create_ranking_embed(
+        existing = get_ranking_message(
             interaction.guild.id,
             weight
         )
 
-        try:
+        # ----------------------------------------------------
+        # Try saved message first.
+        # ----------------------------------------------------
 
-            saved = get_ranking_message(
-                interaction.guild.id,
+        if existing:
+
+            success = await refresh_ranking_message(
+                interaction.guild,
                 weight
             )
 
-            # Use the saved message only when it belongs to
-            # the current channel.
-            if saved and saved["channel_id"] == interaction.channel.id:
+            if success:
 
-                try:
+                continue
 
-                    message = await interaction.channel.fetch_message(
-                        saved["message_id"]
-                    )
+        # ----------------------------------------------------
+        # Search channel for an existing ranking box.
+        # ----------------------------------------------------
 
-                    await message.edit(
-                        embed=embed,
-                        allowed_mentions=discord.AllowedMentions(
-                            users=True
-                        )
-                    )
-
-                    updated += 1
-                    continue
-
-                except discord.NotFound:
-
-                    # Old message was deleted; create a replacement.
-                    pass
-
-                except discord.Forbidden as error:
-
-                    print(
-                        f"Forbidden editing {weight}: {error}"
-                    )
-
-                    failed += 1
-                    continue
-
-            # Search this channel for an existing board before
-            # creating a duplicate.
-            existing_message = await find_existing_ranking_message(
+        existing_message = (
+            await find_existing_ranking_message(
                 interaction.channel,
                 weight
             )
+        )
 
-            if existing_message:
-
-                await existing_message.edit(
-                    embed=embed,
-                    allowed_mentions=discord.AllowedMentions(
-                        users=True
-                    )
-                )
-
-                save_ranking_message(
-                    interaction.guild.id,
-                    weight,
-                    interaction.channel.id,
-                    existing_message.id
-                )
-
-                updated += 1
-                continue
-
-            # No board exists in this channel, so create it.
-            message = await interaction.channel.send(
-                embed=embed,
-                allowed_mentions=discord.AllowedMentions(
-                    users=True
-                )
-            )
+        if existing_message:
 
             save_ranking_message(
                 interaction.guild.id,
                 weight,
                 interaction.channel.id,
-                message.id
+                existing_message.id
             )
 
-            created += 1
-
-        except Exception as error:
-
-            print(
-                f"/rankingsp error for {weight}: "
-                f"{type(error).__name__}: {error}"
+            await existing_message.edit(
+                embed=await create_ranking_embed(
+                    interaction.guild,
+                    weight
+                ),
+                allowed_mentions=discord.AllowedMentions(
+                    users=True
+                )
             )
 
-            failed += 1
+            continue
 
-    if failed:
+        # ----------------------------------------------------
+        # Create a new message only if none exists.
+        # ----------------------------------------------------
 
-        await interaction.edit_original_response(
-            content=(
-                "⚠️ **PFO Rankings finished with some errors.**\n\n"
-                f"🆕 Created: **{created}**\n"
-                f"🔄 Updated: **{updated}**\n"
-                f"❌ Failed: **{failed}**\n\n"
-                "Check the Railway deploy logs for the exact error."
-            )
-        )
-
-    else:
-
-        await interaction.edit_original_response(
-            content=(
-                "✅ **PFO Rankings are ready!**\n\n"
-                f"🆕 Created: **{created}**\n"
-                f"🔄 Updated: **{updated}**\n\n"
-                "All ranking boards are in this channel."
+        message = await interaction.channel.send(
+            embed=await create_ranking_embed(
+                interaction.guild,
+                weight
             )
         )
+
+        save_ranking_message(
+            interaction.guild.id,
+            weight,
+            interaction.channel.id,
+            message.id
+        )
+
+    await interaction.edit_original_response(
+        content=(
+            "✅ **PFO Rankings have been created!**\n\n"
+            "The ranking boards are now ready."
+        )
+    )
 
 
 # ============================================================
@@ -2463,8 +2464,8 @@ async def refresh_ranking_message(
         )
 
         await message.edit(
-            embed=create_ranking_embed(
-                guild.id,
+            embed=await create_ranking_embed(
+                guild,
                 weight
             ),
             allowed_mentions=discord.AllowedMentions(
