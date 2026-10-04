@@ -1491,18 +1491,21 @@ def update_ranking(
     desired_rank: int
 ):
     """
-    P4P is completely separate from weight classes.
+    Places a fighter into the selected ranking only.
 
-    A fighter can be:
+    P4P and every weight class are completely independent.
 
+    A fighter can therefore be ranked in multiple weight classes
+    AND in P4P at the same time.
+
+    Example:
         Lightweight #1
+        Welterweight #5
+        Middleweight #12
         P4P #4
 
-    simultaneously.
-
-    Updating P4P does NOT remove them from their weight class.
-
-    Updating their weight class does NOT remove them from P4P.
+    Updating one division never removes the fighter from any
+    other division.
     """
 
     # ========================================================
@@ -1512,7 +1515,6 @@ def update_ranking(
     if weight == P4P_WEIGHT:
 
         if desired_rank < 1 or desired_rank > 15:
-
             raise ValueError(
                 "P4P rank must be between #1 and #15."
             )
@@ -1527,7 +1529,6 @@ def update_ranking(
             for row in old_rows
         }
 
-        # Remove ONLY from P4P.
         users = [
             row["discord_user_id"]
             for row in old_rows
@@ -1548,8 +1549,7 @@ def update_ranking(
 
         new_positions = {
             fighter_id: index + 1
-            for index, fighter_id
-            in enumerate(users)
+            for index, fighter_id in enumerate(users)
         }
 
         movements = calculate_movements(
@@ -1560,7 +1560,6 @@ def update_ranking(
         fighters = []
 
         for fighter_id, rank in new_positions.items():
-
             fighters.append({
                 "user_id": fighter_id,
                 "rank": rank,
@@ -1583,50 +1582,13 @@ def update_ranking(
     # ========================================================
 
     if desired_rank < 0 or desired_rank > 15:
-
         raise ValueError(
             "Weight-class rank must be Champion or #1-#15."
         )
 
-    # --------------------------------------------------------
-    # Find their current weight class.
-    #
-    # P4P is intentionally ignored.
-    # --------------------------------------------------------
-
-    current_weight_row = get_user_weight_class(
-        guild_id,
-        user_id
-    )
-
-    old_weight = None
-
-    if current_weight_row:
-
-        old_weight = current_weight_row["weight"]
-
-    # --------------------------------------------------------
-    # Save old positions.
-    # --------------------------------------------------------
-
-    old_positions = {}
-
-    if old_weight:
-
-        old_rows = get_division_rankings(
-            guild_id,
-            old_weight
-        )
-
-        old_positions = {
-            row["discord_user_id"]: row["rank"]
-            for row in old_rows
-        }
-
-    # --------------------------------------------------------
-    # Save target positions BEFORE changing.
-    # --------------------------------------------------------
-
+    # IMPORTANT:
+    # Do NOT look for or remove the fighter from another weight class.
+    # Fighters are allowed to exist in multiple weight classes.
     target_rows = get_division_rankings(
         guild_id,
         weight
@@ -1637,24 +1599,8 @@ def update_ranking(
         for row in target_rows
     }
 
-    # --------------------------------------------------------
-    # Remove from old weight class.
-    #
-    # P4P remains untouched.
-    # --------------------------------------------------------
-
-    if old_weight:
-
-        delete_user_from_division(
-            guild_id,
-            old_weight,
-            user_id
-        )
-
-    # --------------------------------------------------------
-    # Remove from target in case they already exist there.
-    # --------------------------------------------------------
-
+    # Remove the fighter only from THIS division so we can insert
+    # them at their new position without creating a duplicate row.
     delete_user_from_division(
         guild_id,
         weight,
@@ -1666,23 +1612,12 @@ def update_ranking(
         weight
     )
 
-    # --------------------------------------------------------
-    # Find champion.
-    # --------------------------------------------------------
-
     champion_id = None
 
     for row in target_rows:
-
         if row["rank"] == 0:
-
             champion_id = row["discord_user_id"]
-
             break
-
-    # --------------------------------------------------------
-    # Get ranked fighters.
-    # --------------------------------------------------------
 
     ranked_users = [
         row["discord_user_id"]
@@ -1697,16 +1632,13 @@ def update_ranking(
     if desired_rank == 0:
 
         if champion_id is not None:
-
             ranked_users.insert(
                 0,
                 champion_id
             )
 
         ranked_users = list(
-            dict.fromkeys(
-                ranked_users
-            )
+            dict.fromkeys(ranked_users)
         )
 
         ranked_users = ranked_users[:15]
@@ -1729,7 +1661,6 @@ def update_ranking(
         }]
 
         for fighter_id, rank in new_positions.items():
-
             fighters.append({
                 "user_id": fighter_id,
                 "rank": rank,
@@ -1762,9 +1693,7 @@ def update_ranking(
         )
 
         ranked_users = list(
-            dict.fromkeys(
-                ranked_users
-            )
+            dict.fromkeys(ranked_users)
         )
 
         ranked_users = ranked_users[:15]
@@ -1783,7 +1712,6 @@ def update_ranking(
         fighters = []
 
         if champion_id is not None:
-
             fighters.append({
                 "user_id": champion_id,
                 "rank": 0,
@@ -1791,7 +1719,6 @@ def update_ranking(
             })
 
         for fighter_id, rank in new_positions.items():
-
             fighters.append({
                 "user_id": fighter_id,
                 "rank": rank,
@@ -1807,71 +1734,9 @@ def update_ranking(
             fighters
         )
 
-    # ========================================================
-    # REBUILD OLD WEIGHT CLASS
-    # ========================================================
-
-    if old_weight and old_weight != weight:
-
-        remaining = get_division_rankings(
-            guild_id,
-            old_weight
-        )
-
-        old_champion = None
-        old_ranked = []
-
-        for row in remaining:
-
-            if row["rank"] == 0:
-
-                old_champion = row["discord_user_id"]
-
-            else:
-
-                old_ranked.append(
-                    row["discord_user_id"]
-                )
-
-        new_old_positions = {
-            fighter_id: index + 1
-            for index, fighter_id
-            in enumerate(old_ranked)
-        }
-
-        old_movements = calculate_movements(
-            old_positions,
-            new_old_positions
-        )
-
-        old_fighters = []
-
-        if old_champion is not None:
-
-            old_fighters.append({
-                "user_id": old_champion,
-                "rank": 0,
-                "movement": 0
-            })
-
-        for fighter_id, rank in new_old_positions.items():
-
-            old_fighters.append({
-                "user_id": fighter_id,
-                "rank": rank,
-                "movement": old_movements.get(
-                    fighter_id,
-                    0
-                )
-            })
-
-        save_division_rankings(
-            guild_id,
-            old_weight,
-            old_fighters
-        )
-
-    return old_weight
+    # No old weight class is returned because the fighter is not
+    # removed from any other division anymore.
+    return None
 
 
 # ============================================================
@@ -2452,6 +2317,101 @@ async def rankingsr(
             "❌ Something went wrong while removing the fighter.",
             ephemeral=True
         )
+
+
+# ============================================================
+# /RANKINGSCLEARUNKNOWN
+# ============================================================
+
+@bot.tree.command(
+    name="rankingsclearunknown",
+    description="Remove fighters who have left the server from rankings."
+)
+async def rankingsclearunknown(
+    interaction: discord.Interaction
+):
+
+    if not is_admin(interaction):
+        await interaction.response.send_message(
+            "❌ Only server administrators can clear unknown fighters.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    removed_by_weight = {}
+    member_cache = {}
+
+    # Check every ranking independently. This is important because
+    # the same fighter can now appear in multiple weight classes and P4P.
+    for weight in WEIGHTS.keys():
+
+        rows = get_division_rankings(
+            interaction.guild.id,
+            weight
+        )
+
+        for row in rows:
+
+            fighter_id = row["discord_user_id"]
+
+            # Avoid checking the same Discord member repeatedly when
+            # they appear in several divisions. The result is cached
+            # for this command run.
+            if fighter_id not in member_cache:
+                member_cache[fighter_id] = await get_server_member(
+                    interaction.guild,
+                    fighter_id
+                )
+
+            if member_cache[fighter_id] is not None:
+                continue
+
+            removed = remove_from_rankings(
+                interaction.guild.id,
+                fighter_id,
+                weight
+            )
+
+            if removed:
+                removed_by_weight[weight] = (
+                    removed_by_weight.get(weight, 0) + 1
+                )
+
+    # Refresh every board that may have changed.
+    for weight in removed_by_weight:
+        await refresh_ranking_message(
+            interaction.guild,
+            weight
+        )
+
+    total_removed = sum(
+        removed_by_weight.values()
+    )
+
+    if total_removed == 0:
+        await interaction.followup.send(
+            "✅ No unknown fighters were found in the rankings.",
+            ephemeral=True
+        )
+        return
+
+    details = "\n".join(
+        f"• **{weight}:** {count} removed"
+        for weight, count in removed_by_weight.items()
+    )
+
+    await interaction.followup.send(
+        (
+            f"✅ **{total_removed} unknown ranking entr"
+            f"{'y' if total_removed == 1 else 'ies'} removed.**\n\n"
+            f"{details}"
+        ),
+        ephemeral=True
+    )
 
 
 # ============================================================
