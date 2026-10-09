@@ -169,6 +169,12 @@ P4P_WEIGHT = "P4P"
 intents = discord.Intents.default()
 intents.members = True
  
+# Needed for /scanresults to read typed results in a channel.
+# Turn on "Message Content Intent" in the Discord Developer Portal
+# (Bot page). If it isn't turned on, the bot still starts and
+# everything else works; only /scanresults explains what to do.
+intents.message_content = True
+ 
 bot = commands.Bot(
     command_prefix="!",
     intents=intents
@@ -3450,6 +3456,9 @@ async def create_profile_embed(
  
             if fight["event"]:
                 extra += f" · *{fight['event']}*"
+            elif fight["fight_date"]:
+                y, m, d = fight["fight_date"].split("-")
+                extra += f" · *{d}/{m}/{y}*"
  
             if fight["title_fight"]:
                 extra += " 👑"
@@ -3990,8 +3999,16 @@ def resolve_fighter(
  
         return user_id, "Unknown Fighter", "id_only"
  
+    text = text.lstrip("@").strip()
+ 
+    plain = re.sub(r"\s*\([^()]*\)\s*$", "", text)
+    plain = re.sub(r"\s*\[[^\[\]]*\]", "", plain).strip()
+ 
     matches = lookup.get(
         normalise_name(text),
+        set()
+    ) or lookup.get(
+        normalise_name(plain),
         set()
     )
  
@@ -4163,7 +4180,9 @@ def create_import_summary_embed(
     ready: list,
     problems: list,
     name_only: set,
-    skipped: int
+    skipped: int,
+    found_text: str = None,
+    author_text: str = "PFO • IMPORT FIGHT HISTORY"
 ):
  
     fighters = set()
@@ -4173,7 +4192,7 @@ def create_import_summary_embed(
         fighters.add(fight["loser_id"] or normalise_name(fight["loser_name"]))
  
     lines = [
-        f"Found **{len(ready) + len(problems) + skipped} fight rows**.",
+        found_text or f"Found **{len(ready) + len(problems) + skipped} fight rows**.",
         "",
         f"✅ **{len(ready)} fights** for **{len(fighters)} fighters** are ready to import",
     ]
@@ -4193,10 +4212,12 @@ def create_import_summary_embed(
         ]
  
     if problems:
-        lines += ["", f"⚠️ **{len(problems)} row(s) need fixing** and won't be imported:"]
+        lines += ["", f"⚠️ **{len(problems)}** need fixing and won't be imported:"]
  
-        for number, reason in problems[:10]:
-            lines.append(f"• Row {number}: {reason}")
+        for label, reason in problems[:10]:
+            if isinstance(label, int):
+                label = f"Row {label}"
+            lines.append(f"• {label}: {reason}")
  
         if len(problems) > 10:
             lines.append(f"• …and {len(problems) - 10} more")
@@ -4211,7 +4232,7 @@ def create_import_summary_embed(
  
     apply_branding(
         embed,
-        author_text="PFO • IMPORT FIGHT HISTORY"
+        author_text=author_text
     )
  
     embed.set_footer(
@@ -4601,6 +4622,405 @@ async def importfights(
  
  
 # ============================================================
+# /SCANRESULTS
+#
+# Reads typed results from a channel, e.g.
+#   @A finishes @B in RD3
+#   @A submits @B in RD3 via Guillotine
+#   @A Wins Against @B In RD2 AND STILL 🏆
+# and imports them like a spreadsheet would (check first, then
+# press Import). Nothing in the channel is changed.
+# ============================================================
+ 
+FIGHTER_TOKEN = r"<@!?\d+>|[^\n<>]+?"
+ 
+RESULT_VERBS = {
+    # verb pattern -> what it tells us
+    r"submits|submitted|subs|subbed|taps|tapped": "SUB",
+    r"knocks out|knocked out|kos|ko'?d|ko'?s|tkos|tko'?d|knocks|knocked": "KO/TKO",
+    r"finishes|finished|stops|stopped": "FINISH",
+    r"outpoints|outpointed|decisions|decisioned": "DEC",
+    r"wins against|won against|wins vs\.?|won vs\.?|beats|beat|defeats|defeated|def\.?|wins over|won over": "WIN",
+    r"draws with|drew with|draw with|draws against|drew against": "DRAW",
+    r"no contest with|no contest against|nc with|nc against": "NC",
+}
+ 
+RESULT_LINE = re.compile(
+    rf"^\s*(?P<a>{FIGHTER_TOKEN})\s+"
+    rf"(?P<verb>{'|'.join(RESULT_VERBS)})\s+"
+    rf"(?P<tail>.+)$",
+    re.IGNORECASE
+)
+ 
+# Where a typed (non-@) opponent's name ends.
+NAME_END = re.compile(
+    r"\s+(?:in|at|via|by|with)\s+|\s+(?:rd|round|rnd)\s*\.?\s*\d|\s+r\d\b|\s*[-–,!]\s|\s*\*\*|\s*[🥊🏆🔥]",
+    re.IGNORECASE
+)
+ 
+ROUND_PATTERN = re.compile(
+    r"\b(?:rd|round|rnd|r)\s*\.?\s*([1-5])\b",
+    re.IGNORECASE
+)
+ 
+SUB_WORDS = [
+    "submission", "sub", "guillotine", "choke", "rnc", "rear naked",
+    "rear-naked", "armbar", "arm bar", "triangle", "kimura", "americana",
+    "heel hook", "kneebar", "knee bar", "darce", "d'arce", "anaconda",
+    "ezekiel", "arm triangle", "omoplata", "ankle lock", "tap",
+]
+ 
+KO_WORDS = [
+    "ko", "tko", "knockout", "punch", "punches", "kick", "head kick",
+    "body kick", "elbow", "knee", "ground and pound", "gnp", "slam",
+    "spinning", "stoppage", "doctor", "uppercut", "hook", "jab", "cross",
+    "body shot", "liver", "flying",
+]
+ 
+DEC_WORDS = [
+    "decision", "dec", "ud", "sd", "md", "points", "unanimous",
+    "split", "majority", "judges", "scorecards",
+]
+ 
+ 
+def has_word(
+    text: str,
+    words: list
+):
+ 
+    text = text.casefold()
+ 
+    return any(
+        re.search(rf"(?<![a-z]){re.escape(word)}(?![a-z])", text)
+        for word in words
+    )
+ 
+ 
+def method_from_line(
+    verb_kind: str,
+    rest: str
+):
+    """
+    Works out the method from the verb and anything after it.
+      submits                         -> SUB
+      finishes ... via Guillotine     -> SUB
+      finishes / knocks out           -> KO/TKO
+      wins against ... via decision   -> DEC
+      wins against ... in RD2         -> KO/TKO (finished in a round)
+      wins against (no round)         -> DEC
+    """
+ 
+    if verb_kind in ("SUB", "DEC", "DRAW", "NC"):
+        return verb_kind
+ 
+    via = re.search(r"\b(?:via|by|with)\b(.*)", rest, re.IGNORECASE)
+    detail = via.group(1) if via else rest
+ 
+    if has_word(detail, SUB_WORDS):
+        return "SUB"
+ 
+    if has_word(detail, DEC_WORDS):
+        return "DEC"
+ 
+    if verb_kind in ("KO/TKO", "FINISH"):
+        return "KO/TKO"
+ 
+    if has_word(detail, KO_WORDS) or ROUND_PATTERN.search(rest):
+        return "KO/TKO"
+ 
+    return "DEC"
+ 
+ 
+def clean_fighter_text(
+    text: str
+):
+ 
+    return text.strip().strip("*_~|").strip()
+ 
+ 
+def parse_result_line(
+    line: str
+):
+    """
+    Returns (winner_text, loser_text, method, round, title_fight)
+    or None if the line isn't a result.
+    """
+ 
+    match = RESULT_LINE.match(line.strip())
+ 
+    if not match:
+        return None
+ 
+    verb = match.group("verb").casefold()
+    verb_kind = next(
+        kind for pattern, kind in RESULT_VERBS.items()
+        if re.fullmatch(pattern, verb, re.IGNORECASE)
+    )
+ 
+    tail = match.group("tail")
+ 
+    # "@A finishes @B in RD3": the opponent is the mention.
+    # For a typed name, it ends where the round / via part starts.
+    mention = re.match(r"\s*(<@!?\d+>)", tail)
+ 
+    if mention:
+        b_text = mention.group(1)
+        rest = tail[mention.end():]
+    else:
+        end = NAME_END.search(tail)
+        b_text = tail[:end.start()] if end else tail
+        rest = tail[end.start():] if end else ""
+ 
+    if not b_text.strip():
+        return None
+ 
+    method = method_from_line(verb_kind, rest)
+ 
+    fight_round = None
+ 
+    if method not in ("DEC", "DRAW", "NC"):
+        found = ROUND_PATTERN.search(rest)
+        if found:
+            fight_round = int(found.group(1))
+ 
+    title_fight = bool(re.search(
+        r"\band (?:still|new)\b|\btitle\b|\bbelt\b|\bchampion",
+        rest,
+        re.IGNORECASE
+    ))
+ 
+    return (
+        clean_fighter_text(match.group("a")),
+        clean_fighter_text(b_text),
+        method,
+        fight_round,
+        title_fight,
+    )
+ 
+ 
+def looks_like_result(
+    line: str
+):
+    """A line we couldn't read but that probably is a result."""
+ 
+    mentions = len(re.findall(r"<@!?\d+>", line))
+ 
+    return mentions >= 2 and bool(
+        ROUND_PATTERN.search(line)
+        or re.search(r"\bvia\b|\bwins?\b|\bdef\b|\bko\b|\bsub", line, re.IGNORECASE)
+    )
+ 
+ 
+async def scan_channel_results(
+    guild: discord.Guild,
+    channel,
+    since=None
+):
+ 
+    lookup = build_member_lookup(guild)
+    existing = get_existing_fight_keys(guild.id)
+ 
+    ready = []
+    problems = []
+    name_only = set()
+    skipped = 0
+    seen = set()
+    messages_read = 0
+ 
+    async for message in channel.history(
+        limit=None,
+        oldest_first=True,
+        after=since
+    ):
+ 
+        if message.author.bot or not message.content:
+            continue
+ 
+        messages_read += 1
+        date = message.created_at.date().isoformat()
+ 
+        for line in message.content.splitlines():
+ 
+            if not line.strip():
+                continue
+ 
+            parsed = parse_result_line(line)
+ 
+            if not parsed:
+                if looks_like_result(line):
+                    problems.append((
+                        f"[Message from {message.created_at:%d/%m/%Y}]({message.jump_url})",
+                        "couldn't tell who won; add it with /result"
+                    ))
+                continue
+ 
+            a_text, b_text, method, fight_round, title_fight = parsed
+ 
+            resolved = []
+            bad = False
+ 
+            for text in (a_text, b_text):
+                user_id, name, status = resolve_fighter(guild, lookup, text)
+ 
+                if status == "ambiguous":
+                    problems.append((
+                        f"[Message from {message.created_at:%d/%m/%Y}]({message.jump_url})",
+                        f"`{text}` matches more than one member; add it with /result"
+                    ))
+                    bad = True
+                    break
+ 
+                if status == "name_only":
+                    name_only.add(name)
+ 
+                resolved.append((user_id, name))
+ 
+            if bad:
+                continue
+ 
+            (winner_id, winner_name), (loser_id, loser_name) = resolved
+ 
+            # A line with no @mentions where neither name is a member
+            # is probably just chat ("he finishes everyone in rd1").
+            if not winner_id and not loser_id:
+                name_only.discard(winner_name)
+                name_only.discard(loser_name)
+                continue
+ 
+            if winner_id and winner_id == loser_id:
+                continue
+ 
+            key = fight_key(date, winner_id, winner_name, loser_id, loser_name, method)
+ 
+            if key in existing or key in seen:
+                skipped += 1
+                continue
+ 
+            seen.add(key)
+ 
+            ready.append({
+                "date": date,
+                "event": None,
+                "winner_id": winner_id,
+                "winner_name": winner_name,
+                "loser_id": loser_id,
+                "loser_name": loser_name,
+                "method": method,
+                "round": fight_round,
+                "division": None,
+                "title_fight": title_fight,
+            })
+ 
+    return ready, problems, name_only, skipped, messages_read
+ 
+ 
+@bot.tree.command(
+    name="scanresults",
+    description="Read typed results from a channel and import them as fights."
+)
+@app_commands.describe(
+    channel="The channel where results are posted",
+    since="Only read messages from this date on, e.g. 01/09/2026 (optional)"
+)
+async def scanresults(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    since: str = None
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can import fights.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    if not bot.intents.message_content:
+ 
+        await interaction.response.send_message(
+            "❌ I can't read message text yet. In the **Discord Developer "
+            "Portal**, open your bot → **Bot** → turn on **Message Content "
+            "Intent** → Save, then restart the bot on Railway.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    since_date = None
+ 
+    if since:
+        parsed, ok = parse_date(since)
+ 
+        if not ok or not parsed:
+            await interaction.response.send_message(
+                "❌ Write the date like 01/09/2026.",
+                ephemeral=True
+            )
+            return
+ 
+        since_date = datetime.fromisoformat(parsed).replace(tzinfo=timezone.utc)
+ 
+    await interaction.response.defer(
+        ephemeral=True
+    )
+ 
+    try:
+ 
+        ready, problems, name_only, skipped, messages_read = (
+            await scan_channel_results(
+                interaction.guild,
+                channel,
+                since_date
+            )
+        )
+ 
+    except discord.Forbidden:
+ 
+        await interaction.followup.send(
+            f"❌ I don't have permission to read {channel.mention}. "
+            "Give the bot **View Channel** and **Read Message History** there.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    except Exception as error:
+ 
+        print(f"Scan error: {error}")
+ 
+        await interaction.followup.send(
+            "❌ Something went wrong while reading that channel.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    found = len(ready) + skipped
+ 
+    await interaction.followup.send(
+        embed=create_import_summary_embed(
+            ready,
+            problems,
+            name_only,
+            skipped,
+            found_text=(
+                f"Read **{messages_read} messages** in {channel.mention} "
+                f"and found **{found} results**."
+            ),
+            author_text="PFO • SCAN RESULTS CHANNEL"
+        ),
+        view=ImportConfirmView(
+            interaction.user.id,
+            interaction.guild.id,
+            ready
+        ),
+        ephemeral=True
+    )
+ 
+ 
+# ============================================================
 # ON READY
 # ============================================================
  
@@ -4701,4 +5121,20 @@ if not TOKEN:
  
 setup_database()
  
-bot.run(TOKEN)
+try:
+ 
+    bot.run(TOKEN)
+ 
+except discord.PrivilegedIntentsRequired:
+ 
+    print(
+        "Message Content Intent is not turned on in the Discord "
+        "Developer Portal, so /scanresults can't read messages. "
+        "Starting without it; everything else works normally."
+    )
+ 
+    bot.clear()
+    bot._connection._intents.message_content = False
+ 
+    bot.run(TOKEN)
+
