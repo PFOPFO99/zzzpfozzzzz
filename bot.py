@@ -64,6 +64,10 @@ PFO_GOLD = discord.Color.from_rgb(212, 168, 76)
  
 LOGO_FILE = "pfo_logo.gif"
  
+RESULT_BANNER_FILE = "result.gif"
+TITLE_RESULT_BANNER_FILE = "result_title.gif"
+PROFILE_BANNER_FILE = "profile.gif"
+ 
  
 def asset_url(
     filename: str
@@ -3359,32 +3363,9 @@ async def create_profile_embed(
     if description:
         embed.description = "\n".join(description)
  
-    # Banner: champion division, else best-ranked division,
-    # else division of their latest fight.
-    banner_weight = None
- 
-    if champion_of:
-        banner_weight = champion_of[0]
-    else:
-        ranked = sorted(
-            (row for row in ranks if row["weight"] != P4P_WEIGHT),
-            key=lambda row: row["rank"]
-        )
- 
-        if ranked:
-            banner_weight = ranked[0]["weight"]
-        else:
-            for fight in reversed(stats["fights"]):
-                if fight["division"]:
-                    banner_weight = fight["division"]
-                    break
- 
     apply_branding(
         embed,
-        banner_file=(
-            ranking_banner_file(banner_weight)
-            if banner_weight else None
-        ),
+        banner_file=PROFILE_BANNER_FILE,
         author_text="PFO • FIGHTER PROFILE",
         show_thumbnail=False
     )
@@ -3564,8 +3545,8 @@ def create_result_embed(
     apply_branding(
         embed,
         banner_file=(
-            ranking_banner_file(fight["division"])
-            if fight.get("division") else None
+            TITLE_RESULT_BANNER_FILE
+            if fight.get("title_fight") else RESULT_BANNER_FILE
         ),
         author_text=author
     )
@@ -4364,9 +4345,107 @@ class ImportConfirmView(
         )
  
  
+# ------------------------------------------------------------
+# Google Sheets support
+#
+# Staff paste the sheet's link into /importfights. The sheet
+# must be shared as "Anyone with the link: Viewer" so the bot
+# can read it (it never needs edit access).
+# ------------------------------------------------------------
+ 
+GOOGLE_SHEET_ID = re.compile(
+    r"docs\.google\.com/spreadsheets/d/([a-zA-Z0-9_-]{20,})"
+)
+ 
+GOOGLE_SHEET_TAB = re.compile(
+    r"[#&?]gid=(\d+)"
+)
+ 
+SHEET_HEADER_ROW = (
+    "date | event | winner | loser | method | round | division | title_fight"
+)
+ 
+ 
+class SheetReadError(Exception):
+    pass
+ 
+ 
+async def download_google_sheet(
+    link: str
+):
+    """
+    Downloads one tab of a Google Sheet as CSV.
+    Only docs.google.com links are accepted.
+    """
+ 
+    import aiohttp  # installed with discord.py
+ 
+    match = GOOGLE_SHEET_ID.search(link)
+ 
+    if not match:
+        raise SheetReadError(
+            "That doesn't look like a Google Sheets link. Copy it from "
+            "the address bar while the sheet is open; it starts with "
+            "`https://docs.google.com/spreadsheets/d/`."
+        )
+ 
+    sheet_id = match.group(1)
+    tab = GOOGLE_SHEET_TAB.search(link)
+    tab_id = tab.group(1) if tab else "0"
+ 
+    url = (
+        f"https://docs.google.com/spreadsheets/d/{sheet_id}"
+        f"/export?format=csv&gid={tab_id}"
+    )
+ 
+    not_shared = SheetReadError(
+        "I couldn't open that sheet. In Google Sheets press **Share**, "
+        "set **General access** to **Anyone with the link** (Viewer), "
+        "then try again."
+    )
+ 
+    try:
+        timeout = aiohttp.ClientTimeout(total=20)
+ 
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+ 
+                if response.status in (401, 403, 404):
+                    raise not_shared
+ 
+                if response.status != 200:
+                    raise SheetReadError(
+                        f"Google Sheets returned an error ({response.status}). "
+                        "Please try again in a minute."
+                    )
+ 
+                content_type = response.headers.get("Content-Type", "")
+ 
+                # A private sheet sends back a Google sign-in page
+                # instead of the data.
+                if "text/html" in content_type:
+                    raise not_shared
+ 
+                raw = await response.content.read(2_000_001)
+ 
+    except SheetReadError:
+        raise
+ 
+    except Exception as error:
+        print(f"Google Sheets download error: {error}")
+        raise SheetReadError(
+            "I couldn't reach Google Sheets. Please try again in a minute."
+        )
+ 
+    if len(raw) > 2_000_000:
+        raise SheetReadError("That sheet is too big (2 MB max).")
+ 
+    return raw
+ 
+ 
 @bot.tree.command(
     name="importtemplate",
-    description="Get a spreadsheet template for importing past fights."
+    description="How to set up a Google Sheet (or CSV file) for importing past fights."
 )
 async def importtemplate(
     interaction: discord.Interaction
@@ -4383,9 +4462,18 @@ async def importtemplate(
  
     await interaction.response.send_message(
         (
-            "📄 **Fight history template**\n"
-            "One row per fight. Open it in Excel or Google Sheets, fill it in, "
-            "then save/download it as **CSV** and use `/importfights`.\n\n"
+            "📄 **Importing past fights with Google Sheets**\n\n"
+            "**1.** Make a new Google Sheet and put these headings in row 1, "
+            "one per column:\n"
+            f"```{SHEET_HEADER_ROW}```"
+            "Or open the attached file in Google Sheets "
+            "(*File → Import → Upload*), which has the headings and 3 examples.\n"
+            "**2.** Add one row per fight.\n"
+            "**3.** Press **Share** and set **General access** to "
+            "**Anyone with the link** (Viewer).\n"
+            "**4.** Copy the link and use `/importfights sheet_link:`. "
+            "The bot reads the tab that's open when you copy the link.\n\n"
+            "**Columns**\n"
             "• **winner / loser:** Discord username works best (or user ID). "
             "Names of people who've left are saved by name only.\n"
             "• **method:** KO/TKO, SUB, DEC, DQ, DRAW or NC. "
@@ -4393,8 +4481,9 @@ async def importtemplate(
             "• **round:** 1-5, or empty for decisions.\n"
             "• **date:** 2026-03-14 or 14/03/2026 (can be empty).\n"
             "• **division:** e.g. Lightweight or LW (can be empty).\n"
-            "• **title_fight:** yes or no.\n"
-            "• Importing the same file twice won't double up fights."
+            "• **title_fight:** yes or no.\n\n"
+            "You can keep adding fights to the same sheet and import it again; "
+            "fights already saved are skipped, never doubled."
         ),
         file=discord.File(
             io.BytesIO(template_csv().encode("utf-8")),
@@ -4406,14 +4495,16 @@ async def importtemplate(
  
 @bot.tree.command(
     name="importfights",
-    description="Import past fights from a CSV spreadsheet."
+    description="Import past fights from a Google Sheet (or a CSV file)."
 )
 @app_commands.describe(
-    file="The filled-in CSV file (get the layout from /importtemplate)"
+    sheet_link="Link to the Google Sheet (shared as 'Anyone with the link')",
+    file="Or upload a CSV file instead"
 )
 async def importfights(
     interaction: discord.Interaction,
-    file: discord.Attachment
+    sheet_link: str = None,
+    file: discord.Attachment = None
 ):
  
     if not is_staff(interaction):
@@ -4425,24 +4516,36 @@ async def importfights(
  
         return
  
-    if not file.filename.lower().endswith((".csv", ".txt")):
+    if not sheet_link and not file:
  
         await interaction.response.send_message(
-            "❌ Please upload a **.csv** file. In Excel use *Save As → CSV*, "
-            "in Google Sheets use *File → Download → CSV*.",
+            "❌ Paste your Google Sheet link into **sheet_link**. "
+            "Use `/importtemplate` to see how to set the sheet up.",
             ephemeral=True
         )
  
         return
  
-    if file.size > 2_000_000:
+    if file and not sheet_link:
  
-        await interaction.response.send_message(
-            "❌ That file is too big (2 MB max).",
-            ephemeral=True
-        )
+        if not file.filename.lower().endswith((".csv", ".txt")):
  
-        return
+            await interaction.response.send_message(
+                "❌ Please upload a **.csv** file, or use **sheet_link** "
+                "with a Google Sheets link instead.",
+                ephemeral=True
+            )
+ 
+            return
+ 
+        if file.size > 2_000_000:
+ 
+            await interaction.response.send_message(
+                "❌ That file is too big (2 MB max).",
+                ephemeral=True
+            )
+ 
+            return
  
     await interaction.response.defer(
         ephemeral=True
@@ -4450,7 +4553,12 @@ async def importfights(
  
     try:
  
-        raw = await file.read()
+        if sheet_link:
+            raw = await download_google_sheet(
+                sheet_link.strip()
+            )
+        else:
+            raw = await file.read()
  
         ready, problems, name_only, skipped = parse_fight_csv(
             interaction.guild,
@@ -4472,6 +4580,13 @@ async def importfights(
             ephemeral=True
         )
  
+    except SheetReadError as error:
+ 
+        await interaction.followup.send(
+            f"❌ {error}",
+            ephemeral=True
+        )
+ 
     except Exception as error:
  
         print(
@@ -4479,8 +4594,8 @@ async def importfights(
         )
  
         await interaction.followup.send(
-            "❌ Couldn't read that file. Make sure it's a CSV saved from "
-            "Excel or Google Sheets, using the /importtemplate layout.",
+            "❌ Couldn't read that sheet. Make sure row 1 has the headings "
+            "from `/importtemplate`.",
             ephemeral=True
         )
  
@@ -4587,4 +4702,3 @@ if not TOKEN:
 setup_database()
  
 bot.run(TOKEN)
-
