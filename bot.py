@@ -346,6 +346,13 @@ def setup_database():
         )
     """)
  
+    # Earlier streak (e.g. W3) at the end of the earlier record.
+    # Added to existing databases without touching their data.
+    cursor.execute("PRAGMA table_info(starting_records)")
+ 
+    if "streak" not in [column[1] for column in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE starting_records ADD COLUMN streak TEXT")
+ 
     db.commit()
     db.close()
  
@@ -3135,7 +3142,8 @@ def set_starting_record(
     user_id: int,
     wins: int,
     losses: int,
-    draws: int
+    draws: int,
+    streak: str = None
 ):
  
     db = get_db()
@@ -3145,15 +3153,16 @@ def set_starting_record(
         INSERT OR REPLACE INTO starting_records
         (
             guild_id, discord_user_id,
-            wins, losses, draws, updated_at
+            wins, losses, draws, streak, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (
         guild_id,
         user_id,
         wins,
         losses,
         draws,
+        streak,
         now_utc()
     ))
  
@@ -3257,6 +3266,11 @@ def get_fighter_stats(
     start_w = start["wins"] if start else 0
     start_l = start["losses"] if start else 0
     start_d = start["draws"] if start else 0
+ 
+    # An earlier streak (set with /setrecord) carries on into the
+    # logged fights, e.g. earlier W3 + two logged wins = W5.
+    if start and start["streak"]:
+        results = [start["streak"][0]] * int(start["streak"][1:]) + results
  
     streak = ""
  
@@ -3780,7 +3794,8 @@ async def pick_fighter(
     round="Round it ended in (leave empty for decisions)",
     division="Weight class",
     title_fight="Was a belt on the line?",
-    event="Event name, e.g. Fight Night 15"
+    event="Event name, e.g. Fight Night 15",
+    date="Only for older fights: the date it happened, e.g. 14/09/2026 (default: today)"
 )
 @app_commands.choices(
     method=METHOD_CHOICES,
@@ -3796,7 +3811,8 @@ async def result(
     round: app_commands.Range[int, 1, 5] = None,
     division: app_commands.Choice[str] = None,
     title_fight: bool = False,
-    event: str = None
+    event: str = None,
+    date: str = None
 ):
  
     if not is_staff(interaction):
@@ -3807,6 +3823,25 @@ async def result(
         )
  
         return
+ 
+    fight_date = today_iso()
+ 
+    if date:
+        fight_date, ok = parse_date(date)
+ 
+        if not ok or not fight_date:
+            await interaction.response.send_message(
+                "❌ Write the date like 14/09/2026.",
+                ephemeral=True
+            )
+            return
+ 
+        if fight_date > today_iso():
+            await interaction.response.send_message(
+                "❌ That date is in the future.",
+                ephemeral=True
+            )
+            return
  
     await interaction.response.defer()
  
@@ -3843,7 +3878,7 @@ async def result(
         }
  
         fight = {
-            "date": today_iso(),
+            "date": fight_date,
             "event": event.strip() if event and event.strip() else None,
             "winner_id": winner_id,
             "winner_name": winner_name,
@@ -4017,7 +4052,8 @@ async def profile(
     losses="Earlier losses",
     draws="Earlier draws",
     fighter="Which fighter?",
-    fighter_left="Someone who has LEFT the server: their user ID"
+    fighter_left="Someone who has LEFT the server: their user ID",
+    streak="Their streak at the end of the earlier record, e.g. W3 or L1 (optional)"
 )
 async def setrecord(
     interaction: discord.Interaction,
@@ -4025,7 +4061,8 @@ async def setrecord(
     losses: app_commands.Range[int, 0, 999],
     draws: app_commands.Range[int, 0, 999] = 0,
     fighter: discord.Member = None,
-    fighter_left: str = None
+    fighter_left: str = None,
+    streak: str = None
 ):
  
     if not is_staff(interaction):
@@ -4060,12 +4097,32 @@ async def setrecord(
  
         return
  
+    if streak:
+        streak = streak.strip().upper().replace(" ", "")
+        valid = re.fullmatch(r"([WLD])(\d{1,3})", streak)
+        limits = {"W": wins, "L": losses, "D": draws}
+ 
+        if not valid or int(valid.group(2)) < 1:
+            await interaction.followup.send(
+                "❌ Write the streak like **W3** (3 wins in a row), **L1** or **D1**.",
+                ephemeral=True
+            )
+            return
+ 
+        if int(valid.group(2)) > limits[valid.group(1)]:
+            await interaction.followup.send(
+                f"❌ A streak of {streak} is longer than the earlier record allows.",
+                ephemeral=True
+            )
+            return
+ 
     set_starting_record(
         interaction.guild.id,
         user_id,
         wins,
         losses,
-        draws
+        draws,
+        streak or None
     )
  
     stats = get_fighter_stats(
@@ -4076,7 +4133,8 @@ async def setrecord(
     await interaction.followup.send(
         (
             f"✅ Earlier record for **{name}** set to "
-            f"**{format_record(wins, losses, draws)}**.\n"
+            f"**{format_record(wins, losses, draws)}**"
+            f"{f' (ending on a {streak} streak)' if streak else ''}.\n"
             f"Their full record is now **{stats_record(stats)}** "
             f"including logged fights."
         ),
@@ -4135,6 +4193,305 @@ async def deletefight(
  
     await interaction.response.send_message(
         f"🗑️ Deleted fight #{fight_id}: {summary}. Both records have been updated.",
+        ephemeral=True
+    )
+ 
+ 
+# ------------------------------------------------------------
+# /EDITFIGHT
+# ------------------------------------------------------------
+ 
+def update_fight(
+    guild_id: int,
+    fight_id: int,
+    changes: dict
+):
+ 
+    if not changes:
+        return
+ 
+    columns = ", ".join(f"{column} = ?" for column in changes)
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute(
+        f"UPDATE fights SET {columns} WHERE guild_id = ? AND id = ?",
+        (*changes.values(), guild_id, fight_id)
+    )
+ 
+    db.commit()
+    db.close()
+ 
+ 
+def fight_summary(
+    fight
+):
+ 
+    if fight["fight_date"]:
+        y, m, d = fight["fight_date"].split("-")
+        when = f"{d}/{m}/{y}"
+    else:
+        when = "no date"
+ 
+    if fight["method"] in ("DRAW", "NC"):
+        who = f"{fight['winner_name']} vs {fight['loser_name']}"
+    else:
+        who = f"{fight['winner_name']} def. {fight['loser_name']}"
+ 
+    extras = [fight_method_text(fight)]
+ 
+    if fight["division"]:
+        extras.append(fight["division"])
+ 
+    if fight["event"]:
+        extras.append(fight["event"])
+ 
+    if fight["title_fight"]:
+        extras.append("👑 title fight")
+ 
+    return f"**#{fight['id']}** · {when} · {who} ({', '.join(extras)})"
+ 
+ 
+@bot.tree.command(
+    name="editfight",
+    description="Fix a fight that's already logged (date, method, round and more)."
+)
+@app_commands.describe(
+    fight_id="The fight number (shown on result cards and in /fights)",
+    date="When it happened, e.g. 14/09/2026",
+    method="How it ended",
+    round="Round it ended in (0 = clear it)",
+    division="Weight class",
+    title_fight="Was a belt on the line?",
+    event="Event name (type 'none' to clear it)",
+    swap_winner="Swap the winner and loser"
+)
+@app_commands.choices(
+    method=METHOD_CHOICES,
+    division=DIVISION_CHOICES
+)
+async def editfight(
+    interaction: discord.Interaction,
+    fight_id: int,
+    date: str = None,
+    method: app_commands.Choice[str] = None,
+    round: app_commands.Range[int, 0, 5] = None,
+    division: app_commands.Choice[str] = None,
+    title_fight: bool = None,
+    event: str = None,
+    swap_winner: bool = False
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can edit fights.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    fight = get_fight(
+        interaction.guild.id,
+        fight_id
+    )
+ 
+    if not fight:
+ 
+        await interaction.response.send_message(
+            f"❌ There is no fight #{fight_id}. Use `/fights` to find the right number.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    changes = {}
+ 
+    if date:
+        new_date, ok = parse_date(date)
+ 
+        if not ok or not new_date:
+            await interaction.response.send_message(
+                "❌ Write the date like 14/09/2026.",
+                ephemeral=True
+            )
+            return
+ 
+        if new_date > today_iso():
+            await interaction.response.send_message(
+                "❌ That date is in the future.",
+                ephemeral=True
+            )
+            return
+ 
+        changes["fight_date"] = new_date
+ 
+    if method:
+        changes["method"] = method.value
+ 
+    if round is not None:
+        changes["round"] = round or None
+ 
+    if division:
+        changes["division"] = division.value
+ 
+    if title_fight is not None:
+        changes["title_fight"] = 1 if title_fight else 0
+ 
+    if event:
+        changes["event"] = None if event.strip().lower() == "none" else event.strip()
+ 
+    if swap_winner:
+        changes.update({
+            "winner_id": fight["loser_id"],
+            "winner_name": fight["loser_name"],
+            "loser_id": fight["winner_id"],
+            "loser_name": fight["winner_name"],
+        })
+ 
+    if not changes:
+ 
+        await interaction.response.send_message(
+            "❌ Nothing to change. Fill in at least one option, e.g. **date**.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    update_fight(
+        interaction.guild.id,
+        fight_id,
+        changes
+    )
+ 
+    updated = get_fight(
+        interaction.guild.id,
+        fight_id
+    )
+ 
+    await interaction.response.send_message(
+        (
+            "✏️ **Fight updated.** Records, streaks and profiles now use the new details.\n\n"
+            f"Before: {fight_summary(fight)}\n"
+            f"After: {fight_summary(updated)}"
+        ),
+        ephemeral=True
+    )
+ 
+ 
+# ------------------------------------------------------------
+# /FIGHTS
+# ------------------------------------------------------------
+ 
+FIGHTS_PER_PAGE = 15
+ 
+ 
+@bot.tree.command(
+    name="fights",
+    description="List a fighter's logged fights with their fight numbers."
+)
+@app_commands.describe(
+    fighter="Which fighter?",
+    fighter_left="Someone who has LEFT the server: their user ID or name",
+    page="Page number for long histories"
+)
+async def fights(
+    interaction: discord.Interaction,
+    fighter: discord.Member = None,
+    fighter_left: str = None,
+    page: app_commands.Range[int, 1, 999] = 1
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can list fights.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    await interaction.response.defer(
+        ephemeral=True
+    )
+ 
+    try:
+        user_id, name, _ = await pick_fighter(
+            interaction.guild, fighter, fighter_left, "fighter"
+        )
+    except FighterInputError as error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+ 
+    history = list(reversed(get_fighter_fights(
+        interaction.guild.id,
+        user_id,
+        name
+    )))
+ 
+    if not history:
+        await interaction.followup.send(
+            f"❌ No fights logged for **{name}** yet.",
+            ephemeral=True
+        )
+        return
+ 
+    pages = (len(history) + FIGHTS_PER_PAGE - 1) // FIGHTS_PER_PAGE
+    page = min(page, pages)
+    shown = history[(page - 1) * FIGHTS_PER_PAGE: page * FIGHTS_PER_PAGE]
+ 
+    lines = []
+ 
+    for fight in shown:
+ 
+        if fight["fight_date"]:
+            y, m, d = fight["fight_date"].split("-")
+            when = f"{d}/{m}/{y}"
+        else:
+            when = "no date"
+ 
+        if fight_is_win_for(fight, user_id, name):
+            opponent = fight["loser_name"]
+        else:
+            opponent = fight["winner_name"]
+ 
+        lines.append(
+            f"`#{fight['id']}` {when} · {fight_line_tag(fight, user_id, name)} "
+            f"vs {opponent} — {fight_method_text(fight)}"
+            f"{' 👑' if fight['title_fight'] else ''}"
+        )
+ 
+    stats = get_fighter_stats(
+        interaction.guild.id,
+        user_id,
+        name
+    )
+ 
+    embed = discord.Embed(
+        title=f"{name}: {stats_record(stats)}",
+        description=(
+            "\n".join(lines)
+            + "\n\nNewest first. Fix a fight with `/editfight fight_id:`"
+        )[:4000],
+        color=PFO_GOLD
+    )
+ 
+    apply_branding(
+        embed,
+        author_text="PFO • FIGHT HISTORY"
+    )
+ 
+    embed.set_footer(
+        text=(
+            f"Page {page} of {pages} • {len(history)} fights"
+            + (f" • streak {stats['streak']}" if stats["streak"] else "")
+        ),
+        icon_url=asset_url(LOGO_FILE)
+    )
+ 
+    await interaction.followup.send(
+        embed=embed,
         ephemeral=True
     )
  
@@ -5417,3 +5774,4 @@ except discord.PrivilegedIntentsRequired:
     bot._connection._intents.message_content = False
  
     bot.run(TOKEN)
+
