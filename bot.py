@@ -1,4 +1,7 @@
+import csv
+import io
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
  
@@ -276,6 +279,59 @@ def setup_database():
             message_id INTEGER NOT NULL,
  
             PRIMARY KEY(guild_id, weight)
+        )
+    """)
+ 
+    # --------------------------------------------------------
+    # FIGHTS
+    #
+    # One row per fight. Fighters are stored by Discord user ID,
+    # so records follow the account even if someone changes
+    # their nickname. The name is also saved, which covers
+    # fighters who have left the server or were imported by
+    # name only.
+    #
+    # method: KO/TKO, SUB, DEC, DQ, DRAW or NC
+    # For DRAW / NC, "winner" and "loser" are just fighter A / B.
+    # --------------------------------------------------------
+ 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            fight_date TEXT,
+            event TEXT,
+            winner_id INTEGER,
+            winner_name TEXT NOT NULL,
+            loser_id INTEGER,
+            loser_name TEXT NOT NULL,
+            method TEXT NOT NULL,
+            round INTEGER,
+            division TEXT,
+            title_fight INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'result',
+            logged_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+ 
+    # --------------------------------------------------------
+    # STARTING RECORDS
+    #
+    # For fighters whose older fights were never written down.
+    # Logged fights are added on top of this.
+    # --------------------------------------------------------
+ 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS starting_records (
+            guild_id INTEGER NOT NULL,
+            discord_user_id INTEGER NOT NULL,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            draws INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL,
+ 
+            PRIMARY KEY(guild_id, discord_user_id)
         )
     """)
  
@@ -772,14 +828,105 @@ class SignupView(
 # ADMIN CHECK
 # ============================================================
  
-def is_admin(
+# Who counts as staff. Every command except /profile is staff-only.
+# Role names are matched ignoring capitals, spaces, dashes and emojis,
+# so "👑 Owner", "owner" and "OWNER" all count as Owner.
+#
+# To use different role names without editing this file, set
+# STAFF_ROLES / FIGHTER_ROLES in Railway, comma-separated, e.g.
+#   STAFF_ROLES=Helper,Moderator,Vice President,Owner
+STAFF_ROLE_NAMES = [
+    name.strip()
+    for name in os.getenv(
+        "STAFF_ROLES",
+        "Helper,Moderator,Vice President,Owner"
+    ).split(",")
+    if name.strip()
+]
+ 
+FIGHTER_ROLE_NAMES = [
+    name.strip()
+    for name in os.getenv(
+        "FIGHTER_ROLES",
+        "Fighter"
+    ).split(",")
+    if name.strip()
+]
+ 
+STAFF_ONLY_TEXT = (
+    "Only staff ("
+    + ", ".join(STAFF_ROLE_NAMES[:-1])
+    + (" or " if len(STAFF_ROLE_NAMES) > 1 else "")
+    + STAFF_ROLE_NAMES[-1]
+    + ")"
+)
+ 
+ 
+def role_key(
+    name: str
+):
+ 
+    return "".join(
+        ch for ch in name.casefold()
+        if ch.isalnum()
+    )
+ 
+ 
+def has_any_role(
+    member,
+    role_names: list
+):
+ 
+    wanted = {
+        role_key(name)
+        for name in role_names
+    }
+ 
+    return any(
+        role_key(role.name) in wanted
+        for role in getattr(member, "roles", [])
+    )
+ 
+ 
+def is_staff(
     interaction: discord.Interaction
 ):
  
     if not interaction.guild:
         return False
  
-    return interaction.user.guild_permissions.administrator
+    # The server owner can always use everything, so nobody can
+    # lock themselves out by renaming a role.
+    if interaction.user.id == interaction.guild.owner_id:
+        return True
+ 
+    return has_any_role(
+        interaction.user,
+        STAFF_ROLE_NAMES
+    )
+ 
+ 
+def is_fighter_or_staff(
+    interaction: discord.Interaction
+):
+ 
+    if is_staff(interaction):
+        return True
+ 
+    return has_any_role(
+        interaction.user,
+        FIGHTER_ROLE_NAMES
+    )
+ 
+ 
+def is_admin(
+    interaction: discord.Interaction
+):
+    # Kept under its old name so every existing command uses the
+    # new staff roles without any other changes.
+    return is_staff(
+        interaction
+    )
  
  
 # ============================================================
@@ -797,7 +944,7 @@ async def fnsignup(
     if not is_admin(interaction):
  
         await interaction.response.send_message(
-            "❌ Only server administrators can create signups.",
+            f"❌ {STAFF_ONLY_TEXT} can create signups.",
             ephemeral=True
         )
  
@@ -859,7 +1006,7 @@ async def livesignup(
     if not is_admin(interaction):
  
         await interaction.response.send_message(
-            "❌ Only server administrators can create signups.",
+            f"❌ {STAFF_ONLY_TEXT} can create signups.",
             ephemeral=True
         )
  
@@ -937,7 +1084,7 @@ async def signupclose(
     if not is_admin(interaction):
  
         await interaction.response.send_message(
-            "❌ Only server administrators can close signups.",
+            f"❌ {STAFF_ONLY_TEXT} can close signups.",
             ephemeral=True
         )
  
@@ -1028,6 +1175,15 @@ async def signuppaste(
     interaction: discord.Interaction,
     signup_type: app_commands.Choice[str]
 ):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can paste the signup list.",
+            ephemeral=True
+        )
+ 
+        return
  
     signup_type_value = signup_type.value
  
@@ -2144,7 +2300,7 @@ async def rankingsp(
     if not is_admin(interaction):
  
         await interaction.response.send_message(
-            "❌ Only server administrators can create rankings.",
+            f"❌ {STAFF_ONLY_TEXT} can create rankings.",
             ephemeral=True
         )
  
@@ -2261,7 +2417,7 @@ async def rankingsu(
     if not is_admin(interaction):
  
         await interaction.response.send_message(
-            "❌ Only server administrators can update rankings.",
+            f"❌ {STAFF_ONLY_TEXT} can update rankings.",
             ephemeral=True
         )
  
@@ -2393,7 +2549,7 @@ async def rankingsr(
     if not is_admin(interaction):
  
         await interaction.response.send_message(
-            "❌ Only server administrators can remove fighters.",
+            f"❌ {STAFF_ONLY_TEXT} can remove fighters.",
             ephemeral=True
         )
  
@@ -2496,7 +2652,7 @@ async def rankingsclearunknown(
  
     if not is_admin(interaction):
         await interaction.response.send_message(
-            "❌ Only server administrators can clear unknown fighters.",
+            f"❌ {STAFF_ONLY_TEXT} can clear unknown fighters.",
             ephemeral=True
         )
         return
@@ -2628,6 +2784,1705 @@ async def refresh_ranking_message(
         )
  
         return False
+ 
+ 
+# ============================================================
+# FIGHTER RECORDS
+#
+# Commands:
+#   /result        log a fight (staff)
+#   /profile       show a fighter's record (Fighter role or staff)
+#   /setrecord     set a starting record for older, untracked fights (staff)
+#   /importfights  import past fights from a CSV spreadsheet (staff)
+#   /importtemplate  get a blank CSV to fill in (staff)
+#   /deletefight   remove a fight logged by mistake (staff)
+#
+# None of this touches the rankings or sign-ups.
+# ============================================================
+ 
+METHOD_LABELS = {
+    "KO/TKO": "KO/TKO",
+    "SUB": "Submission",
+    "DEC": "Decision",
+    "DQ": "DQ",
+    "DRAW": "Draw",
+    "NC": "No Contest",
+}
+ 
+# Words accepted in spreadsheets for each method.
+METHOD_ALIASES = {
+    "KO/TKO": ["ko", "tko", "ko/tko", "tko/ko", "knockout", "ko tko", "ko-tko"],
+    "SUB": ["sub", "submission", "subs"],
+    "DEC": ["dec", "decision", "ud", "sd", "md", "unanimous decision",
+            "split decision", "majority decision", "points"],
+    "DQ": ["dq", "disqualification"],
+    "DRAW": ["draw", "drew", "d"],
+    "NC": ["nc", "no contest", "nocontest"],
+}
+ 
+METHOD_CHOICES = [
+    app_commands.Choice(name="KO/TKO", value="KO/TKO"),
+    app_commands.Choice(name="Submission", value="SUB"),
+    app_commands.Choice(name="Decision", value="DEC"),
+    app_commands.Choice(name="DQ", value="DQ"),
+    app_commands.Choice(name="Draw", value="DRAW"),
+    app_commands.Choice(name="No Contest", value="NC"),
+]
+ 
+DIVISION_CHOICES = [
+    choice for choice in WEIGHT_CHOICES
+    if choice.value != P4P_WEIGHT
+]
+ 
+CSV_COLUMNS = [
+    "date",
+    "event",
+    "winner",
+    "loser",
+    "method",
+    "round",
+    "division",
+    "title_fight",
+]
+ 
+MAX_IMPORT_ROWS = 2000
+ 
+ 
+def today_iso():
+    return datetime.now(timezone.utc).date().isoformat()
+ 
+ 
+def normalise_name(
+    text: str
+):
+    return " ".join(str(text).split()).casefold()
+ 
+ 
+def format_record(
+    wins: int,
+    losses: int,
+    draws: int
+):
+    return f"{wins}-{losses}-{draws}"
+ 
+ 
+def profile_link(
+    name: str,
+    user_id
+):
+ 
+    if user_id:
+        return f"[{name}](https://discord.com/users/{user_id})"
+ 
+    return name
+ 
+ 
+# ------------------------------------------------------------
+# Fight database functions
+# ------------------------------------------------------------
+ 
+def add_fight(
+    guild_id: int,
+    fight: dict,
+    source: str,
+    logged_by: int,
+    cursor=None
+):
+ 
+    own = cursor is None
+ 
+    if own:
+        db = get_db()
+        cursor = db.cursor()
+ 
+    cursor.execute("""
+        INSERT INTO fights
+        (
+            guild_id, fight_date, event,
+            winner_id, winner_name, loser_id, loser_name,
+            method, round, division, title_fight,
+            source, logged_by, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        guild_id,
+        fight.get("date"),
+        fight.get("event"),
+        fight.get("winner_id"),
+        fight["winner_name"],
+        fight.get("loser_id"),
+        fight["loser_name"],
+        fight["method"],
+        fight.get("round"),
+        fight.get("division"),
+        1 if fight.get("title_fight") else 0,
+        source,
+        logged_by,
+        now_utc()
+    ))
+ 
+    fight_id = cursor.lastrowid
+ 
+    if own:
+        db.commit()
+        db.close()
+ 
+    return fight_id
+ 
+ 
+def get_fight(
+    guild_id: int,
+    fight_id: int
+):
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute("""
+        SELECT *
+        FROM fights
+        WHERE guild_id = ?
+        AND id = ?
+    """, (
+        guild_id,
+        fight_id
+    ))
+ 
+    row = cursor.fetchone()
+ 
+    db.close()
+ 
+    return row
+ 
+ 
+def delete_fight(
+    guild_id: int,
+    fight_id: int
+):
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute("""
+        DELETE FROM fights
+        WHERE guild_id = ?
+        AND id = ?
+    """, (
+        guild_id,
+        fight_id
+    ))
+ 
+    deleted = cursor.rowcount > 0
+ 
+    db.commit()
+    db.close()
+ 
+    return deleted
+ 
+ 
+def get_fighter_fights(
+    guild_id: int,
+    user_id: int
+):
+    """
+    All fights for one fighter, oldest first.
+    Fights with no date (old imports) count as the oldest.
+    """
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute("""
+        SELECT *
+        FROM fights
+        WHERE guild_id = ?
+        AND (winner_id = ? OR loser_id = ?)
+        ORDER BY
+            fight_date IS NOT NULL,
+            fight_date ASC,
+            id ASC
+    """, (
+        guild_id,
+        user_id,
+        user_id
+    ))
+ 
+    rows = cursor.fetchall()
+ 
+    db.close()
+ 
+    return rows
+ 
+ 
+def get_existing_fight_keys(
+    guild_id: int
+):
+    """
+    Used by the importer to skip fights that are already saved.
+    """
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute("""
+        SELECT fight_date, winner_id, winner_name,
+               loser_id, loser_name, method
+        FROM fights
+        WHERE guild_id = ?
+    """, (
+        guild_id,
+    ))
+ 
+    rows = cursor.fetchall()
+ 
+    db.close()
+ 
+    return {
+        fight_key(
+            row["fight_date"],
+            row["winner_id"], row["winner_name"],
+            row["loser_id"], row["loser_name"],
+            row["method"]
+        )
+        for row in rows
+    }
+ 
+ 
+def fight_key(
+    date,
+    winner_id,
+    winner_name,
+    loser_id,
+    loser_name,
+    method
+):
+ 
+    winner = str(winner_id) if winner_id else normalise_name(winner_name)
+    loser = str(loser_id) if loser_id else normalise_name(loser_name)
+ 
+    return (date or "", winner, loser, method)
+ 
+ 
+def get_starting_record(
+    guild_id: int,
+    user_id: int
+):
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute("""
+        SELECT *
+        FROM starting_records
+        WHERE guild_id = ?
+        AND discord_user_id = ?
+    """, (
+        guild_id,
+        user_id
+    ))
+ 
+    row = cursor.fetchone()
+ 
+    db.close()
+ 
+    return row
+ 
+ 
+def set_starting_record(
+    guild_id: int,
+    user_id: int,
+    wins: int,
+    losses: int,
+    draws: int
+):
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute("""
+        INSERT OR REPLACE INTO starting_records
+        (
+            guild_id, discord_user_id,
+            wins, losses, draws, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        guild_id,
+        user_id,
+        wins,
+        losses,
+        draws,
+        now_utc()
+    ))
+ 
+    db.commit()
+    db.close()
+ 
+ 
+def get_user_rankings(
+    guild_id: int,
+    user_id: int
+):
+ 
+    db = get_db()
+    cursor = db.cursor()
+ 
+    cursor.execute("""
+        SELECT weight, rank
+        FROM rankings
+        WHERE guild_id = ?
+        AND discord_user_id = ?
+    """, (
+        guild_id,
+        user_id
+    ))
+ 
+    rows = cursor.fetchall()
+ 
+    db.close()
+ 
+    return rows
+ 
+ 
+# ------------------------------------------------------------
+# Stats
+# ------------------------------------------------------------
+ 
+def get_fighter_stats(
+    guild_id: int,
+    user_id: int
+):
+ 
+    fights = get_fighter_fights(
+        guild_id,
+        user_id
+    )
+ 
+    start = get_starting_record(
+        guild_id,
+        user_id
+    )
+ 
+    wins = losses = draws = no_contests = 0
+    wins_by = {}
+    losses_by = {}
+    title_wins = 0
+    results = []  # "W", "L", "D" in date order (no contests skipped)
+ 
+    for fight in fights:
+ 
+        method = fight["method"]
+ 
+        if method == "NC":
+            no_contests += 1
+            continue
+ 
+        if method == "DRAW":
+            draws += 1
+            results.append("D")
+            continue
+ 
+        if fight["winner_id"] == user_id:
+            wins += 1
+            wins_by[method] = wins_by.get(method, 0) + 1
+            results.append("W")
+ 
+            if fight["title_fight"]:
+                title_wins += 1
+ 
+        else:
+            losses += 1
+            losses_by[method] = losses_by.get(method, 0) + 1
+            results.append("L")
+ 
+    start_w = start["wins"] if start else 0
+    start_l = start["losses"] if start else 0
+    start_d = start["draws"] if start else 0
+ 
+    streak = ""
+ 
+    if results:
+        last = results[-1]
+        count = 0
+ 
+        for result in reversed(results):
+            if result != last:
+                break
+            count += 1
+ 
+        streak = f"{last}{count}"
+ 
+    finishes = wins_by.get("KO/TKO", 0) + wins_by.get("SUB", 0)
+ 
+    return {
+        "fights": fights,
+        "wins": wins + start_w,
+        "losses": losses + start_l,
+        "draws": draws + start_d,
+        "no_contests": no_contests,
+        "logged_wins": wins,
+        "wins_by": wins_by,
+        "losses_by": losses_by,
+        "title_wins": title_wins,
+        "streak": streak,
+        "finish_rate": (
+            round(100 * finishes / wins) if wins else None
+        ),
+        "starting_record": (
+            format_record(start_w, start_l, start_d) if start else None
+        ),
+    }
+ 
+ 
+def stats_record(
+    stats: dict
+):
+    return format_record(
+        stats["wins"],
+        stats["losses"],
+        stats["draws"]
+    )
+ 
+ 
+# ------------------------------------------------------------
+# Embeds
+# ------------------------------------------------------------
+ 
+async def opponent_text(
+    guild: discord.Guild,
+    user_id,
+    saved_name: str
+):
+ 
+    if user_id:
+        member = await get_server_member(
+            guild,
+            user_id
+        )
+ 
+        if member:
+            return profile_link(member.display_name, member.id)
+ 
+    return saved_name
+ 
+ 
+def fight_line_tag(
+    fight,
+    user_id: int
+):
+ 
+    if fight["method"] == "NC":
+        return "⚪ **NC**"
+ 
+    if fight["method"] == "DRAW":
+        return "🟡 **D**"
+ 
+    if fight["winner_id"] == user_id:
+        return "🟢 **W**"
+ 
+    return "🔴 **L**"
+ 
+ 
+def fight_method_text(
+    fight
+):
+ 
+    method = fight["method"]
+ 
+    if method in ("DRAW", "NC"):
+        return METHOD_LABELS[method]
+ 
+    text = METHOD_LABELS.get(method, method)
+ 
+    if fight["round"] and method != "DEC":
+        text += f" R{fight['round']}"
+ 
+    return text
+ 
+ 
+async def create_profile_embed(
+    guild: discord.Guild,
+    member
+):
+ 
+    stats = get_fighter_stats(
+        guild.id,
+        member.id
+    )
+ 
+    ranks = get_user_rankings(
+        guild.id,
+        member.id
+    )
+ 
+    # Champion lines + ranking list
+    champion_of = [
+        row["weight"] for row in ranks
+        if row["rank"] == 0 and row["weight"] != P4P_WEIGHT
+    ]
+ 
+    rank_lines = []
+ 
+    # Divisions first, P4P last.
+    weight_order = [w for w in WEIGHTS.keys() if w != P4P_WEIGHT] + [P4P_WEIGHT]
+ 
+    for weight in weight_order:
+        for row in ranks:
+            if row["weight"] != weight:
+                continue
+ 
+            if row["rank"] == 0:
+                rank_lines.append(f"👑 {weight}")
+            elif weight == P4P_WEIGHT:
+                rank_lines.append(f"#{row['rank']} P4P")
+            else:
+                rank_lines.append(f"#{row['rank']} {weight}")
+ 
+    embed = discord.Embed(
+        title=member.display_name,
+        url=f"https://discord.com/users/{member.id}",
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+ 
+    description = []
+ 
+    for weight in champion_of:
+        description.append(f"👑 **{weight} Champion**")
+ 
+    if stats["title_wins"]:
+        description.append(
+            f"🏆 {stats['title_wins']} title fight "
+            f"win{'s' if stats['title_wins'] != 1 else ''}"
+        )
+ 
+    if description:
+        embed.description = "\n".join(description)
+ 
+    # Banner: champion division, else best-ranked division,
+    # else division of their latest fight.
+    banner_weight = None
+ 
+    if champion_of:
+        banner_weight = champion_of[0]
+    else:
+        ranked = sorted(
+            (row for row in ranks if row["weight"] != P4P_WEIGHT),
+            key=lambda row: row["rank"]
+        )
+ 
+        if ranked:
+            banner_weight = ranked[0]["weight"]
+        else:
+            for fight in reversed(stats["fights"]):
+                if fight["division"]:
+                    banner_weight = fight["division"]
+                    break
+ 
+    apply_branding(
+        embed,
+        banner_file=(
+            ranking_banner_file(banner_weight)
+            if banner_weight else None
+        ),
+        author_text="PFO • FIGHTER PROFILE",
+        show_thumbnail=False
+    )
+ 
+    # Fighter's own avatar in the corner.
+    avatar = getattr(member, "display_avatar", None)
+ 
+    if avatar:
+        embed.set_thumbnail(
+            url=avatar.url
+        )
+ 
+    streak = stats["streak"]
+ 
+    if streak.startswith("W") and int(streak[1:]) >= 3:
+        streak_text = f"🔥 {streak}"
+    elif streak:
+        streak_text = streak
+    else:
+        streak_text = "—"
+ 
+    embed.add_field(
+        name="Record",
+        value=f"**{stats_record(stats)}**",
+        inline=True
+    )
+ 
+    embed.add_field(
+        name="Streak",
+        value=streak_text,
+        inline=True
+    )
+ 
+    embed.add_field(
+        name="Finish Rate",
+        value=(
+            f"{stats['finish_rate']}%"
+            if stats["finish_rate"] is not None else "—"
+        ),
+        inline=True
+    )
+ 
+    embed.add_field(
+        name="Rankings",
+        value="\n".join(rank_lines) if rank_lines else "Unranked",
+        inline=True
+    )
+ 
+    def method_lines(counts):
+        lines = [
+            f"{METHOD_LABELS[method]}  {counts[method]}"
+            for method in ("KO/TKO", "SUB", "DEC", "DQ")
+            if counts.get(method)
+        ]
+        return "\n".join(lines) if lines else "—"
+ 
+    embed.add_field(
+        name="Wins By",
+        value=method_lines(stats["wins_by"]),
+        inline=True
+    )
+ 
+    embed.add_field(
+        name="Losses By",
+        value=method_lines(stats["losses_by"]),
+        inline=True
+    )
+ 
+    # Last 5 fights, newest first
+    recent = list(reversed(stats["fights"]))[:5]
+ 
+    if recent:
+        lines = []
+ 
+        for fight in recent:
+            if fight["winner_id"] == member.id:
+                opp = await opponent_text(guild, fight["loser_id"], fight["loser_name"])
+            else:
+                opp = await opponent_text(guild, fight["winner_id"], fight["winner_name"])
+ 
+            extra = ""
+ 
+            if fight["event"]:
+                extra += f" · *{fight['event']}*"
+ 
+            if fight["title_fight"]:
+                extra += " 👑"
+ 
+            lines.append(
+                f"{fight_line_tag(fight, member.id)} vs {opp} — "
+                f"{fight_method_text(fight)}{extra}"
+            )
+ 
+        embed.add_field(
+            name="🥊 Last 5 Fights",
+            value="\n".join(lines)[:1024],
+            inline=False
+        )
+ 
+    footer = f"{len(stats['fights'])} PFO fight{'s' if len(stats['fights']) != 1 else ''} logged"
+ 
+    if stats["starting_record"]:
+        footer += f" • includes earlier record {stats['starting_record']}"
+ 
+    embed.set_footer(
+        text=footer,
+        icon_url=asset_url(LOGO_FILE)
+    )
+ 
+    return embed
+ 
+ 
+def create_result_embed(
+    fight_id: int,
+    fight: dict,
+    before: dict,
+    after: dict,
+    logged_by_name: str
+):
+    """
+    before / after: {"winner": "6-0-0", "loser": "4-2-0"}
+    """
+ 
+    method = fight["method"]
+    winner = profile_link(fight["winner_name"], fight.get("winner_id"))
+    loser = profile_link(fight["loser_name"], fight.get("loser_id"))
+ 
+    if fight.get("event"):
+        author = f"PFO • {fight['event'].upper()} • RESULT"
+    else:
+        author = "PFO • FIGHT RESULT"
+ 
+    if fight.get("title_fight") and fight.get("division"):
+        title = f"👑 {fight['division']} Title Fight"
+    elif fight.get("title_fight"):
+        title = "👑 Title Fight"
+    elif fight.get("division"):
+        title = f"{fight['division']} Bout"
+    else:
+        title = None
+ 
+    if method == "DRAW":
+        headline = f"🤝 **{winner}** and **{loser}** fought to a draw"
+        tags = ("D", "D")
+    elif method == "NC":
+        headline = f"⚪ **{winner}** vs **{loser}** ended in a no contest"
+        tags = ("NC", "NC")
+    else:
+        headline = f"🏆 **{winner}** def. **{loser}**"
+        tags = ("W", "L")
+ 
+    lines = [
+        headline,
+        "",
+        f"**Method:** {METHOD_LABELS[method]}",
+    ]
+ 
+    if fight.get("round") and method not in ("DRAW", "NC"):
+        lines.append(f"**Round:** {fight['round']}")
+ 
+    lines += [
+        "",
+        "**Updated records**",
+        f"`{tags[0]:^3}` {fight['winner_name']}  "
+        f"{before['winner']} → **{after['winner']}**",
+        f"`{tags[1]:^3}` {fight['loser_name']}  "
+        f"{before['loser']} → **{after['loser']}**",
+    ]
+ 
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+ 
+    apply_branding(
+        embed,
+        banner_file=(
+            ranking_banner_file(fight["division"])
+            if fight.get("division") else None
+        ),
+        author_text=author
+    )
+ 
+    embed.set_footer(
+        text=f"Fight #{fight_id} • Logged by {logged_by_name}",
+        icon_url=asset_url(LOGO_FILE)
+    )
+ 
+    return embed
+ 
+ 
+# ------------------------------------------------------------
+# /RESULT
+# ------------------------------------------------------------
+ 
+@bot.tree.command(
+    name="result",
+    description="Log a fight result."
+)
+@app_commands.describe(
+    winner="The winner (for a draw or no contest, either fighter)",
+    loser="The loser (for a draw or no contest, the other fighter)",
+    method="How the fight ended",
+    round="Round it ended in (leave empty for decisions)",
+    division="Weight class",
+    title_fight="Was a belt on the line?",
+    event="Event name, e.g. Fight Night 15"
+)
+@app_commands.choices(
+    method=METHOD_CHOICES,
+    division=DIVISION_CHOICES
+)
+async def result(
+    interaction: discord.Interaction,
+    winner: discord.Member,
+    loser: discord.Member,
+    method: app_commands.Choice[str],
+    round: app_commands.Range[int, 1, 5] = None,
+    division: app_commands.Choice[str] = None,
+    title_fight: bool = False,
+    event: str = None
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can log results.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    if winner.id == loser.id:
+ 
+        await interaction.response.send_message(
+            "❌ The winner and loser must be two different fighters.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    if winner.bot or loser.bot:
+ 
+        await interaction.response.send_message(
+            "❌ Bots can't have fight records.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    await interaction.response.defer()
+ 
+    try:
+ 
+        guild_id = interaction.guild.id
+ 
+        before = {
+            "winner": stats_record(get_fighter_stats(guild_id, winner.id)),
+            "loser": stats_record(get_fighter_stats(guild_id, loser.id)),
+        }
+ 
+        fight = {
+            "date": today_iso(),
+            "event": event.strip() if event and event.strip() else None,
+            "winner_id": winner.id,
+            "winner_name": winner.display_name,
+            "loser_id": loser.id,
+            "loser_name": loser.display_name,
+            "method": method.value,
+            "round": round,
+            "division": division.value if division else None,
+            "title_fight": title_fight,
+        }
+ 
+        fight_id = add_fight(
+            guild_id,
+            fight,
+            "result",
+            interaction.user.id
+        )
+ 
+        after = {
+            "winner": stats_record(get_fighter_stats(guild_id, winner.id)),
+            "loser": stats_record(get_fighter_stats(guild_id, loser.id)),
+        }
+ 
+        await interaction.followup.send(
+            embed=create_result_embed(
+                fight_id,
+                fight,
+                before,
+                after,
+                interaction.user.display_name
+            )
+        )
+ 
+    except Exception as error:
+ 
+        print(
+            f"Result error: {error}"
+        )
+ 
+        await interaction.followup.send(
+            "❌ Something went wrong while logging the result.",
+            ephemeral=True
+        )
+ 
+ 
+# ------------------------------------------------------------
+# /PROFILE
+# ------------------------------------------------------------
+ 
+@bot.tree.command(
+    name="profile",
+    description="Show a fighter's PFO record."
+)
+@app_commands.describe(
+    fighter="Whose profile? Leave empty for your own."
+)
+async def profile(
+    interaction: discord.Interaction,
+    fighter: discord.Member = None
+):
+ 
+    if not is_fighter_or_staff(interaction):
+ 
+        await interaction.response.send_message(
+            "❌ You need the Fighter role to use /profile.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    member = fighter or interaction.user
+ 
+    if member.bot:
+ 
+        await interaction.response.send_message(
+            "❌ Bots don't have fight records.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    await interaction.response.defer()
+ 
+    try:
+ 
+        await interaction.followup.send(
+            embed=await create_profile_embed(
+                interaction.guild,
+                member
+            )
+        )
+ 
+    except Exception as error:
+ 
+        print(
+            f"Profile error: {error}"
+        )
+ 
+        await interaction.followup.send(
+            "❌ Something went wrong while loading that profile.",
+            ephemeral=True
+        )
+ 
+ 
+# ------------------------------------------------------------
+# /SETRECORD
+# ------------------------------------------------------------
+ 
+@bot.tree.command(
+    name="setrecord",
+    description="Set a fighter's earlier record (fights that were never logged)."
+)
+@app_commands.describe(
+    fighter="Which fighter?",
+    wins="Earlier wins",
+    losses="Earlier losses",
+    draws="Earlier draws"
+)
+async def setrecord(
+    interaction: discord.Interaction,
+    fighter: discord.Member,
+    wins: app_commands.Range[int, 0, 999],
+    losses: app_commands.Range[int, 0, 999],
+    draws: app_commands.Range[int, 0, 999] = 0
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can set records.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    if fighter.bot:
+ 
+        await interaction.response.send_message(
+            "❌ Bots can't have fight records.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    set_starting_record(
+        interaction.guild.id,
+        fighter.id,
+        wins,
+        losses,
+        draws
+    )
+ 
+    stats = get_fighter_stats(
+        interaction.guild.id,
+        fighter.id
+    )
+ 
+    await interaction.response.send_message(
+        (
+            f"✅ Earlier record for **{fighter.display_name}** set to "
+            f"**{format_record(wins, losses, draws)}**.\n"
+            f"Their full record is now **{stats_record(stats)}** "
+            f"including logged fights."
+        ),
+        ephemeral=True
+    )
+ 
+ 
+# ------------------------------------------------------------
+# /DELETEFIGHT
+# ------------------------------------------------------------
+ 
+@bot.tree.command(
+    name="deletefight",
+    description="Delete a fight that was logged by mistake."
+)
+@app_commands.describe(
+    fight_id="The fight number, shown at the bottom of the result card (Fight #...)"
+)
+async def deletefight(
+    interaction: discord.Interaction,
+    fight_id: int
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can delete fights.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    fight = get_fight(
+        interaction.guild.id,
+        fight_id
+    )
+ 
+    if not fight:
+ 
+        await interaction.response.send_message(
+            f"❌ There is no fight #{fight_id}.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    delete_fight(
+        interaction.guild.id,
+        fight_id
+    )
+ 
+    if fight["method"] in ("DRAW", "NC"):
+        summary = f"{fight['winner_name']} vs {fight['loser_name']} ({METHOD_LABELS[fight['method']]})"
+    else:
+        summary = f"{fight['winner_name']} def. {fight['loser_name']} ({METHOD_LABELS[fight['method']]})"
+ 
+    await interaction.response.send_message(
+        f"🗑️ Deleted fight #{fight_id}: {summary}. Both records have been updated.",
+        ephemeral=True
+    )
+ 
+ 
+# ------------------------------------------------------------
+# IMPORTING PAST FIGHTS
+# ------------------------------------------------------------
+ 
+def template_csv():
+ 
+    return (
+        "date,event,winner,loser,method,round,division,title_fight\n"
+        "2026-03-14,Fight Night 1,razorreyes,leonward,KO/TKO,1,Lightweight,no\n"
+        "2026-03-14,Fight Night 1,dimapetrenko,jordanprice,SUB,2,Lightweight,no\n"
+        "2026-03-21,Live Card 1,razorreyes,dimapetrenko,DEC,,Lightweight,yes\n"
+    )
+ 
+ 
+def parse_method(
+    text: str
+):
+ 
+    key = normalise_name(text)
+ 
+    for method, aliases in METHOD_ALIASES.items():
+        if key in aliases:
+            return method
+ 
+    return None
+ 
+ 
+def parse_division(
+    text: str
+):
+ 
+    key = role_key(text)
+ 
+    if not key:
+        return None, True
+ 
+    for weight, short in WEIGHTS.items():
+        if weight == P4P_WEIGHT:
+            continue
+ 
+        if key in (role_key(weight), role_key(short)):
+            return weight, True
+ 
+    return None, False
+ 
+ 
+def parse_date(
+    text: str
+):
+ 
+    text = text.strip()
+ 
+    if not text:
+        return None, True
+ 
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d/%m/%y", "%d-%m-%Y", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat(), True
+        except ValueError:
+            pass
+ 
+    return None, False
+ 
+ 
+def parse_yes_no(
+    text: str
+):
+ 
+    return normalise_name(text) in ("yes", "y", "true", "1", "title", "x")
+ 
+ 
+def build_member_lookup(
+    guild: discord.Guild
+):
+ 
+    lookup = {}
+ 
+    for member in guild.members:
+ 
+        if member.bot:
+            continue
+ 
+        names = {
+            member.name,
+            member.display_name,
+            getattr(member, "global_name", None),
+        }
+ 
+        for name in names:
+            if not name:
+                continue
+ 
+            # Also match the name without a record or tags,
+            # e.g. "Razor Reyes [C] (9-1-0)" matches "Razor Reyes".
+            plain = re.sub(r"\s*\([^()]*\)\s*$", "", name)
+            plain = re.sub(r"\s*\[[^\[\]]*\]", "", plain)
+ 
+            for variant in {name, plain}:
+                if variant.strip():
+                    lookup.setdefault(
+                        normalise_name(variant),
+                        set()
+                    ).add(member)
+ 
+    return lookup
+ 
+ 
+def resolve_fighter(
+    guild: discord.Guild,
+    lookup: dict,
+    text: str
+):
+    """
+    Returns (user_id, display_name, status)
+      status: "member"    matched a member
+              "id_only"   a user ID for someone not in the server
+              "name_only" no member found, saved by name
+              "ambiguous" several members match that name
+    """
+ 
+    text = text.strip()
+ 
+    mention = re.fullmatch(r"<@!?(\d+)>", text)
+    digits = mention.group(1) if mention else (
+        text if text.isdigit() and 15 <= len(text) <= 20 else None
+    )
+ 
+    if digits:
+        user_id = int(digits)
+        member = guild.get_member(user_id)
+ 
+        if member:
+            return member.id, member.display_name, "member"
+ 
+        return user_id, "Unknown Fighter", "id_only"
+ 
+    matches = lookup.get(
+        normalise_name(text),
+        set()
+    )
+ 
+    if len(matches) == 1:
+        member = next(iter(matches))
+        return member.id, member.display_name, "member"
+ 
+    if len(matches) > 1:
+        return None, text, "ambiguous"
+ 
+    return None, text, "name_only"
+ 
+ 
+def parse_fight_csv(
+    guild: discord.Guild,
+    raw: bytes
+):
+    """
+    Checks every row and returns:
+      ready      fights that can be imported
+      problems   (row number, reason) for rows that need fixing
+      name_only  names that didn't match a member (saved by name)
+      skipped    rows already in the database
+    """
+ 
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+ 
+    reader = csv.DictReader(io.StringIO(text))
+ 
+    if not reader.fieldnames:
+        return [], [(0, "The file is empty.")], set(), 0
+ 
+    headers = {
+        normalise_name(h).replace(" ", "_"): h
+        for h in reader.fieldnames if h
+    }
+ 
+    missing = [
+        col for col in ("winner", "loser", "method")
+        if col not in headers
+    ]
+ 
+    if missing:
+        return [], [(1, "Missing column(s): " + ", ".join(missing)
+                     + ". Use /importtemplate for the right layout.")], set(), 0
+ 
+    def cell(row, col):
+        header = headers.get(col)
+        value = row.get(header) if header else None
+        return (value or "").strip()
+ 
+    lookup = build_member_lookup(guild)
+    existing = get_existing_fight_keys(guild.id)
+ 
+    ready = []
+    problems = []
+    name_only = set()
+    skipped = 0
+    seen = set()
+ 
+    for number, row in enumerate(reader, start=2):
+ 
+        if number - 1 > MAX_IMPORT_ROWS:
+            problems.append((number, f"Only the first {MAX_IMPORT_ROWS} rows are read."))
+            break
+ 
+        if not any((value or "").strip() for value in row.values() if isinstance(value, str)):
+            continue
+ 
+        winner_text = cell(row, "winner")
+        loser_text = cell(row, "loser")
+ 
+        if not winner_text or not loser_text:
+            problems.append((number, "winner and loser are both needed"))
+            continue
+ 
+        method = parse_method(cell(row, "method"))
+ 
+        if not method:
+            problems.append((
+                number,
+                f"method `{cell(row, 'method') or 'empty'}` isn't recognised "
+                "(use KO/TKO, SUB, DEC, DQ, DRAW or NC)"
+            ))
+            continue
+ 
+        round_text = cell(row, "round")
+        fight_round = None
+ 
+        if round_text:
+            if round_text.isdigit() and 1 <= int(round_text) <= 5:
+                fight_round = int(round_text)
+            else:
+                problems.append((number, f"round `{round_text}` should be 1 to 5 or empty"))
+                continue
+ 
+        division, ok = parse_division(cell(row, "division"))
+ 
+        if not ok:
+            problems.append((number, f"division `{cell(row, 'division')}` isn't a PFO weight class"))
+            continue
+ 
+        date, ok = parse_date(cell(row, "date"))
+ 
+        if not ok:
+            problems.append((number, f"date `{cell(row, 'date')}` should look like 2026-03-14 or 14/03/2026"))
+            continue
+ 
+        bad = False
+        resolved = []
+ 
+        for text in (winner_text, loser_text):
+            user_id, name, status = resolve_fighter(guild, lookup, text)
+ 
+            if status == "ambiguous":
+                problems.append((
+                    number,
+                    f"`{text}` matches more than one member; use their username or user ID"
+                ))
+                bad = True
+                break
+ 
+            if status == "name_only":
+                name_only.add(name)
+ 
+            resolved.append((user_id, name))
+ 
+        if bad:
+            continue
+ 
+        (winner_id, winner_name), (loser_id, loser_name) = resolved
+ 
+        if (winner_id and winner_id == loser_id) or (
+            not winner_id and normalise_name(winner_name) == normalise_name(loser_name)
+        ):
+            problems.append((number, "winner and loser are the same fighter"))
+            continue
+ 
+        key = fight_key(date, winner_id, winner_name, loser_id, loser_name, method)
+ 
+        if key in existing or key in seen:
+            skipped += 1
+            continue
+ 
+        seen.add(key)
+ 
+        event = cell(row, "event")
+ 
+        ready.append({
+            "date": date,
+            "event": event or None,
+            "winner_id": winner_id,
+            "winner_name": winner_name,
+            "loser_id": loser_id,
+            "loser_name": loser_name,
+            "method": method,
+            "round": fight_round,
+            "division": division,
+            "title_fight": parse_yes_no(cell(row, "title_fight")),
+        })
+ 
+    return ready, problems, name_only, skipped
+ 
+ 
+def create_import_summary_embed(
+    ready: list,
+    problems: list,
+    name_only: set,
+    skipped: int
+):
+ 
+    fighters = set()
+ 
+    for fight in ready:
+        fighters.add(fight["winner_id"] or normalise_name(fight["winner_name"]))
+        fighters.add(fight["loser_id"] or normalise_name(fight["loser_name"]))
+ 
+    lines = [
+        f"Found **{len(ready) + len(problems) + skipped} fight rows**.",
+        "",
+        f"✅ **{len(ready)} fights** for **{len(fighters)} fighters** are ready to import",
+    ]
+ 
+    if skipped:
+        lines.append(f"⏭️ **{skipped}** already saved, so they'll be skipped")
+ 
+    if name_only:
+        names = sorted(name_only)
+        shown = ", ".join(f"`{n}`" for n in names[:8])
+        more = f" and {len(names) - 8} more" if len(names) > 8 else ""
+        lines += [
+            "",
+            f"👤 **{len(names)} name(s) didn't match a member** and will be "
+            f"saved by name only (fine for people who've left; "
+            f"check for typos): {shown}{more}",
+        ]
+ 
+    if problems:
+        lines += ["", f"⚠️ **{len(problems)} row(s) need fixing** and won't be imported:"]
+ 
+        for number, reason in problems[:10]:
+            lines.append(f"• Row {number}: {reason}")
+ 
+        if len(problems) > 10:
+            lines.append(f"• …and {len(problems) - 10} more")
+ 
+    lines += ["", "Nothing is saved until you press **Import**."]
+ 
+    embed = discord.Embed(
+        title="Check before importing",
+        description="\n".join(lines)[:4000],
+        color=PFO_GOLD
+    )
+ 
+    apply_branding(
+        embed,
+        author_text="PFO • IMPORT FIGHT HISTORY"
+    )
+ 
+    embed.set_footer(
+        text="This expires in 10 minutes",
+        icon_url=asset_url(LOGO_FILE)
+    )
+ 
+    return embed
+ 
+ 
+class ImportConfirmView(
+    discord.ui.View
+):
+ 
+    def __init__(
+        self,
+        author_id: int,
+        guild_id: int,
+        fights: list
+    ):
+ 
+        super().__init__(
+            timeout=600
+        )
+ 
+        self.author_id = author_id
+        self.guild_id = guild_id
+        self.fights = fights
+ 
+        confirm = discord.ui.Button(
+            label=f"Import {len(fights)} fight{'s' if len(fights) != 1 else ''}",
+            style=discord.ButtonStyle.green,
+            emoji="✅",
+            disabled=not fights
+        )
+ 
+        confirm.callback = self.confirm
+ 
+        cancel = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.grey
+        )
+ 
+        cancel.callback = self.cancel
+ 
+        self.add_item(confirm)
+        self.add_item(cancel)
+ 
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+ 
+        if interaction.user.id != self.author_id:
+ 
+            await interaction.response.send_message(
+                "❌ Only the person who started this import can confirm it.",
+                ephemeral=True
+            )
+ 
+            return False
+ 
+        return True
+ 
+    async def confirm(
+        self,
+        interaction: discord.Interaction
+    ):
+ 
+        db = get_db()
+        cursor = db.cursor()
+ 
+        try:
+            for fight in self.fights:
+                add_fight(
+                    self.guild_id,
+                    fight,
+                    "import",
+                    self.author_id,
+                    cursor=cursor
+                )
+ 
+            db.commit()
+ 
+        except Exception as error:
+ 
+            db.rollback()
+            db.close()
+ 
+            print(f"Import error: {error}")
+ 
+            await interaction.response.edit_message(
+                content="❌ The import failed and nothing was saved. Please try again.",
+                embed=None,
+                view=None
+            )
+ 
+            return
+ 
+        db.close()
+ 
+        fighters = {
+            f["winner_id"] or normalise_name(f["winner_name"]) for f in self.fights
+        } | {
+            f["loser_id"] or normalise_name(f["loser_name"]) for f in self.fights
+        }
+ 
+        self.stop()
+ 
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **Imported {len(self.fights)} fights.** "
+                f"Records for {len(fighters)} fighters are updated; "
+                f"check anyone with /profile."
+            ),
+            embed=None,
+            view=None
+        )
+ 
+    async def cancel(
+        self,
+        interaction: discord.Interaction
+    ):
+ 
+        self.stop()
+ 
+        await interaction.response.edit_message(
+            content="Import cancelled. Nothing was saved.",
+            embed=None,
+            view=None
+        )
+ 
+ 
+@bot.tree.command(
+    name="importtemplate",
+    description="Get a spreadsheet template for importing past fights."
+)
+async def importtemplate(
+    interaction: discord.Interaction
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can import fights.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    await interaction.response.send_message(
+        (
+            "📄 **Fight history template**\n"
+            "One row per fight. Open it in Excel or Google Sheets, fill it in, "
+            "then save/download it as **CSV** and use `/importfights`.\n\n"
+            "• **winner / loser:** Discord username works best (or user ID). "
+            "Names of people who've left are saved by name only.\n"
+            "• **method:** KO/TKO, SUB, DEC, DQ, DRAW or NC. "
+            "For DRAW or NC put either fighter as winner.\n"
+            "• **round:** 1-5, or empty for decisions.\n"
+            "• **date:** 2026-03-14 or 14/03/2026 (can be empty).\n"
+            "• **division:** e.g. Lightweight or LW (can be empty).\n"
+            "• **title_fight:** yes or no.\n"
+            "• Importing the same file twice won't double up fights."
+        ),
+        file=discord.File(
+            io.BytesIO(template_csv().encode("utf-8")),
+            filename="pfo_fight_history_template.csv"
+        ),
+        ephemeral=True
+    )
+ 
+ 
+@bot.tree.command(
+    name="importfights",
+    description="Import past fights from a CSV spreadsheet."
+)
+@app_commands.describe(
+    file="The filled-in CSV file (get the layout from /importtemplate)"
+)
+async def importfights(
+    interaction: discord.Interaction,
+    file: discord.Attachment
+):
+ 
+    if not is_staff(interaction):
+ 
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can import fights.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    if not file.filename.lower().endswith((".csv", ".txt")):
+ 
+        await interaction.response.send_message(
+            "❌ Please upload a **.csv** file. In Excel use *Save As → CSV*, "
+            "in Google Sheets use *File → Download → CSV*.",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    if file.size > 2_000_000:
+ 
+        await interaction.response.send_message(
+            "❌ That file is too big (2 MB max).",
+            ephemeral=True
+        )
+ 
+        return
+ 
+    await interaction.response.defer(
+        ephemeral=True
+    )
+ 
+    try:
+ 
+        raw = await file.read()
+ 
+        ready, problems, name_only, skipped = parse_fight_csv(
+            interaction.guild,
+            raw
+        )
+ 
+        await interaction.followup.send(
+            embed=create_import_summary_embed(
+                ready,
+                problems,
+                name_only,
+                skipped
+            ),
+            view=ImportConfirmView(
+                interaction.user.id,
+                interaction.guild.id,
+                ready
+            ),
+            ephemeral=True
+        )
+ 
+    except Exception as error:
+ 
+        print(
+            f"Import read error: {error}"
+        )
+ 
+        await interaction.followup.send(
+            "❌ Couldn't read that file. Make sure it's a CSV saved from "
+            "Excel or Google Sheets, using the /importtemplate layout.",
+            ephemeral=True
+        )
  
  
 # ============================================================
