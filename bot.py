@@ -3,6 +3,7 @@ import io
 import os
 import re
 import sqlite3
+import types
 from datetime import datetime, timezone
  
 import discord
@@ -2992,15 +2993,46 @@ def delete_fight(
  
 def get_fighter_fights(
     guild_id: int,
-    user_id: int
+    user_id: int,
+    name: str = None
 ):
     """
     All fights for one fighter, oldest first.
     Fights with no date (old imports) count as the oldest.
+ 
+    Fighters who left and were saved by name only (no user ID)
+    are looked up by name instead.
     """
  
     db = get_db()
     cursor = db.cursor()
+ 
+    if not user_id:
+ 
+        cursor.execute("""
+            SELECT *
+            FROM fights
+            WHERE guild_id = ?
+            AND (winner_id IS NULL OR loser_id IS NULL)
+            ORDER BY
+                fight_date IS NOT NULL,
+                fight_date ASC,
+                id ASC
+        """, (
+            guild_id,
+        ))
+ 
+        key = normalise_name(name or "")
+ 
+        rows = [
+            row for row in cursor.fetchall()
+            if (row["winner_id"] is None and normalise_name(row["winner_name"]) == key)
+            or (row["loser_id"] is None and normalise_name(row["loser_name"]) == key)
+        ]
+ 
+        db.close()
+ 
+        return rows
  
     cursor.execute("""
         SELECT *
@@ -3158,20 +3190,37 @@ def get_user_rankings(
 # Stats
 # ------------------------------------------------------------
  
+def fight_is_win_for(
+    fight,
+    user_id,
+    name: str = None
+):
+ 
+    if user_id:
+        return fight["winner_id"] == user_id
+ 
+    return (
+        fight["winner_id"] is None
+        and normalise_name(fight["winner_name"]) == normalise_name(name or "")
+    )
+ 
+ 
 def get_fighter_stats(
     guild_id: int,
-    user_id: int
+    user_id: int,
+    name: str = None
 ):
  
     fights = get_fighter_fights(
         guild_id,
-        user_id
+        user_id,
+        name
     )
  
     start = get_starting_record(
         guild_id,
         user_id
-    )
+    ) if user_id else None
  
     wins = losses = draws = no_contests = 0
     wins_by = {}
@@ -3192,7 +3241,7 @@ def get_fighter_stats(
             results.append("D")
             continue
  
-        if fight["winner_id"] == user_id:
+        if fight_is_win_for(fight, user_id, name):
             wins += 1
             wins_by[method] = wins_by.get(method, 0) + 1
             results.append("W")
@@ -3258,6 +3307,44 @@ def stats_record(
 # Embeds
 # ------------------------------------------------------------
  
+DEPARTED_NAME_CACHE = {}
+ 
+ 
+async def departed_name(
+    user_id: int
+):
+    """
+    The Discord username of someone who isn't in the server
+    (any more). Discord still knows who they are by their ID.
+    """
+ 
+    if user_id in DEPARTED_NAME_CACHE:
+        return DEPARTED_NAME_CACHE[user_id]
+ 
+    try:
+        user = await bot.fetch_user(user_id)
+        name = user.global_name or user.name
+    except Exception:
+        name = "Unknown Fighter"
+ 
+    DEPARTED_NAME_CACHE[user_id] = name
+ 
+    return name
+ 
+ 
+async def fill_departed_names(
+    fights: list
+):
+    """Swaps "Unknown Fighter" for the real username where we have an ID."""
+ 
+    for fight in fights:
+        for side in ("winner", "loser"):
+            if fight.get(f"{side}_id") and fight[f"{side}_name"] == "Unknown Fighter":
+                fight[f"{side}_name"] = await departed_name(fight[f"{side}_id"])
+ 
+    return fights
+ 
+ 
 async def opponent_text(
     guild: discord.Guild,
     user_id,
@@ -3273,12 +3360,16 @@ async def opponent_text(
         if member:
             return profile_link(member.display_name, member.id)
  
+        if saved_name == "Unknown Fighter":
+            saved_name = await departed_name(user_id)
+ 
     return saved_name
  
  
 def fight_line_tag(
     fight,
-    user_id: int
+    user_id: int,
+    name: str = None
 ):
  
     if fight["method"] == "NC":
@@ -3287,7 +3378,7 @@ def fight_line_tag(
     if fight["method"] == "DRAW":
         return "🟡 **D**"
  
-    if fight["winner_id"] == user_id:
+    if fight_is_win_for(fight, user_id, name):
         return "🟢 **W**"
  
     return "🔴 **L**"
@@ -3317,13 +3408,14 @@ async def create_profile_embed(
  
     stats = get_fighter_stats(
         guild.id,
-        member.id
+        member.id,
+        member.display_name
     )
  
     ranks = get_user_rankings(
         guild.id,
         member.id
-    )
+    ) if member.id else []
  
     # Champion lines + ranking list
     champion_of = [
@@ -3350,7 +3442,10 @@ async def create_profile_embed(
  
     embed = discord.Embed(
         title=member.display_name,
-        url=f"https://discord.com/users/{member.id}",
+        url=(
+            f"https://discord.com/users/{member.id}"
+            if member.id else None
+        ),
         color=PFO_GOLD,
         timestamp=discord.utils.utcnow()
     )
@@ -3447,7 +3542,7 @@ async def create_profile_embed(
         lines = []
  
         for fight in recent:
-            if fight["winner_id"] == member.id:
+            if fight_is_win_for(fight, member.id, member.display_name):
                 opp = await opponent_text(guild, fight["loser_id"], fight["loser_name"])
             else:
                 opp = await opponent_text(guild, fight["winner_id"], fight["winner_name"])
@@ -3464,7 +3559,7 @@ async def create_profile_embed(
                 extra += " 👑"
  
             lines.append(
-                f"{fight_line_tag(fight, member.id)} vs {opp} — "
+                f"{fight_line_tag(fight, member.id, member.display_name)} vs {opp} — "
                 f"{fight_method_text(fight)}{extra}"
             )
  
@@ -3478,6 +3573,9 @@ async def create_profile_embed(
  
     if stats["starting_record"]:
         footer += f" • includes earlier record {stats['starting_record']}"
+ 
+    if getattr(member, "left_server", False):
+        footer += " • no longer in the server"
  
     embed.set_footer(
         text=footer,
@@ -3569,6 +3667,103 @@ def create_result_embed(
  
  
 # ------------------------------------------------------------
+# Fighters who have left the server
+#
+# Discord only lets you pick current members in a command, so
+# the "..._left" options take a user ID (best: records follow
+# them if they come back) or just a name.
+#
+# Getting a user ID: Discord settings → Advanced → turn on
+# Developer Mode, then right-click their name on an old message
+# → Copy User ID.
+# ------------------------------------------------------------
+ 
+class FighterInputError(Exception):
+    pass
+ 
+ 
+async def resolve_left_fighter(
+    guild: discord.Guild,
+    text: str
+):
+    """Returns (user_id or None, name, still_in_server)."""
+ 
+    text = text.strip()
+ 
+    mention = re.fullmatch(r"<@!?(\d+)>", text)
+    digits = mention.group(1) if mention else (
+        text if text.isdigit() and 15 <= len(text) <= 20 else None
+    )
+ 
+    if digits:
+        user_id = int(digits)
+        member = guild.get_member(user_id)
+ 
+        if member:
+            return member.id, member.display_name, True
+ 
+        return user_id, await departed_name(user_id), False
+ 
+    user_id, name, status = resolve_fighter(
+        guild,
+        build_member_lookup(guild),
+        text
+    )
+ 
+    if status == "member":
+        return user_id, name, True
+ 
+    if status == "ambiguous":
+        raise FighterInputError(
+            f"`{text}` matches more than one member. Use their user ID instead."
+        )
+ 
+    name = " ".join(text.lstrip("@").split())
+ 
+    if not name:
+        raise FighterInputError("Please enter a name or user ID.")
+ 
+    # Reuse the spelling already on record for this person.
+    for fight in get_fighter_fights(guild.id, None, name):
+        for side in ("winner", "loser"):
+            if fight[f"{side}_id"] is None and normalise_name(fight[f"{side}_name"]) == normalise_name(name):
+                return None, fight[f"{side}_name"], False
+ 
+    return None, name, False
+ 
+ 
+async def pick_fighter(
+    guild: discord.Guild,
+    member,
+    left_text: str,
+    role: str
+):
+    """
+    Uses whichever of the two options was filled in.
+    Returns (user_id or None, name, still_in_server).
+    """
+ 
+    if member and left_text:
+        raise FighterInputError(
+            f"Fill in only one of **{role}** or **{role}_left**."
+        )
+ 
+    if member:
+        if member.bot:
+            raise FighterInputError("Bots can't have fight records.")
+ 
+        return member.id, member.display_name, True
+ 
+    if left_text:
+        return await resolve_left_fighter(guild, left_text)
+ 
+    raise FighterInputError(
+        f"Pick the **{role}**, or for someone who has left use **{role}_left** "
+        f"(their user ID or name)."
+    )
+ 
+ 
+# ------------------------------------------------------------
 # /RESULT
 # ------------------------------------------------------------
  
@@ -3577,9 +3772,11 @@ def create_result_embed(
     description="Log a fight result."
 )
 @app_commands.describe(
+    method="How the fight ended",
     winner="The winner (for a draw or no contest, either fighter)",
     loser="The loser (for a draw or no contest, the other fighter)",
-    method="How the fight ended",
+    winner_left="Winner who has LEFT the server: their user ID (best) or name",
+    loser_left="Loser who has LEFT the server: their user ID (best) or name",
     round="Round it ended in (leave empty for decisions)",
     division="Weight class",
     title_fight="Was a belt on the line?",
@@ -3591,9 +3788,11 @@ def create_result_embed(
 )
 async def result(
     interaction: discord.Interaction,
-    winner: discord.Member,
-    loser: discord.Member,
     method: app_commands.Choice[str],
+    winner: discord.Member = None,
+    loser: discord.Member = None,
+    winner_left: str = None,
+    loser_left: str = None,
     round: app_commands.Range[int, 1, 5] = None,
     division: app_commands.Choice[str] = None,
     title_fight: bool = False,
@@ -3609,42 +3808,47 @@ async def result(
  
         return
  
-    if winner.id == loser.id:
+    await interaction.response.defer()
  
-        await interaction.response.send_message(
+    try:
+        winner_id, winner_name, _ = await pick_fighter(
+            interaction.guild, winner, winner_left, "winner"
+        )
+        loser_id, loser_name, _ = await pick_fighter(
+            interaction.guild, loser, loser_left, "loser"
+        )
+    except FighterInputError as error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+ 
+    if (winner_id and winner_id == loser_id) or (
+        not winner_id and not loser_id
+        and normalise_name(winner_name) == normalise_name(loser_name)
+    ):
+ 
+        await interaction.followup.send(
             "❌ The winner and loser must be two different fighters.",
             ephemeral=True
         )
  
         return
  
-    if winner.bot or loser.bot:
- 
-        await interaction.response.send_message(
-            "❌ Bots can't have fight records.",
-            ephemeral=True
-        )
- 
-        return
- 
-    await interaction.response.defer()
- 
     try:
  
         guild_id = interaction.guild.id
  
         before = {
-            "winner": stats_record(get_fighter_stats(guild_id, winner.id)),
-            "loser": stats_record(get_fighter_stats(guild_id, loser.id)),
+            "winner": stats_record(get_fighter_stats(guild_id, winner_id, winner_name)),
+            "loser": stats_record(get_fighter_stats(guild_id, loser_id, loser_name)),
         }
  
         fight = {
             "date": today_iso(),
             "event": event.strip() if event and event.strip() else None,
-            "winner_id": winner.id,
-            "winner_name": winner.display_name,
-            "loser_id": loser.id,
-            "loser_name": loser.display_name,
+            "winner_id": winner_id,
+            "winner_name": winner_name,
+            "loser_id": loser_id,
+            "loser_name": loser_name,
             "method": method.value,
             "round": round,
             "division": division.value if division else None,
@@ -3659,8 +3863,8 @@ async def result(
         )
  
         after = {
-            "winner": stats_record(get_fighter_stats(guild_id, winner.id)),
-            "loser": stats_record(get_fighter_stats(guild_id, loser.id)),
+            "winner": stats_record(get_fighter_stats(guild_id, winner_id, winner_name)),
+            "loser": stats_record(get_fighter_stats(guild_id, loser_id, loser_name)),
         }
  
         await interaction.followup.send(
@@ -3694,11 +3898,13 @@ async def result(
     description="Show a fighter's PFO record."
 )
 @app_commands.describe(
-    fighter="Whose profile? Leave empty for your own."
+    fighter="Whose profile? Leave empty for your own.",
+    fighter_left="Someone who has LEFT the server: their user ID or name"
 )
 async def profile(
     interaction: discord.Interaction,
-    fighter: discord.Member = None
+    fighter: discord.Member = None,
+    fighter_left: str = None
 ):
  
     if not is_fighter_or_staff(interaction):
@@ -3707,6 +3913,60 @@ async def profile(
             "❌ You need the Fighter role to use /profile.",
             ephemeral=True
         )
+ 
+        return
+ 
+    if fighter_left and not fighter:
+ 
+        await interaction.response.defer()
+ 
+        try:
+            user_id, name, in_server = await resolve_left_fighter(
+                interaction.guild,
+                fighter_left
+            )
+        except FighterInputError as error:
+            await interaction.followup.send(f"❌ {error}", ephemeral=True)
+            return
+ 
+        if in_server:
+            member = interaction.guild.get_member(user_id)
+        else:
+            avatar = None
+ 
+            if user_id:
+                try:
+                    avatar = (await bot.fetch_user(user_id)).display_avatar
+                except Exception:
+                    avatar = None
+ 
+            member = types.SimpleNamespace(
+                id=user_id,
+                display_name=name,
+                display_avatar=avatar,
+                bot=False,
+                left_server=True
+            )
+ 
+            if not get_fighter_fights(interaction.guild.id, user_id, name) and not (
+                user_id and get_starting_record(interaction.guild.id, user_id)
+            ):
+                await interaction.followup.send(
+                    f"❌ No fights found for **{name}**.",
+                    ephemeral=True
+                )
+                return
+ 
+        try:
+            await interaction.followup.send(
+                embed=await create_profile_embed(interaction.guild, member)
+            )
+        except Exception as error:
+            print(f"Profile error: {error}")
+            await interaction.followup.send(
+                "❌ Something went wrong while loading that profile.",
+                ephemeral=True
+            )
  
         return
  
@@ -3753,17 +4013,19 @@ async def profile(
     description="Set a fighter's earlier record (fights that were never logged)."
 )
 @app_commands.describe(
-    fighter="Which fighter?",
     wins="Earlier wins",
     losses="Earlier losses",
-    draws="Earlier draws"
+    draws="Earlier draws",
+    fighter="Which fighter?",
+    fighter_left="Someone who has LEFT the server: their user ID"
 )
 async def setrecord(
     interaction: discord.Interaction,
-    fighter: discord.Member,
     wins: app_commands.Range[int, 0, 999],
     losses: app_commands.Range[int, 0, 999],
-    draws: app_commands.Range[int, 0, 999] = 0
+    draws: app_commands.Range[int, 0, 999] = 0,
+    fighter: discord.Member = None,
+    fighter_left: str = None
 ):
  
     if not is_staff(interaction):
@@ -3775,10 +4037,24 @@ async def setrecord(
  
         return
  
-    if fighter.bot:
+    await interaction.response.defer(
+        ephemeral=True
+    )
  
-        await interaction.response.send_message(
-            "❌ Bots can't have fight records.",
+    try:
+        user_id, name, _ = await pick_fighter(
+            interaction.guild, fighter, fighter_left, "fighter"
+        )
+    except FighterInputError as error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+ 
+    if not user_id:
+ 
+        await interaction.followup.send(
+            "❌ An earlier record needs their **user ID**, not just a name. "
+            "Turn on Developer Mode in Discord, right-click their name on an "
+            "old message and choose **Copy User ID**.",
             ephemeral=True
         )
  
@@ -3786,7 +4062,7 @@ async def setrecord(
  
     set_starting_record(
         interaction.guild.id,
-        fighter.id,
+        user_id,
         wins,
         losses,
         draws
@@ -3794,12 +4070,12 @@ async def setrecord(
  
     stats = get_fighter_stats(
         interaction.guild.id,
-        fighter.id
+        user_id
     )
  
-    await interaction.response.send_message(
+    await interaction.followup.send(
         (
-            f"✅ Earlier record for **{fighter.display_name}** set to "
+            f"✅ Earlier record for **{name}** set to "
             f"**{format_record(wins, losses, draws)}**.\n"
             f"Their full record is now **{stats_record(stats)}** "
             f"including logged fights."
@@ -4586,6 +4862,8 @@ async def importfights(
             raw
         )
  
+        await fill_departed_names(ready)
+ 
         await interaction.followup.send(
             embed=create_import_summary_embed(
                 ready,
@@ -4999,6 +5277,8 @@ async def scanresults(
  
     found = len(ready) + skipped
  
+    await fill_departed_names(ready)
+ 
     await interaction.followup.send(
         embed=create_import_summary_embed(
             ready,
@@ -5137,4 +5417,3 @@ except discord.PrivilegedIntentsRequired:
     bot._connection._intents.message_content = False
  
     bot.run(TOKEN)
-
