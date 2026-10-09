@@ -29,6 +29,113 @@ DATABASE_FILE = os.getenv(
 
 
 # ============================================================
+# VISUALS (banners, logo, colours)
+#
+# This section is LOOKS ONLY. Nothing here changes how the
+# signups or rankings work.
+#
+# The animated banners live in the "assets" folder. Put that
+# folder in your GitHub repo next to this file, then set:
+#
+#   ASSET_BASE_URL=https://raw.githubusercontent.com/<you>/<repo>/main/assets
+#
+# in Railway's Variables tab. If ASSET_BASE_URL is not set the
+# bot simply shows no banners/logo - everything else still works.
+#
+# Discord caches images by URL. If you ever regenerate the GIFs,
+# bump ASSET_VERSION (e.g. 2, 3...) so Discord loads the new ones.
+# ============================================================
+
+ASSET_BASE_URL = os.getenv(
+    "ASSET_BASE_URL",
+    ""
+).strip().rstrip("/")
+
+ASSET_VERSION = os.getenv(
+    "ASSET_VERSION",
+    "3"
+).strip()
+
+# Gold from the official PFO logo (black / gold / silver scheme).
+PFO_GOLD = discord.Color.from_rgb(212, 168, 76)
+
+LOGO_FILE = "pfo_logo.gif"
+
+
+def asset_url(
+    filename: str
+):
+
+    if not ASSET_BASE_URL:
+        return None
+
+    return f"{ASSET_BASE_URL}/{filename}?v={ASSET_VERSION}"
+
+
+def signup_banner_file(
+    signup_type: str,
+    closed: bool = False
+):
+
+    if closed:
+        return f"signup_{signup_type}_closed.gif"
+
+    return f"signup_{signup_type}.gif"
+
+
+def ranking_banner_file(
+    weight: str
+):
+
+    return (
+        "rankings_"
+        + weight.lower().replace(" ", "_")
+        + ".gif"
+    )
+
+
+def apply_branding(
+    embed: discord.Embed,
+    banner_file: str = None,
+    logo_file: str = LOGO_FILE,
+    author_text: str = None
+):
+    """
+    Adds the animated banner (bottom image), the animated logo
+    (top-right thumbnail) and a small author line to an embed.
+
+    Each piece is skipped quietly if ASSET_BASE_URL is not set.
+    """
+
+    logo = asset_url(logo_file) if logo_file else None
+    banner = asset_url(banner_file) if banner_file else None
+
+    if author_text:
+
+        if logo:
+            embed.set_author(
+                name=author_text,
+                icon_url=logo
+            )
+        else:
+            embed.set_author(
+                name=author_text
+            )
+
+    if logo:
+        embed.set_thumbnail(
+            url=logo
+        )
+
+    if banner:
+        embed.set_image(
+            url=banner
+        )
+
+    return embed
+
+
+# ============================================================
 # RANKING CONFIGURATION
 # ============================================================
 
@@ -412,6 +519,12 @@ SIGNUP_INFO = {
     }
 }
 
+# Short names used only for the small line above the embed title.
+SIGNUP_LABELS = {
+    "fight_night": "FIGHT NIGHT",
+    "live_card": "LIVE CARD",
+}
+
 
 # ============================================================
 # SIGNUP EMBED
@@ -431,14 +544,23 @@ def create_signup_embed(
     embed = discord.Embed(
         title=info["title"],
         description=(
-            f"{info['message']}\n\n"
-            f"**Current Sign-Ups: {count}**"
+            f"**{info['message']}**\n\n"
+            f"🥊 **Current Sign-Ups: {count}**\n"
+            f"🟢 **Status:** Open"
         ),
-        color=discord.Color.red()
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=signup_banner_file(signup_type),
+        author_text=f"PFO • {SIGNUP_LABELS[signup_type]}"
     )
 
     embed.set_footer(
-        text="Press the button below to sign up."
+        text="Press the button below to sign up.",
+        icon_url=asset_url(LOGO_FILE)
     )
 
     return embed
@@ -455,14 +577,30 @@ def create_closed_embed(
         session_id
     )
 
-    return discord.Embed(
+    embed = discord.Embed(
         title=info["title"],
         description=(
-            f"**Sign-Ups Closed! [{count} SIGN-UPS]!**\n\n"
+            f"🔒 **Sign-Ups Closed! [{count} SIGN-UPS]!**\n\n"
             "This signup is no longer accepting entries."
         ),
-        color=discord.Color.dark_grey()
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
     )
+
+    apply_branding(
+        embed,
+        banner_file=signup_banner_file(
+            signup_type,
+            closed=True
+        ),
+        author_text=f"PFO • {SIGNUP_LABELS[signup_type]}"
+    )
+
+    embed.set_footer(
+        text="Closed"
+    )
+
+    return embed
 
 
 # ============================================================
@@ -489,7 +627,7 @@ class SignupView(
         button = discord.ui.Button(
             label="Sign Up",
             style=discord.ButtonStyle.green,
-            emoji="🟢",
+            emoji="🥊",
             custom_id=f"pfo_signup_{session_id}"
         )
 
@@ -957,11 +1095,19 @@ async def signuppaste(
             signup_type_value
         ]["title"],
         description="\n".join(lines),
-        color=discord.Color.red()
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=signup_banner_file(signup_type_value),
+        author_text=f"PFO • {SIGNUP_LABELS[signup_type_value]} • FIGHTER LIST"
     )
 
     embed.set_footer(
-        text=f"Total Sign-Ups: {len(signups)}"
+        text=f"🥊 Total Sign-Ups: {len(signups)}",
+        icon_url=asset_url(LOGO_FILE)
     )
 
     await interaction.response.send_message(
@@ -1285,7 +1431,15 @@ async def create_ranking_embed(
     if weight == P4P_WEIGHT:
         embed = discord.Embed(
             title="🏆 PFO P4P RANKINGS",
-            color=discord.Color.red()
+            color=PFO_GOLD,
+            timestamp=discord.utils.utcnow()
+        )
+
+        apply_branding(
+            embed,
+            banner_file=ranking_banner_file(weight),
+            logo_file=LOGO_FILE,
+            author_text="PFO • POUND FOR POUND"
         )
 
         lines = []
@@ -1328,8 +1482,10 @@ async def create_ranking_embed(
         embed.set_footer(
             text=(
                 "🟢⬆️ Moved Up    "
-                "🔴⬇️ Moved Down"
-            )
+                "🔴⬇️ Moved Down    "
+                "▫️ No Change"
+            ),
+            icon_url=asset_url(LOGO_FILE)
         )
 
         return embed
@@ -1343,7 +1499,14 @@ async def create_ranking_embed(
             f"🏆 PFO UFC RANKINGS — "
             f"{weight.upper()}"
         ),
-        color=discord.Color.red()
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=ranking_banner_file(weight),
+        author_text=f"PFO • {weight.upper()} DIVISION"
     )
 
     champion = ranking_dict.get(
@@ -1367,7 +1530,7 @@ async def create_ranking_embed(
         champion_text = "🏆 Vacant"
 
     embed.add_field(
-        name="Champion",
+        name="👑 Champion",
         value=champion_text,
         inline=False
     )
@@ -1437,8 +1600,10 @@ async def create_ranking_embed(
     embed.set_footer(
         text=(
             "🟢⬆️ Moved Up    "
-            "🔴⬇️ Moved Down"
-        )
+            "🔴⬇️ Moved Down    "
+            "▫️ No Change"
+        ),
+        icon_url=asset_url(LOGO_FILE)
     )
 
     return embed
