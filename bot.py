@@ -1,22 +1,22 @@
 import os
 import sqlite3
 from datetime import datetime, timezone
-
+ 
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-
-
+ 
+ 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
+ 
 load_dotenv()
-
+ 
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
-
+ 
 # Railway:
 # Set DATABASE_FILE=/data/pfo_signups.db
 #
@@ -26,8 +26,8 @@ DATABASE_FILE = os.getenv(
     "DATABASE_FILE",
     "pfo_signups.db"
 )
-
-
+ 
+ 
 # ============================================================
 # VISUALS (banners, logo, colours)
 #
@@ -45,73 +45,74 @@ DATABASE_FILE = os.getenv(
 # Discord caches images by URL. If you ever regenerate the GIFs,
 # bump ASSET_VERSION (e.g. 2, 3...) so Discord loads the new ones.
 # ============================================================
-
+ 
 ASSET_BASE_URL = os.getenv(
     "ASSET_BASE_URL",
     ""
 ).strip().rstrip("/")
-
+ 
 ASSET_VERSION = os.getenv(
     "ASSET_VERSION",
     "3"
 ).strip()
-
+ 
 # Gold from the official PFO logo (black / gold / silver scheme).
 PFO_GOLD = discord.Color.from_rgb(212, 168, 76)
-
+ 
 LOGO_FILE = "pfo_logo.gif"
-
-
+ 
+ 
 def asset_url(
     filename: str
 ):
-
+ 
     if not ASSET_BASE_URL:
         return None
-
+ 
     return f"{ASSET_BASE_URL}/{filename}?v={ASSET_VERSION}"
-
-
+ 
+ 
 def signup_banner_file(
     signup_type: str,
     closed: bool = False
 ):
-
+ 
     if closed:
         return f"signup_{signup_type}_closed.gif"
-
+ 
     return f"signup_{signup_type}.gif"
-
-
+ 
+ 
 def ranking_banner_file(
     weight: str
 ):
-
+ 
     return (
         "rankings_"
         + weight.lower().replace(" ", "_")
         + ".gif"
     )
-
-
+ 
+ 
 def apply_branding(
     embed: discord.Embed,
     banner_file: str = None,
     logo_file: str = LOGO_FILE,
-    author_text: str = None
+    author_text: str = None,
+    show_thumbnail: bool = True
 ):
     """
     Adds the animated banner (bottom image), the animated logo
     (top-right thumbnail) and a small author line to an embed.
-
+ 
     Each piece is skipped quietly if ASSET_BASE_URL is not set.
     """
-
+ 
     logo = asset_url(logo_file) if logo_file else None
     banner = asset_url(banner_file) if banner_file else None
-
+ 
     if author_text:
-
+ 
         if logo:
             embed.set_author(
                 name=author_text,
@@ -121,24 +122,24 @@ def apply_branding(
             embed.set_author(
                 name=author_text
             )
-
-    if logo:
+ 
+    if logo and show_thumbnail:
         embed.set_thumbnail(
             url=logo
         )
-
+ 
     if banner:
         embed.set_image(
             url=banner
         )
-
+ 
     return embed
-
-
+ 
+ 
 # ============================================================
 # RANKING CONFIGURATION
 # ============================================================
-
+ 
 WEIGHTS = {
     "P4P": "P4P",
     "Heavyweight": "HW",
@@ -150,51 +151,51 @@ WEIGHTS = {
     "Bantamweight": "BW",
     "Flyweight": "FLW",
 }
-
+ 
 P4P_WEIGHT = "P4P"
-
-
+ 
+ 
 # ============================================================
 # BOT SETUP
 # ============================================================
-
+ 
 intents = discord.Intents.default()
 intents.members = True
-
+ 
 bot = commands.Bot(
     command_prefix="!",
     intents=intents
 )
-
-
+ 
+ 
 def now_utc():
     return datetime.now(timezone.utc).isoformat()
-
-
+ 
+ 
 # ============================================================
 # DATABASE
 # ============================================================
-
+ 
 def get_db():
-
+ 
     connection = sqlite3.connect(
         DATABASE_FILE
     )
-
+ 
     connection.row_factory = sqlite3.Row
-
+ 
     return connection
-
-
+ 
+ 
 def setup_database():
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     # --------------------------------------------------------
     # SIGNUP SESSIONS
     # --------------------------------------------------------
-
+ 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS signup_sessions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -207,7 +208,7 @@ def setup_database():
             closed_at TEXT
         )
     """)
-
+ 
     # --------------------------------------------------------
     # SIGNUPS
     #
@@ -217,7 +218,7 @@ def setup_database():
     # The IMPORTANT part is discord_user_id.
     # /signuppaste uses this ID to create a real @mention.
     # --------------------------------------------------------
-
+ 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS signups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,7 +230,7 @@ def setup_database():
                 REFERENCES signup_sessions(id)
         )
     """)
-
+ 
     # --------------------------------------------------------
     # RANKINGS
     #
@@ -244,7 +245,7 @@ def setup_database():
     #
     # at the same time.
     # --------------------------------------------------------
-
+ 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS rankings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -254,46 +255,46 @@ def setup_database():
             rank INTEGER NOT NULL,
             movement INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT NOT NULL,
-
+ 
             UNIQUE(guild_id, weight, rank),
             UNIQUE(guild_id, weight, discord_user_id)
         )
     """)
-
+ 
     # --------------------------------------------------------
     # RANKING MESSAGE IDs
     #
     # This allows the bot to EDIT the existing ranking message
     # rather than creating a new one every time.
     # --------------------------------------------------------
-
+ 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS ranking_messages (
             guild_id INTEGER NOT NULL,
             weight TEXT NOT NULL,
             channel_id INTEGER NOT NULL,
             message_id INTEGER NOT NULL,
-
+ 
             PRIMARY KEY(guild_id, weight)
         )
     """)
-
+ 
     db.commit()
     db.close()
-
-
+ 
+ 
 # ============================================================
 # SIGNUP DATABASE FUNCTIONS
 # ============================================================
-
+ 
 def get_active_session(
     guild_id: int,
     signup_type: str
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT *
         FROM signup_sessions
@@ -306,21 +307,21 @@ def get_active_session(
         guild_id,
         signup_type
     ))
-
+ 
     session = cursor.fetchone()
-
+ 
     db.close()
-
+ 
     return session
-
-
+ 
+ 
 def get_session(
     session_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT *
         FROM signup_sessions
@@ -328,24 +329,24 @@ def get_session(
     """, (
         session_id,
     ))
-
+ 
     session = cursor.fetchone()
-
+ 
     db.close()
-
+ 
     return session
-
-
+ 
+ 
 def create_session(
     guild_id: int,
     signup_type: str,
     message_id: int,
     channel_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         INSERT INTO signup_sessions
         (
@@ -364,28 +365,28 @@ def create_session(
         channel_id,
         now_utc()
     ))
-
+ 
     session_id = cursor.lastrowid
-
+ 
     db.commit()
     db.close()
-
+ 
     return session_id
-
-
+ 
+ 
 def add_signup(
     session_id: int,
     discord_user_id: int,
     player_name: str
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     # --------------------------------------------------------
     # Check if this Discord account has already signed up.
     # --------------------------------------------------------
-
+ 
     cursor.execute("""
         SELECT id
         FROM signups
@@ -395,15 +396,15 @@ def add_signup(
         session_id,
         discord_user_id
     ))
-
+ 
     existing = cursor.fetchone()
-
+ 
     if existing:
-
+ 
         db.close()
-
+ 
         return False
-
+ 
     cursor.execute("""
         INSERT INTO signups
         (
@@ -419,20 +420,20 @@ def add_signup(
         player_name,
         now_utc()
     ))
-
+ 
     db.commit()
     db.close()
-
+ 
     return True
-
-
+ 
+ 
 def get_signup_count(
     session_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT COUNT(*) AS count
         FROM signups
@@ -440,21 +441,21 @@ def get_signup_count(
     """, (
         session_id,
     ))
-
+ 
     count = cursor.fetchone()["count"]
-
+ 
     db.close()
-
+ 
     return count
-
-
+ 
+ 
 def get_signups(
     session_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT discord_user_id, player_name
         FROM signups
@@ -463,21 +464,21 @@ def get_signups(
     """, (
         session_id,
     ))
-
+ 
     rows = cursor.fetchall()
-
+ 
     db.close()
-
+ 
     return rows
-
-
+ 
+ 
 def close_session(
     session_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         UPDATE signup_sessions
         SET active = 0,
@@ -487,60 +488,60 @@ def close_session(
         now_utc(),
         session_id
     ))
-
+ 
     db.commit()
     db.close()
-
-
+ 
+ 
 # ============================================================
 # SIGNUP INFORMATION
 # ============================================================
-
+ 
 SIGNUP_INFO = {
-
+ 
     "fight_night": {
-
+ 
         "title": "PFO Fight Night Sign-Ups",
-
+ 
         "message": (
             "PFO Fight Night Sign-Ups, "
             "Press The Button Below To Sign Up!"
         )
     },
-
+ 
     "live_card": {
-
+ 
         "title": "PFO Live Card Sign Ups",
-
+ 
         "message": (
             "PFO Live Card Sign Ups, "
             "Press The Button Below To Sign Up!"
         )
     }
 }
-
+ 
 # Short names used only for the small line above the embed title.
 SIGNUP_LABELS = {
     "fight_night": "FIGHT NIGHT",
     "live_card": "LIVE CARD",
 }
-
-
+ 
+ 
 # ============================================================
 # SIGNUP EMBED
 # ============================================================
-
+ 
 def create_signup_embed(
     signup_type: str,
     session_id: int
 ):
-
+ 
     info = SIGNUP_INFO[signup_type]
-
+ 
     count = get_signup_count(
         session_id
     )
-
+ 
     embed = discord.Embed(
         title=info["title"],
         description=(
@@ -551,32 +552,32 @@ def create_signup_embed(
         color=PFO_GOLD,
         timestamp=discord.utils.utcnow()
     )
-
+ 
     apply_branding(
         embed,
         banner_file=signup_banner_file(signup_type),
         author_text=f"PFO • {SIGNUP_LABELS[signup_type]}"
     )
-
+ 
     embed.set_footer(
         text="Press the button below to sign up.",
         icon_url=asset_url(LOGO_FILE)
     )
-
+ 
     return embed
-
-
+ 
+ 
 def create_closed_embed(
     signup_type: str,
     session_id: int
 ):
-
+ 
     info = SIGNUP_INFO[signup_type]
-
+ 
     count = get_signup_count(
         session_id
     )
-
+ 
     embed = discord.Embed(
         title=info["title"],
         description=(
@@ -586,7 +587,7 @@ def create_closed_embed(
         color=PFO_GOLD,
         timestamp=discord.utils.utcnow()
     )
-
+ 
     apply_branding(
         embed,
         banner_file=signup_banner_file(
@@ -595,77 +596,77 @@ def create_closed_embed(
         ),
         author_text=f"PFO • {SIGNUP_LABELS[signup_type]}"
     )
-
+ 
     embed.set_footer(
         text="Closed"
     )
-
+ 
     return embed
-
-
+ 
+ 
 # ============================================================
 # SIGNUP BUTTON VIEW
 # ============================================================
-
+ 
 class SignupView(
     discord.ui.View
 ):
-
+ 
     def __init__(
         self,
         session_id: int,
         signup_type: str
     ):
-
+ 
         super().__init__(
             timeout=None
         )
-
+ 
         self.session_id = session_id
         self.signup_type = signup_type
-
+ 
         button = discord.ui.Button(
             label="Sign Up",
             style=discord.ButtonStyle.green,
             emoji="🥊",
             custom_id=f"pfo_signup_{session_id}"
         )
-
+ 
         button.callback = self.signup_button
-
+ 
         self.add_item(
             button
         )
-
+ 
     async def signup_button(
         self,
         interaction: discord.Interaction
     ):
-
+ 
         session = get_session(
             self.session_id
         )
-
+ 
         # ----------------------------------------------------
         # Make sure the signup is still open.
         # ----------------------------------------------------
-
+ 
         if not session or session["active"] != 1:
-
+ 
             await interaction.response.send_message(
                 "❌ This signup is closed.",
                 ephemeral=True
             )
-
+ 
             return
-
+ 
         # ----------------------------------------------------
         # Check if they already signed up.
         # ----------------------------------------------------
-
+ 
         db = get_db()
         cursor = db.cursor()
-
+ 
         cursor.execute("""
             SELECT id
             FROM signups
@@ -675,20 +676,20 @@ class SignupView(
             self.session_id,
             interaction.user.id
         ))
-
+ 
         existing = cursor.fetchone()
-
+ 
         db.close()
-
+ 
         if existing:
-
+ 
             await interaction.response.send_message(
                 "❌ You are already signed up for this card.",
                 ephemeral=True
             )
-
+ 
             return
-
+ 
         # ----------------------------------------------------
         # SAVE THEIR DISCORD ACCOUNT.
         #
@@ -701,30 +702,30 @@ class SignupView(
         #
         # which Discord displays as their @mention.
         # ----------------------------------------------------
-
+ 
         success = add_signup(
             self.session_id,
             interaction.user.id,
             interaction.user.display_name
         )
-
+ 
         if not success:
-
+ 
             await interaction.response.send_message(
                 "❌ You are already signed up for this card.",
                 ephemeral=True
             )
-
+ 
             return
-
+ 
         # ----------------------------------------------------
         # Tell the player they are signed up.
         # ----------------------------------------------------
-
+ 
         count = get_signup_count(
             self.session_id
         )
-
+ 
         await interaction.response.send_message(
             (
                 "✅ **You have been signed up!**\n\n"
@@ -732,23 +733,23 @@ class SignupView(
             ),
             ephemeral=True
         )
-
+ 
         # ----------------------------------------------------
         # Update the signup box.
         # ----------------------------------------------------
-
+ 
         try:
-
+ 
             channel = interaction.guild.get_channel(
                 session["channel_id"]
             )
-
+ 
             if channel:
-
+ 
                 message = await channel.fetch_message(
                     session["message_id"]
                 )
-
+ 
                 await message.edit(
                     embed=create_signup_embed(
                         self.signup_type,
@@ -759,32 +760,32 @@ class SignupView(
                         self.signup_type
                     )
                 )
-
+ 
         except Exception as error:
-
+ 
             print(
                 f"Could not update signup message: {error}"
             )
-
-
+ 
+ 
 # ============================================================
 # ADMIN CHECK
 # ============================================================
-
+ 
 def is_admin(
     interaction: discord.Interaction
 ):
-
+ 
     if not interaction.guild:
         return False
-
+ 
     return interaction.user.guild_permissions.administrator
-
-
+ 
+ 
 # ============================================================
 # /FNSIGNUP
 # ============================================================
-
+ 
 @bot.tree.command(
     name="fnsignup",
     description="Create a new PFO Fight Night signup."
@@ -792,44 +793,44 @@ def is_admin(
 async def fnsignup(
     interaction: discord.Interaction
 ):
-
+ 
     if not is_admin(interaction):
-
+ 
         await interaction.response.send_message(
             "❌ Only server administrators can create signups.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     existing = get_active_session(
         interaction.guild.id,
         "fight_night"
     )
-
+ 
     if existing:
-
+ 
         await interaction.response.send_message(
             "❌ There is already an active Fight Night signup.\n"
             "Close it first with `/signupclose`.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     await interaction.response.send_message(
         "Creating Fight Night signup..."
     )
-
+ 
     message = await interaction.original_response()
-
+ 
     session_id = create_session(
         interaction.guild.id,
         "fight_night",
         message.id,
         interaction.channel.id
     )
-
+ 
     await message.edit(
         content=None,
         embed=create_signup_embed(
@@ -841,12 +842,12 @@ async def fnsignup(
             "fight_night"
         )
     )
-
-
+ 
+ 
 # ============================================================
 # /LIVESIGNUP
 # ============================================================
-
+ 
 @bot.tree.command(
     name="livesignup",
     description="Create a new PFO Live Card signup."
@@ -854,44 +855,44 @@ async def fnsignup(
 async def livesignup(
     interaction: discord.Interaction
 ):
-
+ 
     if not is_admin(interaction):
-
+ 
         await interaction.response.send_message(
             "❌ Only server administrators can create signups.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     existing = get_active_session(
         interaction.guild.id,
         "live_card"
     )
-
+ 
     if existing:
-
+ 
         await interaction.response.send_message(
             "❌ There is already an active Live Card signup.\n"
             "Close it first with `/signupclose`.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     await interaction.response.send_message(
         "Creating Live Card signup..."
     )
-
+ 
     message = await interaction.original_response()
-
+ 
     session_id = create_session(
         interaction.guild.id,
         "live_card",
         message.id,
         interaction.channel.id
     )
-
+ 
     await message.edit(
         content=None,
         embed=create_signup_embed(
@@ -903,12 +904,12 @@ async def livesignup(
             "live_card"
         )
     )
-
-
+ 
+ 
 # ============================================================
 # /SIGNUPCLOSE
 # ============================================================
-
+ 
 @bot.tree.command(
     name="signupclose",
     description="Close the current active signup."
@@ -932,53 +933,53 @@ async def signupclose(
     interaction: discord.Interaction,
     signup_type: app_commands.Choice[str]
 ):
-
+ 
     if not is_admin(interaction):
-
+ 
         await interaction.response.send_message(
             "❌ Only server administrators can close signups.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     signup_type_value = signup_type.value
-
+ 
     session = get_active_session(
         interaction.guild.id,
         signup_type_value
     )
-
+ 
     if not session:
-
+ 
         await interaction.response.send_message(
             f"❌ There is no active "
             f"{SIGNUP_INFO[signup_type_value]['title']} signup.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     count = get_signup_count(
         session["id"]
     )
-
+ 
     close_session(
         session["id"]
     )
-
+ 
     try:
-
+ 
         channel = interaction.guild.get_channel(
             session["channel_id"]
         )
-
+ 
         if channel:
-
+ 
             message = await channel.fetch_message(
                 session["message_id"]
             )
-
+ 
             await message.edit(
                 embed=create_closed_embed(
                     signup_type_value,
@@ -986,24 +987,24 @@ async def signupclose(
                 ),
                 view=None
             )
-
+ 
     except Exception as error:
-
+ 
         print(
             f"Could not update closed signup: {error}"
         )
-
+ 
     await interaction.response.send_message(
         f"✅ Signup closed.\n\n"
         f"**Sign-Ups Closed! [{count}]!**",
         ephemeral=True
     )
-
-
+ 
+ 
 # ============================================================
 # /SIGNUPPASTE
 # ============================================================
-
+ 
 @bot.tree.command(
     name="signuppaste",
     description="Paste the current signup list."
@@ -1027,37 +1028,37 @@ async def signuppaste(
     interaction: discord.Interaction,
     signup_type: app_commands.Choice[str]
 ):
-
+ 
     signup_type_value = signup_type.value
-
+ 
     session = get_active_session(
         interaction.guild.id,
         signup_type_value
     )
-
+ 
     if not session:
-
+ 
         await interaction.response.send_message(
             f"❌ There is no active "
             f"{SIGNUP_INFO[signup_type_value]['title']} signup.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     signups = get_signups(
         session["id"]
     )
-
+ 
     if not signups:
-
+ 
         await interaction.response.send_message(
             "❌ Nobody has signed up yet.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     # --------------------------------------------------------
     # BUILD CLICKABLE SERVER DISPLAY NAMES
     #
@@ -1065,9 +1066,9 @@ async def signuppaste(
     # server display name/nickname is shown. The name links
     # directly to their Discord profile.
     # --------------------------------------------------------
-
+ 
     lines = []
-
+ 
     for number, signup in enumerate(
         signups,
         start=1
@@ -1076,7 +1077,7 @@ async def signuppaste(
             interaction.guild,
             signup["discord_user_id"]
         )
-
+ 
         if member:
             fighter_name = member.display_name
             fighter_link = (
@@ -1085,11 +1086,11 @@ async def signuppaste(
             )
         else:
             fighter_link = "Unknown Fighter"
-
+ 
         lines.append(
             f"**{number}.** {fighter_link}"
         )
-
+ 
     embed = discord.Embed(
         title=SIGNUP_INFO[
             signup_type_value
@@ -1098,35 +1099,35 @@ async def signuppaste(
         color=PFO_GOLD,
         timestamp=discord.utils.utcnow()
     )
-
+ 
     apply_branding(
         embed,
         banner_file=signup_banner_file(signup_type_value),
         author_text=f"PFO • {SIGNUP_LABELS[signup_type_value]} • FIGHTER LIST"
     )
-
+ 
     embed.set_footer(
         text=f"🥊 Total Sign-Ups: {len(signups)}",
         icon_url=asset_url(LOGO_FILE)
     )
-
+ 
     await interaction.response.send_message(
         embed=embed
     )
-
-
+ 
+ 
 # ============================================================
 # RANKING DATABASE
 # ============================================================
-
+ 
 def get_division_rankings(
     guild_id: int,
     weight: str
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT *
         FROM rankings
@@ -1137,23 +1138,23 @@ def get_division_rankings(
         guild_id,
         weight
     ))
-
+ 
     rows = cursor.fetchall()
-
+ 
     db.close()
-
+ 
     return rows
-
-
+ 
+ 
 def get_user_ranking_in_division(
     guild_id: int,
     discord_user_id: int,
     weight: str
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT *
         FROM rankings
@@ -1166,22 +1167,22 @@ def get_user_ranking_in_division(
         discord_user_id,
         weight
     ))
-
+ 
     row = cursor.fetchone()
-
+ 
     db.close()
-
+ 
     return row
-
-
+ 
+ 
 def get_user_weight_class(
     guild_id: int,
     discord_user_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT *
         FROM rankings
@@ -1194,23 +1195,23 @@ def get_user_weight_class(
         discord_user_id,
         P4P_WEIGHT
     ))
-
+ 
     row = cursor.fetchone()
-
+ 
     db.close()
-
+ 
     return row
-
-
+ 
+ 
 def delete_user_from_division(
     guild_id: int,
     weight: str,
     discord_user_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         DELETE FROM rankings
         WHERE guild_id = ?
@@ -1221,20 +1222,20 @@ def delete_user_from_division(
         weight,
         discord_user_id
     ))
-
+ 
     db.commit()
     db.close()
-
-
+ 
+ 
 def save_division_rankings(
     guild_id: int,
     weight: str,
     fighters: list
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         DELETE FROM rankings
         WHERE guild_id = ?
@@ -1243,9 +1244,9 @@ def save_division_rankings(
         guild_id,
         weight
     ))
-
+ 
     for fighter in fighters:
-
+ 
         cursor.execute("""
             INSERT INTO rankings
             (
@@ -1265,25 +1266,25 @@ def save_division_rankings(
             fighter["movement"],
             now_utc()
         ))
-
+ 
     db.commit()
     db.close()
-
-
+ 
+ 
 # ============================================================
 # RANKING MESSAGE DATABASE
 # ============================================================
-
+ 
 def save_ranking_message(
     guild_id: int,
     weight: str,
     channel_id: int,
     message_id: int
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         INSERT OR REPLACE INTO ranking_messages
         (
@@ -1299,19 +1300,19 @@ def save_ranking_message(
         channel_id,
         message_id
     ))
-
+ 
     db.commit()
     db.close()
-
-
+ 
+ 
 def get_ranking_message(
     guild_id: int,
     weight: str
 ):
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT *
         FROM ranking_messages
@@ -1321,69 +1322,93 @@ def get_ranking_message(
         guild_id,
         weight
     ))
-
+ 
     row = cursor.fetchone()
-
+ 
     db.close()
-
+ 
     return row
-
-
+ 
+ 
+def ranking_author_text(
+    weight: str
+):
+    """
+    The small line at the top of every ranking board,
+    e.g. "PFO • FLYWEIGHT DIVISION".
+    """
+ 
+    if weight == P4P_WEIGHT:
+        return "PFO • POUND FOR POUND"
+ 
+    return f"PFO • {weight.upper()} DIVISION"
+ 
+ 
 async def find_existing_ranking_message(
     channel,
     weight: str
 ):
-
+ 
+    # Boards posted by the older version of the bot have a title.
+    # Boards posted by this version have no title, so they are
+    # found by the line at the top instead. Both are matched, so
+    # /rankingsp keeps editing your existing boards either way.
+ 
     if weight == P4P_WEIGHT:
-
+ 
         expected_title = (
             "🏆 PFO P4P RANKINGS"
         )
-
+ 
     else:
-
+ 
         expected_title = (
             f"🏆 PFO UFC RANKINGS — {weight.upper()}"
         )
-
+ 
+    expected_author = ranking_author_text(
+        weight
+    )
+ 
     try:
-
+ 
         async for message in channel.history(
             limit=100
         ):
-
+ 
             if not message.embeds:
                 continue
-
+ 
             title = message.embeds[0].title
-
-            if title == expected_title:
-
+            author = message.embeds[0].author.name
+ 
+            if title == expected_title or author == expected_author:
+ 
                 return message
-
+ 
     except Exception as error:
-
+ 
         print(
             f"Could not search for existing "
             f"{weight} ranking: {error}"
         )
-
+ 
     return None
-
-
+ 
+ 
 # ============================================================
 # RANKING DISPLAY
 # ============================================================
-
+ 
 async def get_server_member(
     guild: discord.Guild,
     user_id: int
 ):
     member = guild.get_member(user_id)
-
+ 
     if member:
         return member
-
+ 
     try:
         return await guild.fetch_member(user_id)
     except (
@@ -1392,263 +1417,236 @@ async def get_server_member(
         discord.HTTPException
     ):
         return None
-
-
+ 
+ 
 def movement_icon(
     movement: int
 ):
-
+ 
     if movement > 0:
-
+ 
         return "🟢⬆️"
-
+ 
     if movement < 0:
-
+ 
         return "🔴⬇️"
-
+ 
     return "▫️"
-
-
-async def create_ranking_embed(
-    guild: discord.Guild,
-    weight: str
+ 
+ 
+# ------------------------------------------------------------
+# Ranking text formatting (looks only)
+# ------------------------------------------------------------
+ 
+def rank_tag(
+    rank: int
 ):
-
-    rankings = get_division_rankings(
-        guild.id,
-        weight
-    )
-
-    ranking_dict = {
-        row["rank"]: row
-        for row in rankings
-    }
-
-    # ========================================================
-    # P4P
-    # ========================================================
-
-    if weight == P4P_WEIGHT:
-        embed = discord.Embed(
-            title="🏆 PFO P4P RANKINGS",
-            color=PFO_GOLD,
-            timestamp=discord.utils.utcnow()
+    """
+    Rank number in a small grey box, padded so #1 to #15
+    all line up:  ` #1`  ` #9`  `#10`
+    """
+ 
+    return f"`{('#' + str(rank)).rjust(3)}`"
+ 
+ 
+def fighter_link_text(
+    member
+):
+ 
+    if member:
+        return (
+            f"**[{member.display_name}]"
+            f"(https://discord.com/users/{member.id})**"
         )
-
-        apply_branding(
-            embed,
-            banner_file=ranking_banner_file(weight),
-            logo_file=LOGO_FILE,
-            author_text="PFO • POUND FOR POUND"
-        )
-
-        lines = []
-
-        for rank in range(1, 16):
-            row = ranking_dict.get(
-                rank
-            )
-
-            if row:
-                member = await get_server_member(
-                    guild,
-                    row["discord_user_id"]
-                )
-
-                if member:
-                    fighter_name = member.display_name
-                    fighter_link = (
-                        f"[@{fighter_name}]"
-                        f"(https://discord.com/users/{member.id})"
-                    )
-                else:
-                    fighter_link = "Unknown Fighter"
-
-                lines.append(
-                    f"**#{rank}** "
-                    f"{fighter_link} "
-                    f"{movement_icon(row['movement'])}"
-                )
-
-            else:
-                lines.append(
-                    f"**#{rank}** Vacant ▫️"
-                )
-
-        embed.description = "\n".join(
-            lines
-        )
-
-        embed.set_footer(
-            text=(
-                "🟢⬆️ Moved Up    "
-                "🔴⬇️ Moved Down    "
-                "▫️ No Change"
-            ),
-            icon_url=asset_url(LOGO_FILE)
-        )
-
-        return embed
-
-    # ========================================================
-    # WEIGHT CLASS
-    # ========================================================
-
-    embed = discord.Embed(
-        title=(
-            f"🏆 PFO UFC RANKINGS — "
-            f"{weight.upper()}"
-        ),
-        color=PFO_GOLD,
-        timestamp=discord.utils.utcnow()
-    )
-
-    apply_branding(
-        embed,
-        banner_file=ranking_banner_file(weight),
-        author_text=f"PFO • {weight.upper()} DIVISION"
-    )
-
-    champion = ranking_dict.get(
-        0
-    )
-
-    if champion:
-        member = await get_server_member(
-            guild,
-            champion["discord_user_id"]
-        )
-
-        if member:
-            champion_text = (
-                f"🏆 [@{member.display_name}]"
-                f"(https://discord.com/users/{member.id})"
-            )
-        else:
-            champion_text = "🏆 Unknown Fighter"
-    else:
-        champion_text = "🏆 Vacant"
-
-    embed.add_field(
-        name="👑 Champion",
-        value=champion_text,
-        inline=False
-    )
-
+ 
+    return "*Unknown Fighter*"
+ 
+ 
+def ranking_movement_icon(
+    movement: int
+):
+    """
+    Single-emoji version of the movement marker, so it never
+    drops onto its own line on phones.
+    """
+ 
+    if movement > 0:
+        return "🟢"
+ 
+    if movement < 0:
+        return "🔴"
+ 
+    return "▫️"
+ 
+ 
+async def build_rank_lines(
+    guild: discord.Guild,
+    ranking_dict: dict
+):
+ 
     lines = []
-
+ 
     for rank in range(1, 16):
         row = ranking_dict.get(
             rank
         )
-
+ 
         if row:
             member = await get_server_member(
                 guild,
                 row["discord_user_id"]
             )
-
-            if member:
-                fighter_name = member.display_name
-                fighter_link = (
-                    f"[{fighter_name}]"
-                    f"(https://discord.com/users/{member.id})"
-                )
-            else:
-                fighter_link = "Unknown Fighter"
-
+ 
             lines.append(
-                f"**#{rank}** "
-                f"{fighter_link} "
-                f"{movement_icon(row['movement'])}"
+                f"{rank_tag(rank)} "
+                f"{ranking_movement_icon(row['movement'])} "
+                f"{fighter_link_text(member)}"
             )
-
+ 
         else:
             lines.append(
-                f"**#{rank}** Vacant ▫️"
+                f"{rank_tag(rank)} ▫️ *Vacant*"
             )
-
-    # Discord limits each embed field value to 1024 characters.
-    # Split the rankings across fields if the fighter names/links make
-    # the full list too long.
-    current_lines = []
-    current_length = 0
-
-    for line in lines:
-        line_length = len(line)
-        extra_length = line_length + (1 if current_lines else 0)
-
-        if current_lines and current_length + extra_length > 1024:
-            embed.add_field(
-                name="Rankings" if len(embed.fields) == 1 else "\u200b",
-                value="\n".join(current_lines),
-                inline=False
-            )
-            current_lines = []
-            current_length = 0
-
-        current_lines.append(line)
-        current_length += line_length + (1 if len(current_lines) > 1 else 0)
-
-    if current_lines:
-        embed.add_field(
-            name="Rankings" if len(embed.fields) == 1 else "\u200b",
-            value="\n".join(current_lines),
-            inline=False
+ 
+    return lines
+ 
+ 
+RANKING_FOOTER = (
+    "🟢 Moved Up    "
+    "🔴 Moved Down    "
+    "▫️ No Change"
+)
+ 
+ 
+async def create_ranking_embed(
+    guild: discord.Guild,
+    weight: str
+):
+ 
+    rankings = get_division_rankings(
+        guild.id,
+        weight
+    )
+ 
+    ranking_dict = {
+        row["rank"]: row
+        for row in rankings
+    }
+ 
+    # No title: the line at the top (author line) names the board.
+    embed = discord.Embed(
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+ 
+    apply_branding(
+        embed,
+        banner_file=ranking_banner_file(weight),
+        logo_file=LOGO_FILE,
+        author_text=ranking_author_text(weight),
+        # No top-right logo on ranking boards: on phones it squeezes
+        # the names into a narrow column. The logo still shows in
+        # the top line and in the banner.
+        show_thumbnail=False
+    )
+ 
+    lines = await build_rank_lines(
+        guild,
+        ranking_dict
+    )
+ 
+    # ========================================================
+    # P4P (no champion)
+    # ========================================================
+ 
+    if weight == P4P_WEIGHT:
+ 
+        description = (
+            "**🥊 RANKINGS**\n"
+            + "\n".join(lines)
         )
-
+ 
+    # ========================================================
+    # WEIGHT CLASS (champion + #1-#15)
+    # ========================================================
+ 
+    else:
+ 
+        champion = ranking_dict.get(
+            0
+        )
+ 
+        if champion:
+            member = await get_server_member(
+                guild,
+                champion["discord_user_id"]
+            )
+ 
+            champion_text = f"🏆 {fighter_link_text(member)}"
+ 
+        else:
+            champion_text = "🏆 *Vacant*"
+ 
+        description = (
+            "**👑 CHAMPION**\n"
+            f"{champion_text}\n"
+            "\n"
+            "**🥊 RANKINGS**\n"
+            + "\n".join(lines)
+        )
+ 
+    # The whole board sits in one block (limit 4096 characters),
+    # so it never splits into separate chunks with gaps.
+    embed.description = description
+ 
     embed.set_footer(
-        text=(
-            "🟢⬆️ Moved Up    "
-            "🔴⬇️ Moved Down    "
-            "▫️ No Change"
-        ),
+        text=RANKING_FOOTER,
         icon_url=asset_url(LOGO_FILE)
     )
-
+ 
     return embed
-
-
+ 
+ 
 # ============================================================
 # MOVEMENT CALCULATIONS
 # ============================================================
-
+ 
 def calculate_movements(
     old_positions: dict,
     new_positions: dict
 ):
-
+ 
     movements = {}
-
+ 
     for user_id, new_rank in new_positions.items():
-
+ 
         old_rank = old_positions.get(
             user_id
         )
-
+ 
         if old_rank is None:
-
+ 
             movements[user_id] = 0
-
+ 
         elif new_rank < old_rank:
-
+ 
             movements[user_id] = 1
-
+ 
         elif new_rank > old_rank:
-
+ 
             movements[user_id] = -1
-
+ 
         else:
-
+ 
             movements[user_id] = 0
-
+ 
     return movements
-
-
+ 
+ 
 # ============================================================
 # UPDATE RANKING
 # ============================================================
-
+ 
 def update_ranking(
     guild_id: int,
     weight: str,
@@ -1657,73 +1655,73 @@ def update_ranking(
 ):
     """
     Places a fighter into the selected ranking only.
-
+ 
     P4P and every weight class are completely independent.
-
+ 
     A fighter can therefore be ranked in multiple weight classes
     AND in P4P at the same time.
-
+ 
     Example:
         Lightweight #1
         Welterweight #5
         Middleweight #12
         P4P #4
-
+ 
     Updating one division never removes the fighter from any
     other division.
     """
-
+ 
     # ========================================================
     # P4P
     # ========================================================
-
+ 
     if weight == P4P_WEIGHT:
-
+ 
         if desired_rank < 1 or desired_rank > 15:
             raise ValueError(
                 "P4P rank must be between #1 and #15."
             )
-
+ 
         old_rows = get_division_rankings(
             guild_id,
             P4P_WEIGHT
         )
-
+ 
         old_positions = {
             row["discord_user_id"]: row["rank"]
             for row in old_rows
         }
-
+ 
         users = [
             row["discord_user_id"]
             for row in old_rows
             if row["discord_user_id"] != user_id
         ]
-
+ 
         insert_index = min(
             desired_rank - 1,
             len(users)
         )
-
+ 
         users.insert(
             insert_index,
             user_id
         )
-
+ 
         users = users[:15]
-
+ 
         new_positions = {
             fighter_id: index + 1
             for index, fighter_id in enumerate(users)
         }
-
+ 
         movements = calculate_movements(
             old_positions,
             new_positions
         )
-
+ 
         fighters = []
-
+ 
         for fighter_id, rank in new_positions.items():
             fighters.append({
                 "user_id": fighter_id,
@@ -1733,24 +1731,24 @@ def update_ranking(
                     0
                 )
             })
-
+ 
         save_division_rankings(
             guild_id,
             P4P_WEIGHT,
             fighters
         )
-
+ 
         return None
-
+ 
     # ========================================================
     # WEIGHT CLASS
     # ========================================================
-
+ 
     if desired_rank < 0 or desired_rank > 15:
         raise ValueError(
             "Weight-class rank must be Champion or #1-#15."
         )
-
+ 
     # IMPORTANT:
     # Do NOT look for or remove the fighter from another weight class.
     # Fighters are allowed to exist in multiple weight classes.
@@ -1758,12 +1756,12 @@ def update_ranking(
         guild_id,
         weight
     )
-
+ 
     target_positions = {
         row["discord_user_id"]: row["rank"]
         for row in target_rows
     }
-
+ 
     # Remove the fighter only from THIS division so we can insert
     # them at their new position without creating a duplicate row.
     delete_user_from_division(
@@ -1771,60 +1769,60 @@ def update_ranking(
         weight,
         user_id
     )
-
+ 
     target_rows = get_division_rankings(
         guild_id,
         weight
     )
-
+ 
     champion_id = None
-
+ 
     for row in target_rows:
         if row["rank"] == 0:
             champion_id = row["discord_user_id"]
             break
-
+ 
     ranked_users = [
         row["discord_user_id"]
         for row in target_rows
         if row["rank"] >= 1
     ]
-
+ 
     # ========================================================
     # MAKE CHAMPION
     # ========================================================
-
+ 
     if desired_rank == 0:
-
+ 
         if champion_id is not None:
             ranked_users.insert(
                 0,
                 champion_id
             )
-
+ 
         ranked_users = list(
             dict.fromkeys(ranked_users)
         )
-
+ 
         ranked_users = ranked_users[:15]
-
+ 
         new_positions = {
             fighter_id: index + 1
             for index, fighter_id
             in enumerate(ranked_users)
         }
-
+ 
         movements = calculate_movements(
             target_positions,
             new_positions
         )
-
+ 
         fighters = [{
             "user_id": user_id,
             "rank": 0,
             "movement": 0
         }]
-
+ 
         for fighter_id, rank in new_positions.items():
             fighters.append({
                 "user_id": fighter_id,
@@ -1834,55 +1832,55 @@ def update_ranking(
                     0
                 )
             })
-
+ 
         save_division_rankings(
             guild_id,
             weight,
             fighters
         )
-
+ 
     # ========================================================
     # MAKE #1-#15
     # ========================================================
-
+ 
     else:
-
+ 
         insert_index = min(
             desired_rank - 1,
             len(ranked_users)
         )
-
+ 
         ranked_users.insert(
             insert_index,
             user_id
         )
-
+ 
         ranked_users = list(
             dict.fromkeys(ranked_users)
         )
-
+ 
         ranked_users = ranked_users[:15]
-
+ 
         new_positions = {
             fighter_id: index + 1
             for index, fighter_id
             in enumerate(ranked_users)
         }
-
+ 
         movements = calculate_movements(
             target_positions,
             new_positions
         )
-
+ 
         fighters = []
-
+ 
         if champion_id is not None:
             fighters.append({
                 "user_id": champion_id,
                 "rank": 0,
                 "movement": 0
             })
-
+ 
         for fighter_id, rank in new_positions.items():
             fighters.append({
                 "user_id": fighter_id,
@@ -1892,22 +1890,22 @@ def update_ranking(
                     0
                 )
             })
-
+ 
         save_division_rankings(
             guild_id,
             weight,
             fighters
         )
-
+ 
     # No old weight class is returned because the fighter is not
     # removed from any other division anymore.
     return None
-
-
+ 
+ 
 # ============================================================
 # REMOVE FROM RANKING
 # ============================================================
-
+ 
 def remove_from_rankings(
     guild_id: int,
     user_id: int,
@@ -1915,73 +1913,73 @@ def remove_from_rankings(
 ):
     """
     Removes a fighter from ONE ranking only.
-
+ 
     Example:
-
+ 
         /rankingsr P4P @Fighter
-
+ 
     removes them from P4P only.
-
+ 
     Their weight class remains untouched.
     """
-
+ 
     current = get_user_ranking_in_division(
         guild_id,
         user_id,
         weight
     )
-
+ 
     if not current:
-
+ 
         return False
-
+ 
     old_rows = get_division_rankings(
         guild_id,
         weight
     )
-
+ 
     old_positions = {
         row["discord_user_id"]: row["rank"]
         for row in old_rows
     }
-
+ 
     delete_user_from_division(
         guild_id,
         weight,
         user_id
     )
-
+ 
     remaining = get_division_rankings(
         guild_id,
         weight
     )
-
+ 
     # ========================================================
     # P4P
     # ========================================================
-
+ 
     if weight == P4P_WEIGHT:
-
+ 
         users = [
             row["discord_user_id"]
             for row in remaining
         ]
-
+ 
         new_positions = {
             fighter_id: index + 1
             for index, fighter_id
             in enumerate(users)
         }
-
+ 
         movements = calculate_movements(
             old_positions,
             new_positions
         )
-
+ 
         fighters = []
-
+ 
         for fighter_id, rank in new_positions.items():
-
+ 
             fighters.append({
                 "user_id": fighter_id,
                 "rank": rank,
@@ -1990,57 +1988,57 @@ def remove_from_rankings(
                     0
                 )
             })
-
+ 
         save_division_rankings(
             guild_id,
             weight,
             fighters
         )
-
+ 
         return True
-
+ 
     # ========================================================
     # WEIGHT CLASS
     # ========================================================
-
+ 
     champion = None
     ranked = []
-
+ 
     for row in remaining:
-
+ 
         if row["rank"] == 0:
-
+ 
             champion = row["discord_user_id"]
-
+ 
         else:
-
+ 
             ranked.append(
                 row["discord_user_id"]
             )
-
+ 
     new_positions = {
         fighter_id: index + 1
         for index, fighter_id
         in enumerate(ranked)
     }
-
+ 
     movements = calculate_movements(
         old_positions,
         new_positions
     )
-
+ 
     fighters = []
-
+ 
     if champion is not None:
-
+ 
         fighters.append({
             "user_id": champion,
             "rank": 0,
             "movement": 0
         })
-
+ 
     for fighter_id, rank in new_positions.items():
-
+ 
         fighters.append({
             "user_id": fighter_id,
             "rank": rank,
@@ -2049,92 +2047,92 @@ def remove_from_rankings(
                 0
             )
         })
-
+ 
     save_division_rankings(
         guild_id,
         weight,
         fighters
     )
-
+ 
     return True
-
-
+ 
+ 
 # ============================================================
 # RANKING CHOICES
 # ============================================================
-
+ 
 WEIGHT_CHOICES = [
-
+ 
     app_commands.Choice(
         name="P4P",
         value="P4P"
     ),
-
+ 
     app_commands.Choice(
         name="Heavyweight",
         value="Heavyweight"
     ),
-
+ 
     app_commands.Choice(
         name="Light Heavyweight",
         value="Light Heavyweight"
     ),
-
+ 
     app_commands.Choice(
         name="Middleweight",
         value="Middleweight"
     ),
-
+ 
     app_commands.Choice(
         name="Welterweight",
         value="Welterweight"
     ),
-
+ 
     app_commands.Choice(
         name="Lightweight",
         value="Lightweight"
     ),
-
+ 
     app_commands.Choice(
         name="Featherweight",
         value="Featherweight"
     ),
-
+ 
     app_commands.Choice(
         name="Bantamweight",
         value="Bantamweight"
     ),
-
+ 
     app_commands.Choice(
         name="Flyweight",
         value="Flyweight"
     )
 ]
-
-
+ 
+ 
 # Champion + #1-#15
 RANK_CHOICES = [
-
+ 
     app_commands.Choice(
         name="Champion",
         value=0
     )
 ]
-
+ 
 for number in range(1, 16):
-
+ 
     RANK_CHOICES.append(
         app_commands.Choice(
             name=f"#{number}",
             value=number
         )
     )
-
-
+ 
+ 
 # ============================================================
 # /RANKINGSP
 # ============================================================
-
+ 
 @bot.tree.command(
     name="rankingsp",
     description="Create the PFO ranking boards."
@@ -2142,62 +2140,62 @@ for number in range(1, 16):
 async def rankingsp(
     interaction: discord.Interaction
 ):
-
+ 
     if not is_admin(interaction):
-
+ 
         await interaction.response.send_message(
             "❌ Only server administrators can create rankings.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     await interaction.response.send_message(
         "Creating PFO ranking boards..."
     )
-
+ 
     for weight in WEIGHTS.keys():
-
+ 
         existing = get_ranking_message(
             interaction.guild.id,
             weight
         )
-
+ 
         # ----------------------------------------------------
         # Try saved message first.
         # ----------------------------------------------------
-
+ 
         if existing:
-
+ 
             success = await refresh_ranking_message(
                 interaction.guild,
                 weight
             )
-
+ 
             if success:
-
+ 
                 continue
-
+ 
         # ----------------------------------------------------
         # Search channel for an existing ranking box.
         # ----------------------------------------------------
-
+ 
         existing_message = (
             await find_existing_ranking_message(
                 interaction.channel,
                 weight
             )
         )
-
+ 
         if existing_message:
-
+ 
             save_ranking_message(
                 interaction.guild.id,
                 weight,
                 interaction.channel.id,
                 existing_message.id
             )
-
+ 
             await existing_message.edit(
                 embed=await create_ranking_embed(
                     interaction.guild,
@@ -2207,39 +2205,39 @@ async def rankingsp(
                     users=True
                 )
             )
-
+ 
             continue
-
+ 
         # ----------------------------------------------------
         # Create a new message only if none exists.
         # ----------------------------------------------------
-
+ 
         message = await interaction.channel.send(
             embed=await create_ranking_embed(
                 interaction.guild,
                 weight
             )
         )
-
+ 
         save_ranking_message(
             interaction.guild.id,
             weight,
             interaction.channel.id,
             message.id
         )
-
+ 
     await interaction.edit_original_response(
         content=(
             "✅ **PFO Rankings have been created!**\n\n"
             "The ranking boards are now ready."
         )
     )
-
-
+ 
+ 
 # ============================================================
 # /RANKINGSU
 # ============================================================
-
+ 
 @bot.tree.command(
     name="rankingsu",
     description="Update a fighter's ranking."
@@ -2259,98 +2257,98 @@ async def rankingsu(
     user: discord.Member,
     rank: app_commands.Choice[int]
 ):
-
+ 
     if not is_admin(interaction):
-
+ 
         await interaction.response.send_message(
             "❌ Only server administrators can update rankings.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     if user.bot:
-
+ 
         await interaction.response.send_message(
             "❌ Bots cannot be added to the rankings.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     weight_value = weight.value
     rank_value = rank.value
-
+ 
     # --------------------------------------------------------
     # P4P validation.
     # --------------------------------------------------------
-
+ 
     if weight_value == P4P_WEIGHT:
-
+ 
         if rank_value < 1 or rank_value > 15:
-
+ 
             await interaction.response.send_message(
                 "❌ P4P only uses ranks **#1-#15**.",
                 ephemeral=True
             )
-
+ 
             return
-
+ 
     # --------------------------------------------------------
     # Weight class validation.
     # --------------------------------------------------------
-
+ 
     else:
-
+ 
         if rank_value < 0 or rank_value > 15:
-
+ 
             await interaction.response.send_message(
                 "❌ Rank must be **Champion or #1-#15**.",
                 ephemeral=True
             )
-
+ 
             return
-
+ 
     await interaction.response.defer(
         ephemeral=True
     )
-
+ 
     try:
-
+ 
         old_weight = update_ranking(
             interaction.guild.id,
             weight_value,
             user.id,
             rank_value
         )
-
+ 
         # Update the ranking that changed.
         await refresh_ranking_message(
             interaction.guild,
             weight_value
         )
-
+ 
         # If they changed weight classes,
         # update the old weight-class box too.
         if old_weight and old_weight != weight_value:
-
+ 
             await refresh_ranking_message(
                 interaction.guild,
                 old_weight
             )
-
+ 
         if weight_value == P4P_WEIGHT:
-
+ 
             position_text = f"#{rank_value}"
-
+ 
         elif rank_value == 0:
-
+ 
             position_text = "Champion"
-
+ 
         else:
-
+ 
             position_text = f"#{rank_value}"
-
+ 
         await interaction.followup.send(
             (
                 f"✅ **{user.display_name}** has been placed at "
@@ -2358,23 +2356,23 @@ async def rankingsu(
             ),
             ephemeral=True
         )
-
+ 
     except Exception as error:
-
+ 
         print(
             f"Ranking update error: {error}"
         )
-
+ 
         await interaction.followup.send(
             "❌ Something went wrong while updating the rankings.",
             ephemeral=True
         )
-
-
+ 
+ 
 # ============================================================
 # /RANKINGSR
 # ============================================================
-
+ 
 @bot.tree.command(
     name="rankingsr",
     description="Remove a fighter from a specific ranking."
@@ -2391,58 +2389,58 @@ async def rankingsr(
     weight: app_commands.Choice[str],
     user_id: str
 ):
-
+ 
     if not is_admin(interaction):
-
+ 
         await interaction.response.send_message(
             "❌ Only server administrators can remove fighters.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     weight_value = weight.value
-
+ 
     # Discord User IDs are 18-19 digit numbers, so they must be
     # accepted as a STRING slash-command option rather than an
     # INTEGER option.
     user_id = user_id.strip()
-
+ 
     if not user_id.isdigit():
-
+ 
         await interaction.response.send_message(
             "❌ That is not a valid Discord User ID. "
             "Enter the numeric User ID, for example `123456789012345678`.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     try:
         fighter_id = int(user_id)
     except ValueError:
-
+ 
         await interaction.response.send_message(
             "❌ That is not a valid Discord User ID.",
             ephemeral=True
         )
-
+ 
         return
-
+ 
     await interaction.response.defer(
         ephemeral=True
     )
-
+ 
     try:
-
+ 
         removed = remove_from_rankings(
             interaction.guild.id,
             fighter_id,
             weight_value
         )
-
+ 
         if not removed:
-
+ 
             await interaction.followup.send(
                 (
                     f"❌ <@{fighter_id}> is not ranked "
@@ -2453,14 +2451,14 @@ async def rankingsr(
                     users=True
                 )
             )
-
+ 
             return
-
+ 
         await refresh_ranking_message(
             interaction.guild,
             weight_value
         )
-
+ 
         await interaction.followup.send(
             (
                 f"✅ <@{fighter_id}> has been removed "
@@ -2471,23 +2469,23 @@ async def rankingsr(
                 users=True
             )
         )
-
+ 
     except Exception as error:
-
+ 
         print(
             f"Ranking removal error: {error}"
         )
-
+ 
         await interaction.followup.send(
             "❌ Something went wrong while removing the fighter.",
             ephemeral=True
         )
-
-
+ 
+ 
 # ============================================================
 # /RANKINGSCLEARUNKNOWN
 # ============================================================
-
+ 
 @bot.tree.command(
     name="rankingsclearunknown",
     description="Remove fighters who have left the server from rankings."
@@ -2495,34 +2493,34 @@ async def rankingsr(
 async def rankingsclearunknown(
     interaction: discord.Interaction
 ):
-
+ 
     if not is_admin(interaction):
         await interaction.response.send_message(
             "❌ Only server administrators can clear unknown fighters.",
             ephemeral=True
         )
         return
-
+ 
     await interaction.response.defer(
         ephemeral=True
     )
-
+ 
     removed_by_weight = {}
     member_cache = {}
-
+ 
     # Check every ranking independently. This is important because
     # the same fighter can now appear in multiple weight classes and P4P.
     for weight in WEIGHTS.keys():
-
+ 
         rows = get_division_rankings(
             interaction.guild.id,
             weight
         )
-
+ 
         for row in rows:
-
+ 
             fighter_id = row["discord_user_id"]
-
+ 
             # Avoid checking the same Discord member repeatedly when
             # they appear in several divisions. The result is cached
             # for this command run.
@@ -2531,44 +2529,44 @@ async def rankingsclearunknown(
                     interaction.guild,
                     fighter_id
                 )
-
+ 
             if member_cache[fighter_id] is not None:
                 continue
-
+ 
             removed = remove_from_rankings(
                 interaction.guild.id,
                 fighter_id,
                 weight
             )
-
+ 
             if removed:
                 removed_by_weight[weight] = (
                     removed_by_weight.get(weight, 0) + 1
                 )
-
+ 
     # Refresh every board that may have changed.
     for weight in removed_by_weight:
         await refresh_ranking_message(
             interaction.guild,
             weight
         )
-
+ 
     total_removed = sum(
         removed_by_weight.values()
     )
-
+ 
     if total_removed == 0:
         await interaction.followup.send(
             "✅ No unknown fighters were found in the rankings.",
             ephemeral=True
         )
         return
-
+ 
     details = "\n".join(
         f"• **{weight}:** {count} removed"
         for weight, count in removed_by_weight.items()
     )
-
+ 
     await interaction.followup.send(
         (
             f"✅ **{total_removed} unknown ranking entr"
@@ -2577,40 +2575,40 @@ async def rankingsclearunknown(
         ),
         ephemeral=True
     )
-
-
+ 
+ 
 # ============================================================
 # REFRESH EXISTING RANKING MESSAGE
 # ============================================================
-
+ 
 async def refresh_ranking_message(
     guild: discord.Guild,
     weight: str
 ):
-
+ 
     saved_message = get_ranking_message(
         guild.id,
         weight
     )
-
+ 
     if not saved_message:
-
+ 
         return False
-
+ 
     try:
-
+ 
         channel = guild.get_channel(
             saved_message["channel_id"]
         )
-
+ 
         if not channel:
-
+ 
             return False
-
+ 
         message = await channel.fetch_message(
             saved_message["message_id"]
         )
-
+ 
         await message.edit(
             embed=await create_ranking_embed(
                 guild,
@@ -2620,117 +2618,118 @@ async def refresh_ranking_message(
                 users=True
             )
         )
-
+ 
         return True
-
+ 
     except Exception as error:
-
+ 
         print(
             f"Could not refresh {weight} ranking: {error}"
         )
-
+ 
         return False
-
-
+ 
+ 
 # ============================================================
 # ON READY
 # ============================================================
-
+ 
 @bot.event
 async def on_ready():
-
+ 
     print(
         f"Logged in as {bot.user}"
     )
-
+ 
     print(
         f"Bot ID: {bot.user.id}"
     )
-
+ 
     setup_database()
-
+ 
     # --------------------------------------------------------
     # Sync slash commands.
     # --------------------------------------------------------
-
+ 
     if GUILD_ID:
-
+ 
         guild = discord.Object(
             id=int(GUILD_ID)
         )
-
+ 
         bot.tree.copy_global_to(
             guild=guild
         )
-
+ 
         await bot.tree.sync(
             guild=guild
         )
-
+ 
         print(
             "Slash commands synced to your server."
         )
-
+ 
     else:
-
+ 
         await bot.tree.sync()
-
+ 
         print(
             "Global slash commands synced."
         )
-
+ 
     # --------------------------------------------------------
     # Restore active signup buttons after a restart.
     # --------------------------------------------------------
-
+ 
     db = get_db()
     cursor = db.cursor()
-
+ 
     cursor.execute("""
         SELECT *
         FROM signup_sessions
         WHERE active = 1
     """)
-
+ 
     active_sessions = cursor.fetchall()
-
+ 
     db.close()
-
+ 
     for session in active_sessions:
-
+ 
         try:
-
+ 
             bot.add_view(
                 SignupView(
                     session["id"],
                     session["signup_type"]
                 )
             )
-
+ 
         except Exception as error:
-
+ 
             print(
                 f"Could not restore signup "
                 f"{session['id']}: {error}"
             )
-
+ 
     print(
         f"Loaded {len(active_sessions)} "
         f"active signup session(s)."
     )
-
-
+ 
+ 
 # ============================================================
 # START BOT
 # ============================================================
-
+ 
 if not TOKEN:
-
+ 
     raise RuntimeError(
         "DISCORD_TOKEN is missing from your environment variables."
     )
-
-
+ 
+ 
 setup_database()
-
+ 
 bot.run(TOKEN)
+
