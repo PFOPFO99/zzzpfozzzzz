@@ -1,8 +1,10 @@
 import csv
+import hashlib
 import io
 import os
 import re
 import sqlite3
+import time
 import types
 from datetime import datetime, timezone
 
@@ -1574,6 +1576,13 @@ async def find_existing_ranking_message(
 # RANKING DISPLAY
 # ============================================================
 
+# People who aren't in the server are remembered for 10 minutes,
+# so refreshing ranking boards doesn't ask Discord about them
+# again and again (too many requests gets the bot blocked).
+MISSING_MEMBER_CACHE = {}
+MISSING_MEMBER_SECONDS = 600
+
+
 async def get_server_member(
     guild: discord.Guild,
     user_id: int
@@ -1583,13 +1592,22 @@ async def get_server_member(
     if member:
         return member
 
+    key = (guild.id, user_id)
+    missing_since = MISSING_MEMBER_CACHE.get(key)
+
+    if missing_since and time.monotonic() - missing_since < MISSING_MEMBER_SECONDS:
+        return None
+
     try:
-        return await guild.fetch_member(user_id)
+        member = await guild.fetch_member(user_id)
+        MISSING_MEMBER_CACHE.pop(key, None)
+        return member
     except (
         discord.NotFound,
         discord.Forbidden,
         discord.HTTPException
     ):
+        MISSING_MEMBER_CACHE[key] = time.monotonic()
         return None
 
 
@@ -6086,55 +6104,82 @@ async def scanresults(
 
 
 # ============================================================
-# ON READY
+# STARTUP
+#
+# Runs once when the bot starts (not on every reconnect):
+#   1. set up the database
+#   2. restore the Sign Up buttons on open sign-ups
+#   3. register slash commands with Discord, but ONLY when this
+#      file has changed since the last time. Re-registering on
+#      every start/reconnect is a common reason Discord
+#      temporarily blocks a bot for too many requests.
 # ============================================================
 
-@bot.event
-async def on_ready():
+def get_meta(
+    key: str
+):
 
-    print(
-        f"Logged in as {bot.user}"
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    cursor.execute(
+        "SELECT value FROM bot_meta WHERE key = ?",
+        (key,)
     )
 
-    print(
-        f"Bot ID: {bot.user.id}"
+    row = cursor.fetchone()
+
+    db.commit()
+    db.close()
+
+    return row["value"] if row else None
+
+
+def set_meta(
+    key: str,
+    value: str
+):
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS bot_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    cursor.execute(
+        "INSERT OR REPLACE INTO bot_meta (key, value) VALUES (?, ?)",
+        (key, value)
     )
 
-    setup_database()
+    db.commit()
+    db.close()
 
-    # --------------------------------------------------------
-    # Sync slash commands.
-    # --------------------------------------------------------
 
-    if GUILD_ID:
+def commands_fingerprint():
 
-        guild = discord.Object(
-            id=int(GUILD_ID)
-        )
+    try:
+        with open(os.path.abspath(__file__), "rb") as source:
+            code = source.read()
+    except OSError:
+        code = b""
 
-        bot.tree.copy_global_to(
-            guild=guild
-        )
+    return hashlib.sha256(
+        code + str(GUILD_ID).encode()
+    ).hexdigest()
 
-        await bot.tree.sync(
-            guild=guild
-        )
 
-        print(
-            "Slash commands synced to your server."
-        )
-
-    else:
-
-        await bot.tree.sync()
-
-        print(
-            "Global slash commands synced."
-        )
-
-    # --------------------------------------------------------
-    # Restore active signup buttons after a restart.
-    # --------------------------------------------------------
+def restore_signup_buttons():
 
     db = get_db()
     cursor = db.cursor()
@@ -6173,6 +6218,84 @@ async def on_ready():
     )
 
 
+async def sync_commands_if_changed():
+
+    fingerprint = commands_fingerprint()
+
+    if (
+        os.getenv("FORCE_COMMAND_SYNC", "").strip() not in ("1", "true", "yes")
+        and get_meta("commands_fingerprint") == fingerprint
+    ):
+        print("Slash commands unchanged; skipping sync.")
+        return
+
+    try:
+
+        if GUILD_ID:
+
+            guild = discord.Object(
+                id=int(GUILD_ID)
+            )
+
+            bot.tree.copy_global_to(
+                guild=guild
+            )
+
+            await bot.tree.sync(
+                guild=guild
+            )
+
+            print(
+                "Slash commands synced to your server."
+            )
+
+        else:
+
+            await bot.tree.sync()
+
+            print(
+                "Global slash commands synced."
+            )
+
+        set_meta(
+            "commands_fingerprint",
+            fingerprint
+        )
+
+    except Exception as error:
+
+        # Don't stop the bot over this: the existing commands keep
+        # working, and it tries again on the next start.
+        print(
+            f"Could not sync slash commands (will retry next start): {error}"
+        )
+
+
+async def setup_hook():
+
+    setup_database()
+
+    # Buttons first, so sign-ups work even if the sync below fails.
+    restore_signup_buttons()
+
+    await sync_commands_if_changed()
+
+
+bot.setup_hook = setup_hook
+
+
+@bot.event
+async def on_ready():
+
+    print(
+        f"Logged in as {bot.user}"
+    )
+
+    print(
+        f"Bot ID: {bot.user.id}"
+    )
+
+
 # ============================================================
 # START BOT
 # ============================================================
@@ -6186,19 +6309,50 @@ if not TOKEN:
 
 setup_database()
 
+# How long to wait before giving up when Discord has temporarily
+# blocked the bot (Cloudflare "error 1015" / 429). Restarting
+# straight away makes the block last longer.
+BLOCKED_WAIT_SECONDS = int(
+    os.getenv("BLOCKED_WAIT_SECONDS", "1800")
+)
+
+
+def run_bot():
+
+    try:
+
+        bot.run(TOKEN)
+
+    except discord.PrivilegedIntentsRequired:
+
+        print(
+            "Message Content Intent is not turned on in the Discord "
+            "Developer Portal, so /scanresults can't read messages. "
+            "Starting without it; everything else works normally."
+        )
+
+        bot.clear()
+        bot._connection._intents.message_content = False
+
+        bot.run(TOKEN)
+
+
 try:
 
-    bot.run(TOKEN)
+    run_bot()
 
-except discord.PrivilegedIntentsRequired:
+except discord.HTTPException as error:
 
-    print(
-        "Message Content Intent is not turned on in the Discord "
-        "Developer Portal, so /scanresults can't read messages. "
-        "Starting without it; everything else works normally."
-    )
+    if error.status == 429:
 
-    bot.clear()
-    bot._connection._intents.message_content = False
+        print(
+            "Discord has temporarily blocked this bot for too many "
+            "requests (Cloudflare error 1015 / 429). This is usually "
+            "Railway's shared address and clears on its own. Waiting "
+            f"{BLOCKED_WAIT_SECONDS // 60} minutes before trying again "
+            "so the block isn't extended."
+        )
 
-    bot.run(TOKEN)
+        time.sleep(BLOCKED_WAIT_SECONDS)
+
+    raise
