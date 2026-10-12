@@ -1,3 +1,4 @@
+import asyncio
 import csv
 import hashlib
 import io
@@ -6,7 +7,7 @@ import re
 import sqlite3
 import time
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -6104,6 +6105,1046 @@ async def scanresults(
 
 
 # ============================================================
+# FIGHT CARD DMS AND LIVE CHECK-IN
+#
+#   /dmfightnight  DM everyone on a Fight Night card (staff)
+#   /dmlivecard    DM everyone on a Live Card, with a Check In
+#                  button in the DM (staff)
+#   /livecheckin   post a board showing who has checked in; it
+#                  updates by itself when people press the button
+#                  (staff)
+#
+# Who gets the DM: @mention everyone in the "fighters" box, any
+# number of people in one go (up to 60).
+#
+# Live Card dates become Discord timestamps, so every fighter sees
+# the time in their own timezone. Staff type the time in UK time
+# (change EVENT_TIMEZONE in Railway to use a different one).
+# ============================================================
+
+SELECTED_FIGHT_NIGHT_BANNER = "selected_fight_night.gif"
+SELECTED_LIVE_CARD_BANNER = "selected_live_card.gif"
+CHECKIN_BANNER = "checkin.gif"
+CHECKED_IN_BANNER = "checked_in.gif"
+
+MAX_CARD_FIGHTERS = 60
+DM_DELAY_SECONDS = 1.0  # gentle on Discord, avoids being blocked
+
+MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
+EVENT_TIMEZONE = os.getenv(
+    "EVENT_TIMEZONE",
+    "Europe/London"
+).strip()
+
+
+FIGHT_NIGHT_DM_TEXT = (
+    "You have been selected to fight on a PFO Fight Night, please check "
+    "the card and organise a time with your opponent before {deadline}.\n\n"
+    "No attempt to fight will result in a suspension from upcoming cards or "
+    "instant removal of your fighter. If you are struggling to organise a "
+    "time with your opponent please contact a member of staff in PFO."
+)
+
+LIVE_CARD_DM_TEXT = (
+    "You have been selected to fight on **{event}** on {date}. Please "
+    "check the card and make contact with your opponent as soon as possible.\n\n"
+    "One person per fight **MUST** stream, please sort this out before the day "
+    "and ensure you are lobbied up a few fights before yours so that the event "
+    "runs smoothly.\n\n"
+    "Failure to show will result in a suspension from upcoming events or "
+    "removal of your fighter. Please press the button below to check in so "
+    "we know you are going to show."
+)
+
+
+# ------------------------------------------------------------
+# Database
+# ------------------------------------------------------------
+
+def setup_card_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS card_notices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            event TEXT,
+            event_date TEXT,
+            deadline TEXT,
+            card_url TEXT,
+            created_by INTEGER,
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            board_channel_id INTEGER,
+            board_message_id INTEGER
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS card_fighters (
+            notice_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            opponent_id INTEGER,
+            dm_status TEXT NOT NULL DEFAULT 'pending',
+            checked_in_at TEXT,
+
+            PRIMARY KEY(notice_id, user_id)
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def create_notice(
+    guild_id: int,
+    kind: str,
+    created_by: int,
+    fighters: list,
+    event: str = None,
+    event_date: str = None,
+    deadline: str = None,
+    card_url: str = None
+):
+    """fighters: list of (user_id, name, opponent_id)"""
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        INSERT INTO card_notices
+        (guild_id, kind, event, event_date, deadline, card_url, created_by, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        guild_id, kind, event, event_date, deadline, card_url, created_by, now_utc()
+    ))
+
+    notice_id = cursor.lastrowid
+
+    cursor.executemany("""
+        INSERT INTO card_fighters
+        (notice_id, user_id, position, name, opponent_id)
+        VALUES (?, ?, ?, ?, ?)
+    """, [
+        (notice_id, user_id, position, name, opponent_id)
+        for position, (user_id, name, opponent_id) in enumerate(fighters)
+    ])
+
+    db.commit()
+    db.close()
+
+    return notice_id
+
+
+def get_notice(
+    notice_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM card_notices WHERE id = ?", (notice_id,))
+    row = cursor.fetchone()
+    db.close()
+
+    return row
+
+
+def get_latest_live_notice(
+    guild_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT * FROM card_notices
+        WHERE guild_id = ? AND kind = 'live_card'
+        ORDER BY id DESC
+        LIMIT 1
+    """, (guild_id,))
+    row = cursor.fetchone()
+    db.close()
+
+    return row
+
+
+def get_active_live_notices():
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT * FROM card_notices
+        WHERE kind = 'live_card' AND active = 1
+    """)
+    rows = cursor.fetchall()
+    db.close()
+
+    return rows
+
+
+def get_card_fighters(
+    notice_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT * FROM card_fighters
+        WHERE notice_id = ?
+        ORDER BY position ASC
+    """, (notice_id,))
+    rows = cursor.fetchall()
+    db.close()
+
+    return rows
+
+
+def get_card_fighter(
+    notice_id: int,
+    user_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT * FROM card_fighters
+        WHERE notice_id = ? AND user_id = ?
+    """, (notice_id, user_id))
+    row = cursor.fetchone()
+    db.close()
+
+    return row
+
+
+def update_card_fighter(
+    notice_id: int,
+    user_id: int,
+    **changes
+):
+
+    columns = ", ".join(f"{column} = ?" for column in changes)
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        f"UPDATE card_fighters SET {columns} WHERE notice_id = ? AND user_id = ?",
+        (*changes.values(), notice_id, user_id)
+    )
+    db.commit()
+    db.close()
+
+
+def update_notice(
+    notice_id: int,
+    **changes
+):
+
+    columns = ", ".join(f"{column} = ?" for column in changes)
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        f"UPDATE card_notices SET {columns} WHERE id = ?",
+        (*changes.values(), notice_id)
+    )
+    db.commit()
+    db.close()
+
+
+# ------------------------------------------------------------
+# Dates and times
+# ------------------------------------------------------------
+
+def uk_offset_hours(
+    naive: datetime
+):
+    """
+    Fallback when the server has no timezone data. UK clocks are
+    GMT, or BST (+1 hour) from the last Sunday of March (01:00) to
+    the last Sunday of October (02:00 local).
+    """
+
+    def last_sunday(year, month):
+        next_month = datetime(year + (month == 12), month % 12 + 1, 1)
+        day = next_month - timedelta(days=1)
+        return day - timedelta(days=(day.weekday() - 6) % 7)
+
+    starts = last_sunday(naive.year, 3).replace(hour=1)
+    ends = last_sunday(naive.year, 10).replace(hour=2)
+
+    return 1 if starts <= naive < ends else 0
+
+
+def to_utc(
+    naive: datetime
+):
+
+    try:
+        from zoneinfo import ZoneInfo
+        return naive.replace(tzinfo=ZoneInfo(EVENT_TIMEZONE)).astimezone(timezone.utc)
+    except Exception:
+        offset = uk_offset_hours(naive) if EVENT_TIMEZONE == "Europe/London" else 0
+        return (naive - timedelta(hours=offset)).replace(tzinfo=timezone.utc)
+
+
+def parse_event_datetime(
+    text: str
+):
+    """
+    Reads a date and time typed in UK time, e.g.
+      24/10/2026 20:00   24/10/2026 8pm   24/10 8:30pm   2026-10-24 20:00
+    Returns a UTC datetime, or None if it can't be read.
+    """
+
+    text = " ".join((text or "").lower().replace(",", " ").replace(" at ", " ").split())
+    text = re.sub(
+        r"^(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day|nesday|sday|urday|rsday)?\s+",
+        "",
+        text
+    )
+
+    match = re.fullmatch(
+        r"(?:(?P<d>\d{1,2})[/.-](?P<m>\d{1,2})(?:[/.-](?P<y>\d{2,4}))?"
+        r"|(?P<y2>\d{4})-(?P<m2>\d{1,2})-(?P<d2>\d{1,2}))"
+        r"\s+(?P<h>\d{1,2})(?:[:.](?P<min>\d{2}))?\s*(?P<ampm>am|pm)?",
+        text
+    )
+
+    if not match:
+        return None
+
+    if match.group("y2"):
+        year, month, day = int(match.group("y2")), int(match.group("m2")), int(match.group("d2"))
+    else:
+        day, month = int(match.group("d")), int(match.group("m"))
+        year = match.group("y")
+        year = int(year) + (2000 if year and len(year) == 2 else 0) if year else None
+
+    hour = int(match.group("h"))
+    minute = int(match.group("min") or 0)
+    ampm = match.group("ampm")
+
+    if ampm:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if ampm == "pm" else 0)
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        if year is None:
+            year = now.year
+            candidate = datetime(year, month, day, hour, minute)
+            if to_utc(candidate) < now:
+                year += 1
+        naive = datetime(year, month, day, hour, minute)
+    except ValueError:
+        return None
+
+    return to_utc(naive)
+
+
+def discord_time(
+    moment: datetime
+):
+    """Shows in every reader's own timezone, e.g. 'Saturday, 24 October 2026 20:00 (in 12 days)'."""
+
+    unix = int(moment.timestamp())
+
+    return f"**<t:{unix}:F>** (<t:{unix}:R>)"
+
+
+def format_saved_time(
+    value: str
+):
+
+    if value and value.isdigit():
+        return discord_time(datetime.fromtimestamp(int(value), timezone.utc))
+
+    return f"**{value}**" if value else ""
+
+
+# ------------------------------------------------------------
+# Working out who is on the card
+# ------------------------------------------------------------
+
+class CardInputError(Exception):
+    pass
+
+
+async def collect_card(
+    guild: discord.Guild,
+    fighters_text: str
+):
+    """
+    Everyone @mentioned, in the order typed, without repeats.
+    Returns a list of (user_id, name, member or None).
+    """
+
+    order = []
+
+    for found in MENTION_PATTERN.findall(fighters_text or ""):
+        user_id = int(found)
+        if user_id not in order:
+            order.append(user_id)
+
+    fighters = []
+
+    for user_id in order:
+
+        member = guild.get_member(user_id)
+
+        if member and member.bot:
+            continue
+
+        name = member.display_name if member else await departed_name(user_id)
+
+        fighters.append((user_id, name, member))
+
+    if not fighters:
+        raise CardInputError(
+            "I didn't find anyone. @mention everyone on the card in "
+            "**fighters**, e.g. `@Razor @Dima @Jordan ...`"
+        )
+
+    if len(fighters) > MAX_CARD_FIGHTERS:
+        raise CardInputError(
+            f"That's {len(fighters)} people; the limit is {MAX_CARD_FIGHTERS} per command."
+        )
+
+    return fighters
+
+
+# ------------------------------------------------------------
+# DM embeds and buttons
+# ------------------------------------------------------------
+
+def create_selection_dm_embed(
+    kind: str,
+    event: str = None,
+    event_date: str = None,
+    deadline: str = None
+):
+
+    if kind == "fight_night":
+        description = FIGHT_NIGHT_DM_TEXT.format(deadline=format_saved_time(deadline))
+        author = "PFO • FIGHT NIGHT"
+        title = "🥊 You've been selected!"
+        banner = SELECTED_FIGHT_NIGHT_BANNER
+    else:
+        description = LIVE_CARD_DM_TEXT.format(event=event, date=format_saved_time(event_date))
+        if event and event.upper().startswith("PFO"):
+            author = event.upper()
+        elif event:
+            author = f"PFO • {event.upper()}"
+        else:
+            author = "PFO • LIVE CARD"
+        title = "🥊 You've been selected!"
+        banner = SELECTED_LIVE_CARD_BANNER
+
+    embed = discord.Embed(
+        title=title,
+        description=description,
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=banner,
+        author_text=author
+    )
+
+    embed.set_footer(
+        text="Prestige Fighting Organisation",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+class CheckInView(
+    discord.ui.View
+):
+    """The Check In button in Live Card DMs. Works after restarts."""
+
+    def __init__(
+        self,
+        notice_id: int
+    ):
+
+        super().__init__(
+            timeout=None
+        )
+
+        self.notice_id = notice_id
+
+        button = discord.ui.Button(
+            label="Check In",
+            style=discord.ButtonStyle.green,
+            emoji="✅",
+            custom_id=f"pfo_checkin_{notice_id}"
+        )
+
+        button.callback = self.check_in
+
+        self.add_item(button)
+
+    async def check_in(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        notice = get_notice(self.notice_id)
+
+        if not notice or not notice["active"]:
+
+            await interaction.response.send_message(
+                "❌ Check-in for this event has closed. Please contact a member of staff in PFO."
+            )
+
+            return
+
+        row = get_card_fighter(
+            self.notice_id,
+            interaction.user.id
+        )
+
+        if not row:
+
+            await interaction.response.send_message(
+                "❌ You're not on this card."
+            )
+
+            return
+
+        if not row["checked_in_at"]:
+            update_card_fighter(
+                self.notice_id,
+                interaction.user.id,
+                checked_in_at=now_utc()
+            )
+
+        embed = (
+            interaction.message.embeds[0].copy()
+            if interaction.message and interaction.message.embeds
+            else create_selection_dm_embed("live_card", event=notice["event"], event_date=notice["event_date"])
+        )
+
+        banner = asset_url(CHECKED_IN_BANNER)
+
+        if banner:
+            embed.set_image(url=banner)
+
+        if not any(field.name.startswith("✅") for field in embed.fields):
+            embed.add_field(
+                name="✅ Checked in",
+                value="Thanks! Staff can see you're coming. See you on the night.",
+                inline=False
+            )
+
+        done = discord.ui.View(timeout=None)
+        done.add_item(discord.ui.Button(
+            label="Checked In",
+            style=discord.ButtonStyle.grey,
+            emoji="✅",
+            disabled=True
+        ))
+
+        await interaction.response.edit_message(
+            embed=embed,
+            view=done
+        )
+
+        await refresh_checkin_board(self.notice_id)
+
+
+# ------------------------------------------------------------
+# Check-in board
+# ------------------------------------------------------------
+
+def create_checkin_board_embed(
+    notice
+):
+
+    fighters = get_card_fighters(notice["id"])
+
+    checked = sum(1 for row in fighters if row["checked_in_at"])
+
+    def fighter_text(row):
+        if row["checked_in_at"]:
+            icon = "✅"
+        elif row["dm_status"] == "failed":
+            icon = "⚠️"
+        else:
+            icon = "⏳"
+        return f"{icon} <@{row['user_id']}>"
+
+    lines = [
+        f"`{number:>2}` {fighter_text(row)}"
+        for number, row in enumerate(fighters, start=1)
+    ]
+
+    header = []
+
+    if notice["event_date"]:
+        header.append(f"📅 {format_saved_time(notice['event_date'])}")
+
+    header.append(f"**{checked} / {len(fighters)} checked in**")
+
+    if not notice["active"]:
+        header.append("🔒 **Check-in closed**")
+
+    embed = discord.Embed(
+        title=notice["event"] or "Live Card",
+        description=("\n".join(header) + "\n\n" + "\n".join(lines))[:4000],
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=CHECKIN_BANNER,
+        author_text="PFO • LIVE CARD CHECK-IN"
+    )
+
+    embed.set_footer(
+        text="✅ Checked in    ⏳ Waiting    ⚠️ Couldn't DM • Updates automatically",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+async def refresh_checkin_board(
+    notice_id: int
+):
+
+    notice = get_notice(notice_id)
+
+    if not notice or not notice["board_message_id"]:
+        return
+
+    try:
+        channel = bot.get_channel(notice["board_channel_id"]) or await bot.fetch_channel(
+            notice["board_channel_id"]
+        )
+        message = await channel.fetch_message(notice["board_message_id"])
+        await message.edit(embed=create_checkin_board_embed(notice))
+    except Exception as error:
+        print(f"Could not refresh check-in board: {error}")
+
+
+# ------------------------------------------------------------
+# Sending
+# ------------------------------------------------------------
+
+class SendDMsView(
+    discord.ui.View
+):
+    """Confirm step before DMing a whole card."""
+
+    def __init__(
+        self,
+        author_id: int,
+        guild: discord.Guild,
+        kind: str,
+        fighters: list,
+        event: str = None,
+        event_date: str = None,
+        deadline: str = None
+    ):
+
+        super().__init__(
+            timeout=600
+        )
+
+        self.author_id = author_id
+        self.guild = guild
+        self.kind = kind
+        self.fighters = fighters
+        self.event = event
+        self.event_date = event_date
+        self.deadline = deadline
+
+        confirm = discord.ui.Button(
+            label=f"Send {len(fighters)} DM{'s' if len(fighters) != 1 else ''}",
+            style=discord.ButtonStyle.green,
+            emoji="📨"
+        )
+        confirm.callback = self.confirm
+
+        cancel = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.grey
+        )
+        cancel.callback = self.cancel
+
+        self.add_item(confirm)
+        self.add_item(cancel)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if interaction.user.id != self.author_id:
+
+            await interaction.response.send_message(
+                "❌ Only the person who started this can confirm it.",
+                ephemeral=True
+            )
+
+            return False
+
+        return True
+
+    async def cancel(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        await interaction.response.edit_message(
+            content="Cancelled. No DMs were sent.",
+            embed=None,
+            view=None
+        )
+
+    async def confirm(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        await interaction.response.edit_message(
+            content=f"📨 Sending DMs to {len(self.fighters)} fighters… this takes about "
+                    f"{max(1, round(len(self.fighters) * DM_DELAY_SECONDS))} seconds.",
+            embed=None,
+            view=None
+        )
+
+        notice_id = create_notice(
+            self.guild.id,
+            self.kind,
+            self.author_id,
+            [(user_id, name, None) for user_id, name, _ in self.fighters],
+            event=self.event,
+            event_date=self.event_date,
+            deadline=self.deadline
+        )
+
+        sent = []
+        failed = []
+
+        for index, (user_id, name, member) in enumerate(self.fighters):
+
+            if index:
+                await asyncio.sleep(DM_DELAY_SECONDS)
+
+            if member is None:
+                failed.append((user_id, "not in the server"))
+                update_card_fighter(notice_id, user_id, dm_status="failed")
+                continue
+
+            embed = create_selection_dm_embed(
+                self.kind,
+                event=self.event,
+                event_date=self.event_date,
+                deadline=self.deadline
+            )
+
+            view = CheckInView(notice_id) if self.kind == "live_card" else None
+
+            try:
+                if view:
+                    await member.send(embed=embed, view=view)
+                else:
+                    await member.send(embed=embed)
+
+                sent.append(user_id)
+                update_card_fighter(notice_id, user_id, dm_status="sent")
+
+            except discord.Forbidden:
+                failed.append((user_id, "DMs closed"))
+                update_card_fighter(notice_id, user_id, dm_status="failed")
+
+            except Exception as error:
+                print(f"DM to {user_id} failed: {error}")
+                failed.append((user_id, "Discord error"))
+                update_card_fighter(notice_id, user_id, dm_status="failed")
+
+        lines = [
+            f"✅ **DMed {len(sent)} of {len(self.fighters)} fighters.**"
+        ]
+
+        if failed:
+            lines.append("")
+            lines.append("⚠️ **Couldn't DM these, so let them know another way:**")
+            for user_id, reason in failed[:25]:
+                lines.append(f"• <@{user_id}> ({reason})")
+            if len(failed) > 25:
+                lines.append(f"• …and {len(failed) - 25} more")
+
+        if self.kind == "live_card":
+            lines.append("")
+            lines.append("Use `/livecheckin` to post the check-in board.")
+
+        await interaction.edit_original_response(
+            content="\n".join(lines)[:2000]
+        )
+
+        await refresh_checkin_board(notice_id)
+
+
+def create_dm_preview_embed(
+    kind: str,
+    fighters: list,
+    event: str = None,
+    event_date: str = None,
+    deadline: str = None
+):
+
+    lines = []
+
+    for user_id, name, member in fighters[:60]:
+        line = f"• <@{user_id}>"
+        if member is None:
+            line += " ⚠️ not in server"
+        lines.append(line)
+
+    if kind == "fight_night":
+        details = f"**Deadline:** {format_saved_time(deadline)}"
+        author = "PFO • DM FIGHT NIGHT CARD"
+    else:
+        details = (
+            f"**Event:** {event}\n"
+            f"**When:** {format_saved_time(event_date)}\n"
+            "**Check-in button:** included"
+        )
+        author = "PFO • DM LIVE CARD"
+
+    embed = discord.Embed(
+        title=f"Send DMs to {len(fighters)} fighters?",
+        description=(details + "\n\n" + "\n".join(lines))[:4000],
+        color=PFO_GOLD
+    )
+
+    apply_branding(
+        embed,
+        author_text=author
+    )
+
+    embed.set_footer(
+        text="Times show in each person's own timezone • Nothing is sent until you press Send",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+async def start_card_dms(
+    interaction: discord.Interaction,
+    kind: str,
+    fighters_text: str,
+    event: str = None,
+    event_date: str = None,
+    deadline: str = None
+):
+
+    if not is_staff(interaction):
+
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can DM fight cards.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    try:
+        fighters = await collect_card(
+            interaction.guild,
+            fighters_text
+        )
+    except CardInputError as error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+
+    await interaction.followup.send(
+        embed=create_dm_preview_embed(
+            kind, fighters, event, event_date, deadline
+        ),
+        view=SendDMsView(
+            interaction.user.id,
+            interaction.guild,
+            kind,
+            fighters,
+            event=event,
+            event_date=event_date,
+            deadline=deadline
+        ),
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# Commands
+# ------------------------------------------------------------
+
+@bot.tree.command(
+    name="dmfightnight",
+    description="DM everyone you @mention that they've been selected for a Fight Night."
+)
+@app_commands.describe(
+    fighters="@mention everyone on the card, e.g. @Razor @Dima @Jordan ...",
+    deadline="Deadline in UK time, e.g. 19/10/2026 22:00 (or any text, e.g. Sunday night)"
+)
+async def dmfightnight(
+    interaction: discord.Interaction,
+    fighters: str,
+    deadline: str
+):
+
+    moment = parse_event_datetime(deadline)
+
+    await start_card_dms(
+        interaction,
+        "fight_night",
+        fighters,
+        deadline=str(int(moment.timestamp())) if moment else deadline.strip()
+    )
+
+
+@bot.tree.command(
+    name="dmlivecard",
+    description="DM everyone you @mention for a Live Card, with a button to check in."
+)
+@app_commands.describe(
+    fighters="@mention everyone on the card, e.g. @Razor @Dima @Jordan ...",
+    event="Event name, e.g. PFO Live Card 6",
+    date="Date and time in UK time, e.g. 24/10/2026 20:00 or 24/10 8pm"
+)
+async def dmlivecard(
+    interaction: discord.Interaction,
+    fighters: str,
+    event: str,
+    date: str
+):
+
+    moment = parse_event_datetime(date)
+
+    if not moment:
+
+        await interaction.response.send_message(
+            "❌ Write the date and time like **24/10/2026 20:00** or **24/10 8pm** "
+            "(UK time). It's turned into a timestamp everyone sees in their own timezone.",
+            ephemeral=True
+        )
+
+        return
+
+    if moment < datetime.now(timezone.utc):
+
+        await interaction.response.send_message(
+            "❌ That date and time has already passed.",
+            ephemeral=True
+        )
+
+        return
+
+    await start_card_dms(
+        interaction,
+        "live_card",
+        fighters,
+        event=event.strip(),
+        event_date=str(int(moment.timestamp()))
+    )
+
+
+@bot.tree.command(
+    name="livecheckin",
+    description="Show who has checked in for the latest Live Card."
+)
+@app_commands.describe(
+    close="Close check-in (the button stops working)"
+)
+async def livecheckin(
+    interaction: discord.Interaction,
+    close: bool = False
+):
+
+    if not is_staff(interaction):
+
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can view check-ins.",
+            ephemeral=True
+        )
+
+        return
+
+    notice = get_latest_live_notice(
+        interaction.guild.id
+    )
+
+    if not notice:
+
+        await interaction.response.send_message(
+            "❌ No Live Card has been DMed yet. Use `/dmlivecard` first.",
+            ephemeral=True
+        )
+
+        return
+
+    if close:
+
+        update_notice(notice["id"], active=0)
+
+        await refresh_checkin_board(notice["id"])
+
+        await interaction.response.send_message(
+            f"🔒 Check-in for **{notice['event']}** is closed.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.send_message(
+        embed=create_checkin_board_embed(notice)
+    )
+
+    message = await interaction.original_response()
+
+    update_notice(
+        notice["id"],
+        board_channel_id=message.channel.id,
+        board_message_id=message.id
+    )
+
+
+def restore_checkin_buttons():
+
+    notices = get_active_live_notices()
+
+    for notice in notices:
+        try:
+            bot.add_view(CheckInView(notice["id"]))
+        except Exception as error:
+            print(f"Could not restore check-in {notice['id']}: {error}")
+
+    print(f"Loaded {len(notices)} active live check-in(s).")
+
+
+# ============================================================
 # STARTUP
 #
 # Runs once when the bot starts (not on every reconnect):
@@ -6274,9 +7315,11 @@ async def sync_commands_if_changed():
 async def setup_hook():
 
     setup_database()
+    setup_card_tables()
 
-    # Buttons first, so sign-ups work even if the sync below fails.
+    # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
+    restore_checkin_buttons()
 
     await sync_commands_if_changed()
 
