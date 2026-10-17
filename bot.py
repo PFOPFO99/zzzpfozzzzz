@@ -2832,7 +2832,7 @@ async def refresh_ranking_message(
 #   /setrecord     set a starting record for older, untracked fights (staff)
 #   /importfights  import past fights from a CSV spreadsheet (staff)
 #   /importtemplate  get a blank CSV to fill in (staff)
-#   /deletefight   remove a fight logged by mistake (staff)
+#   /removefight   remove a fight logged by mistake (staff)
 #
 # None of this touches the rankings or sign-ups.
 # ============================================================
@@ -3852,6 +3852,215 @@ async def pick_fighter(
 
 
 # ------------------------------------------------------------
+# Nicknames show each fighter's record, e.g. "Razor Reyes (9-1-0)"
+#
+# Updated automatically by /profile, /result, /removefight,
+# /editfight, /editrecord, /setrecord and /resetrecord.
+#
+# The bot needs the "Manage Nicknames" permission, and its role
+# must be ABOVE the fighters' roles. Discord never lets a bot change
+# the server owner's nickname.
+#
+# Turn it off with NICKNAME_RECORDS=off in Railway's Variables.
+# ------------------------------------------------------------
+
+NICKNAME_RECORDS = os.getenv(
+    "NICKNAME_RECORDS",
+    "on"
+).strip().lower() not in ("off", "0", "false", "no")
+
+RECORD_IN_NAME = re.compile(
+    r"\s*\(\s*(\d{1,3})\s*-\s*(\d{1,3})(?:\s*-\s*(\d{1,3}))?\s*\)\s*$"
+)
+
+NICKNAME_LIMIT = 32  # Discord's maximum
+
+
+def record_from_name(
+    name: str
+):
+    """(wins, losses, draws) from a name like "Razor (6-1-0)", or None."""
+
+    found = RECORD_IN_NAME.search(name or "")
+
+    if not found:
+        return None
+
+    return (
+        int(found.group(1)),
+        int(found.group(2)),
+        int(found.group(3) or 0),
+    )
+
+
+def name_without_record(
+    name: str
+):
+
+    return RECORD_IN_NAME.sub("", name or "").strip() or (name or "")
+
+
+def nickname_with_record(
+    current: str,
+    record: str,
+    full_name: str = None
+):
+
+    base = full_name or name_without_record(current)
+    suffix = f" ({record})"
+    room = NICKNAME_LIMIT - len(suffix)
+
+    if len(base) > room:
+        base = base[:room].rstrip(" /-|,")
+
+    return f"{base}{suffix}"
+
+
+def has_record_data(
+    guild_id: int,
+    user_id: int
+):
+
+    return bool(
+        get_fighter_fights(guild_id, user_id)
+        or get_starting_record(guild_id, user_id)
+    )
+
+
+def seed_record_from_nickname(
+    guild_id: int,
+    member
+):
+    """
+    If the bot knows nothing about a fighter yet, start them from the
+    record already in their nickname, so it isn't reset to 0-0-0.
+    """
+
+    if not member or not getattr(member, "id", None) or getattr(member, "bot", False):
+        return False
+
+    if has_record_data(guild_id, member.id):
+        return False
+
+    found = record_from_name(member.display_name)
+
+    if not found:
+        return False
+
+    set_starting_record(guild_id, member.id, *found)
+
+    return True
+
+
+async def sync_nickname(
+    guild: discord.Guild,
+    user_id,
+    force: bool = True
+):
+    """
+    Puts the fighter's current record in their nickname.
+    Returns (problem or None, new nickname or None).
+
+    force=False (used by /profile) skips fighters the bot has no
+    record for, so viewing a profile never adds "(0-0-0)".
+    """
+
+    if not NICKNAME_RECORDS or not user_id:
+        return None, None
+
+    member = await get_server_member(guild, user_id)
+
+    if member is None or member.bot:
+        return None, None
+
+    if not force and not has_record_data(guild.id, user_id):
+        return None, None
+
+    record = stats_record(get_fighter_stats(guild.id, user_id))
+
+    # Remember the full name, so a long name cut short to fit
+    # Discord's 32-character limit doesn't get shorter every time.
+    current_base = name_without_record(member.display_name)
+    key = f"nickname_base:{guild.id}:{user_id}"
+    full_name = get_meta(key)
+
+    was_cut_short = (
+        full_name
+        and len(member.display_name) >= NICKNAME_LIMIT - 1
+        and full_name.startswith(current_base.rstrip(" /-|,"))
+    )
+
+    if not was_cut_short:
+        full_name = current_base
+        set_meta(key, full_name)
+
+    new_nick = nickname_with_record(member.display_name, record, full_name)
+
+    if new_nick == member.display_name:
+        return None, None
+
+    if member.id == guild.owner_id:
+        return (
+            f"**{member.display_name}** is the server owner, and Discord doesn't "
+            f"let bots change the owner's nickname (should be **{new_nick}**)",
+            None
+        )
+
+    try:
+        await member.edit(nick=new_nick, reason="Fight record updated")
+    except discord.Forbidden:
+        return (
+            f"**{member.display_name}**: the bot needs the **Manage Nicknames** "
+            "permission, and its role must be above this fighter's roles",
+            None
+        )
+    except Exception as error:
+        print(f"Nickname update failed for {user_id}: {error}")
+        return f"**{member.display_name}**: Discord error, try again later", None
+
+    return None, new_nick
+
+
+async def sync_nicknames(
+    guild: discord.Guild,
+    user_ids
+):
+
+    problems = []
+    seen = set()
+
+    for user_id in user_ids:
+
+        if not user_id or user_id in seen:
+            continue
+
+        if seen:
+            await asyncio.sleep(0.5)
+
+        seen.add(user_id)
+
+        problem, _ = await sync_nickname(guild, user_id)
+
+        if problem:
+            problems.append(problem)
+
+    return problems
+
+
+def nickname_problem_text(
+    problems: list
+):
+
+    if not problems:
+        return ""
+
+    return (
+        "\n\n⚠️ **Nickname not updated:**\n"
+        + "\n".join(f"• {problem}" for problem in problems[:10])
+    )
+
+
+# ------------------------------------------------------------
 # /RESULT
 # ------------------------------------------------------------
 
@@ -3942,6 +4151,16 @@ async def result(
 
         return
 
+    # Fighters in the server: show names without the old record,
+    # and start anyone new to the bot from the record in their nickname.
+    if winner:
+        seed_record_from_nickname(interaction.guild.id, winner)
+        winner_name = name_without_record(winner_name)
+
+    if loser:
+        seed_record_from_nickname(interaction.guild.id, loser)
+        loser_name = name_without_record(loser_name)
+
     try:
 
         guild_id = interaction.guild.id
@@ -3994,6 +4213,19 @@ async def result(
 
         await interaction.followup.send(
             "❌ Something went wrong while logging the result.",
+            ephemeral=True
+        )
+
+        return
+
+    problems = await sync_nicknames(
+        interaction.guild,
+        [winner_id, loser_id]
+    )
+
+    if problems:
+        await interaction.followup.send(
+            nickname_problem_text(problems).strip(),
             ephemeral=True
         )
 
@@ -4092,6 +4324,23 @@ async def profile(
 
     await interaction.response.defer()
 
+    # Keep their nickname in step with their record.
+    seed_record_from_nickname(interaction.guild.id, member)
+
+    problem, new_nick = await sync_nickname(
+        interaction.guild,
+        member.id,
+        force=False
+    )
+
+    if new_nick:
+        member = types.SimpleNamespace(
+            id=member.id,
+            display_name=new_nick,
+            display_avatar=getattr(member, "display_avatar", None),
+            bot=False
+        )
+
     try:
 
         await interaction.followup.send(
@@ -4100,6 +4349,12 @@ async def profile(
                 member
             )
         )
+
+        if problem and is_staff(interaction):
+            await interaction.followup.send(
+                nickname_problem_text([problem]).strip(),
+                ephemeral=True
+            )
 
     except Exception as error:
 
@@ -4204,6 +4459,8 @@ async def setrecord(
         user_id
     )
 
+    problems = await sync_nicknames(interaction.guild, [user_id])
+
     await interaction.followup.send(
         (
             f"✅ Earlier record for **{name}** set to "
@@ -4211,62 +4468,8 @@ async def setrecord(
             f"{f' (ending on a {streak} streak)' if streak else ''}.\n"
             f"Their full record is now **{stats_record(stats)}** "
             f"including logged fights."
+            f"{nickname_problem_text(problems)}"
         ),
-        ephemeral=True
-    )
-
-
-# ------------------------------------------------------------
-# /DELETEFIGHT
-# ------------------------------------------------------------
-
-@bot.tree.command(
-    name="deletefight",
-    description="Delete a fight that was logged by mistake."
-)
-@app_commands.describe(
-    fight_id="The fight number, shown at the bottom of the result card (Fight #...)"
-)
-async def deletefight(
-    interaction: discord.Interaction,
-    fight_id: int
-):
-
-    if not is_staff(interaction):
-
-        await interaction.response.send_message(
-            f"❌ {STAFF_ONLY_TEXT} can delete fights.",
-            ephemeral=True
-        )
-
-        return
-
-    fight = get_fight(
-        interaction.guild.id,
-        fight_id
-    )
-
-    if not fight:
-
-        await interaction.response.send_message(
-            f"❌ There is no fight #{fight_id}.",
-            ephemeral=True
-        )
-
-        return
-
-    delete_fight(
-        interaction.guild.id,
-        fight_id
-    )
-
-    if fight["method"] in ("DRAW", "NC"):
-        summary = f"{fight['winner_name']} vs {fight['loser_name']} ({METHOD_LABELS[fight['method']]})"
-    else:
-        summary = f"{fight['winner_name']} def. {fight['loser_name']} ({METHOD_LABELS[fight['method']]})"
-
-    await interaction.response.send_message(
-        f"🗑️ Deleted fight #{fight_id}: {summary}. Both records have been updated.",
         ephemeral=True
     )
 
@@ -4452,6 +4655,17 @@ async def editfight(
         ),
         ephemeral=True
     )
+
+    problems = await sync_nicknames(
+        interaction.guild,
+        [updated["winner_id"], updated["loser_id"]]
+    )
+
+    if problems:
+        await interaction.followup.send(
+            nickname_problem_text(problems).strip(),
+            ephemeral=True
+        )
 
 
 # ------------------------------------------------------------
@@ -4725,6 +4939,7 @@ async def editrecord(
             f"{'s' if len(before['fights']) != 1 else ''} stay on their profile, "
             f"and new results add on top as normal."
             f"{note}"
+            f"{nickname_problem_text(await sync_nicknames(interaction.guild, [user_id]))}"
         ),
         ephemeral=True
     )
@@ -4798,6 +5013,14 @@ class ResetRecordView(
 
         removed = 0
 
+        # Everyone whose record changes: this fighter, plus their
+        # opponents if their fights are being deleted.
+        affected = [self.user_id]
+
+        if self.delete_fights:
+            for fight in get_fighter_fights(self.guild_id, self.user_id, self.name):
+                affected += [fight["winner_id"], fight["loser_id"]]
+
         if self.user_id:
             clear_starting_record(self.guild_id, self.user_id)
 
@@ -4827,6 +5050,13 @@ class ResetRecordView(
             embed=None,
             view=None
         )
+
+        problems = await sync_nicknames(interaction.client.get_guild(self.guild_id) or interaction.guild, affected)
+
+        if problems:
+            await interaction.edit_original_response(
+                content=text + nickname_problem_text(problems)
+            )
 
     async def cancel(
         self,
@@ -4909,7 +5139,7 @@ async def resetrecord(
             f"This resets **{name}** to **0-0-0** and deletes all "
             f"**{fight_count}** of their logged fights.\n\n"
             "⚠️ Those fights are also removed from their **opponents'** records. "
-            "To fix a single fight instead, use `/editfight` or `/deletefight`."
+            "To fix a single fight instead, use `/editfight` or `/removefight`."
         )
     else:
         logged = format_record(*stats["logged"])
@@ -4938,6 +5168,305 @@ async def resetrecord(
             user_id,
             name,
             delete_fights
+        ),
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# /REMOVEFIGHT
+#
+# Removes a fight that was logged by mistake. Pick it by:
+#   fight_id               the number on the result card / in /fights
+#   fighter                their most recent fight
+#   fighter + opponent     the most recent fight between those two
+# Asks to confirm first, then updates both records and nicknames.
+# ------------------------------------------------------------
+
+def fight_involves(
+    fight,
+    user_id,
+    name: str = None
+):
+
+    for side in ("winner", "loser"):
+
+        if user_id and fight[f"{side}_id"] == user_id:
+            return True
+
+        if not user_id and fight[f"{side}_id"] is None and normalise_name(
+            fight[f"{side}_name"]
+        ) == normalise_name(name or ""):
+            return True
+
+    return False
+
+
+def record_after_removing(
+    guild_id: int,
+    fight,
+    side: str
+):
+    """(before, after) record strings for one side of a fight being removed."""
+
+    user_id = fight[f"{side}_id"]
+    name = fight[f"{side}_name"]
+
+    stats = get_fighter_stats(guild_id, user_id, name)
+    wins, losses, draws = stats["wins"], stats["losses"], stats["draws"]
+    before = format_record(wins, losses, draws)
+
+    if fight["method"] == "DRAW":
+        draws -= 1
+    elif fight["method"] == "NC":
+        pass
+    elif side == "winner":
+        wins -= 1
+    else:
+        losses -= 1
+
+    return before, format_record(wins, losses, draws)
+
+
+class RemoveFightView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        author_id: int,
+        guild_id: int,
+        fight
+    ):
+
+        super().__init__(
+            timeout=300
+        )
+
+        self.author_id = author_id
+        self.guild_id = guild_id
+        self.fight = fight
+
+        confirm = discord.ui.Button(
+            label="Yes, remove it",
+            style=discord.ButtonStyle.red,
+            emoji="🗑️"
+        )
+        confirm.callback = self.confirm
+
+        cancel = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.grey
+        )
+        cancel.callback = self.cancel
+
+        self.add_item(confirm)
+        self.add_item(cancel)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if interaction.user.id != self.author_id:
+
+            await interaction.response.send_message(
+                "❌ Only the person who started this can confirm it.",
+                ephemeral=True
+            )
+
+            return False
+
+        return True
+
+    async def confirm(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        fight = self.fight
+
+        if not get_fight(self.guild_id, fight["id"]):
+
+            await interaction.response.edit_message(
+                content=f"❌ Fight #{fight['id']} was already removed.",
+                embed=None,
+                view=None
+            )
+
+            return
+
+        changes = [
+            (fight[f"{side}_name"], *record_after_removing(self.guild_id, fight, side))
+            for side in ("winner", "loser")
+        ]
+
+        delete_fight(
+            self.guild_id,
+            fight["id"]
+        )
+
+        text = (
+            f"🗑️ **Removed fight #{fight['id']}**: {fight_summary(fight)}\n\n"
+            + "\n".join(
+                f"• **{name_without_record(name)}**: {before} → **{after}**"
+                for name, before, after in changes
+            )
+        )
+
+        await interaction.response.edit_message(
+            content=text,
+            embed=None,
+            view=None
+        )
+
+        guild = interaction.client.get_guild(self.guild_id) or interaction.guild
+
+        problems = await sync_nicknames(
+            guild,
+            [fight["winner_id"], fight["loser_id"]]
+        )
+
+        if problems:
+            await interaction.edit_original_response(
+                content=text + nickname_problem_text(problems)
+            )
+
+    async def cancel(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        await interaction.response.edit_message(
+            content="Cancelled. Nothing was removed.",
+            embed=None,
+            view=None
+        )
+
+
+@bot.tree.command(
+    name="removefight",
+    description="Remove a fight that was logged by mistake (asks to confirm first)."
+)
+@app_commands.describe(
+    fighter="Remove this fighter's most recent fight",
+    opponent="Only fights against this opponent",
+    opponent_left="Opponent who has LEFT the server: their user ID or name",
+    fight_id="Or: the exact fight number (shown on result cards and in /fights)"
+)
+async def removefight(
+    interaction: discord.Interaction,
+    fighter: discord.Member = None,
+    opponent: discord.Member = None,
+    opponent_left: str = None,
+    fight_id: int = None
+):
+
+    if not is_staff(interaction):
+
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can remove fights.",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    guild_id = interaction.guild.id
+
+    if fight_id is not None:
+
+        fight = get_fight(guild_id, fight_id)
+
+        if not fight:
+            await interaction.followup.send(
+                f"❌ There is no fight #{fight_id}. Use `/fights` to find the right number.",
+                ephemeral=True
+            )
+            return
+
+    elif fighter:
+
+        history = list(reversed(get_fighter_fights(guild_id, fighter.id)))
+
+        if opponent or opponent_left:
+            try:
+                opp_id, opp_name, _ = await pick_fighter(
+                    interaction.guild, opponent, opponent_left, "opponent"
+                )
+            except FighterInputError as error:
+                await interaction.followup.send(f"❌ {error}", ephemeral=True)
+                return
+
+            history = [
+                fight for fight in history
+                if fight_involves(fight, opp_id, opp_name)
+            ]
+
+            if not history:
+                await interaction.followup.send(
+                    f"❌ No fights found between **{name_without_record(fighter.display_name)}** "
+                    f"and **{name_without_record(opp_name)}**.",
+                    ephemeral=True
+                )
+                return
+
+        if not history:
+            await interaction.followup.send(
+                f"❌ **{name_without_record(fighter.display_name)}** has no logged fights.",
+                ephemeral=True
+            )
+            return
+
+        fight = history[0]
+
+    else:
+
+        await interaction.followup.send(
+            "❌ Pick a **fighter** (and optionally their **opponent**), or give a **fight_id**.",
+            ephemeral=True
+        )
+
+        return
+
+    lines = [
+        fight_summary(fight),
+        "",
+        "**Records after removing it:**",
+    ]
+
+    for side in ("winner", "loser"):
+        before, after = record_after_removing(guild_id, fight, side)
+        lines.append(
+            f"• **{name_without_record(fight[f'{side}_name'])}**: {before} → **{after}**"
+        )
+
+    lines += ["", "This can't be undone."]
+
+    embed = discord.Embed(
+        title="Remove this fight?",
+        description="\n".join(lines),
+        color=PFO_GOLD
+    )
+
+    apply_branding(
+        embed,
+        author_text="PFO • REMOVE FIGHT"
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        view=RemoveFightView(
+            interaction.user.id,
+            guild_id,
+            fight
         ),
         ephemeral=True
     )
