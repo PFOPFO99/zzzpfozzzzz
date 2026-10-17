@@ -3952,6 +3952,44 @@ def seed_record_from_nickname(
     return True
 
 
+def planned_nickname(
+    guild_id: int,
+    member,
+    save: bool = False
+):
+    """
+    The nickname this fighter should have, or None if it's already
+    right. save=False only works it out (used by the /syncnicknames
+    preview) without remembering anything.
+    """
+
+    record = stats_record(get_fighter_stats(guild_id, member.id))
+
+    # Remember the full name, so a long name cut short to fit
+    # Discord's 32-character limit doesn't get shorter every time.
+    current_base = name_without_record(member.display_name)
+    key = f"nickname_base:{guild_id}:{member.id}"
+    full_name = get_meta(key)
+
+    was_cut_short = (
+        full_name
+        and len(member.display_name) >= NICKNAME_LIMIT - 1
+        and full_name.startswith(current_base.rstrip(" /-|,"))
+    )
+
+    if not was_cut_short:
+        full_name = current_base
+        if save:
+            set_meta(key, full_name)
+
+    new_nick = nickname_with_record(member.display_name, record, full_name)
+
+    if new_nick == member.display_name:
+        return None
+
+    return new_nick
+
+
 async def sync_nickname(
     guild: discord.Guild,
     user_id,
@@ -3976,27 +4014,9 @@ async def sync_nickname(
     if not force and not has_record_data(guild.id, user_id):
         return None, None
 
-    record = stats_record(get_fighter_stats(guild.id, user_id))
+    new_nick = planned_nickname(guild.id, member, save=True)
 
-    # Remember the full name, so a long name cut short to fit
-    # Discord's 32-character limit doesn't get shorter every time.
-    current_base = name_without_record(member.display_name)
-    key = f"nickname_base:{guild.id}:{user_id}"
-    full_name = get_meta(key)
-
-    was_cut_short = (
-        full_name
-        and len(member.display_name) >= NICKNAME_LIMIT - 1
-        and full_name.startswith(current_base.rstrip(" /-|,"))
-    )
-
-    if not was_cut_short:
-        full_name = current_base
-        set_meta(key, full_name)
-
-    new_nick = nickname_with_record(member.display_name, record, full_name)
-
-    if new_nick == member.display_name:
+    if not new_nick:
         return None, None
 
     if member.id == guild.owner_id:
@@ -5470,6 +5490,275 @@ async def removefight(
         ),
         ephemeral=True
     )
+
+
+# ------------------------------------------------------------
+# /SYNCNICKNAMES
+#
+# Updates every fighter's nickname to match their record in one go.
+# Shows a preview first; nothing changes until you press confirm.
+# Fighters the bot has no record for are left alone.
+# ------------------------------------------------------------
+
+NICKNAME_SYNC_DELAY = 0.75  # seconds between changes, gentle on Discord
+
+
+def nickname_sync_plan(
+    guild: discord.Guild
+):
+    """
+    Returns (changes, owner_change, no_record_count):
+      changes        [(member, new_nick)] to apply
+      owner_change   (member, new_nick) or None; Discord won't allow it
+      no_record      fighters the bot has no record for (left alone)
+    """
+
+    changes = []
+    owner_change = None
+    no_record = 0
+
+    for member in guild.members:
+
+        if member.bot:
+            continue
+
+        is_fighter = has_any_role(member, FIGHTER_ROLE_NAMES)
+
+        if not has_record_data(guild.id, member.id):
+            # Their nickname record (if any) becomes their starting
+            # record when they're next in a command, so nothing to do.
+            if is_fighter and not record_from_name(member.display_name):
+                no_record += 1
+            continue
+
+        new_nick = planned_nickname(guild.id, member)
+
+        if not new_nick:
+            continue
+
+        if member.id == guild.owner_id:
+            owner_change = (member, new_nick)
+        else:
+            changes.append((member, new_nick))
+
+    changes.sort(key=lambda change: change[0].display_name.casefold())
+
+    return changes, owner_change, no_record
+
+
+class SyncNicknamesView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        author_id: int,
+        guild: discord.Guild,
+        changes: list
+    ):
+
+        super().__init__(
+            timeout=600
+        )
+
+        self.author_id = author_id
+        self.guild = guild
+        self.changes = changes
+
+        confirm = discord.ui.Button(
+            label=f"Update {len(changes)} nickname{'s' if len(changes) != 1 else ''}",
+            style=discord.ButtonStyle.green,
+            emoji="✏️",
+            disabled=not changes
+        )
+        confirm.callback = self.confirm
+
+        cancel = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.grey
+        )
+        cancel.callback = self.cancel
+
+        self.add_item(confirm)
+        self.add_item(cancel)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        if interaction.user.id != self.author_id:
+
+            await interaction.response.send_message(
+                "❌ Only the person who started this can confirm it.",
+                ephemeral=True
+            )
+
+            return False
+
+        return True
+
+    async def cancel(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        await interaction.response.edit_message(
+            content="Cancelled. No nicknames were changed.",
+            embed=None,
+            view=None
+        )
+
+    async def confirm(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        total = len(self.changes)
+
+        await interaction.response.edit_message(
+            content=f"✏️ Updating {total} nicknames… this takes about "
+                    f"{max(1, round(total * NICKNAME_SYNC_DELAY))} seconds.",
+            embed=None,
+            view=None
+        )
+
+        changed = 0
+        problems = []
+
+        for index, (member, _) in enumerate(self.changes):
+
+            if index:
+                await asyncio.sleep(NICKNAME_SYNC_DELAY)
+
+            problem, new_nick = await sync_nickname(
+                self.guild,
+                member.id
+            )
+
+            if new_nick:
+                changed += 1
+            elif problem:
+                problems.append(problem)
+
+                # Missing permission affects everyone; stop early.
+                if "Manage Nicknames" in problem:
+                    problems.append("Stopped early, so fix the permission and run it again.")
+                    break
+
+            if index and index % 10 == 0:
+                try:
+                    await interaction.edit_original_response(
+                        content=f"✏️ Updating nicknames… {index}/{total} done."
+                    )
+                except Exception:
+                    pass
+
+        text = f"✅ **Updated {changed} of {total} nicknames.**"
+
+        await interaction.edit_original_response(
+            content=(text + nickname_problem_text(problems))[:2000]
+        )
+
+
+@bot.tree.command(
+    name="syncnicknames",
+    description="Update every fighter's nickname to match their record (preview first)."
+)
+async def syncnicknames(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can sync nicknames.",
+            ephemeral=True
+        )
+
+        return
+
+    if not NICKNAME_RECORDS:
+
+        await interaction.response.send_message(
+            "❌ Nickname records are turned off (NICKNAME_RECORDS=off in Railway).",
+            ephemeral=True
+        )
+
+        return
+
+    await interaction.response.defer(
+        ephemeral=True
+    )
+
+    changes, owner_change, no_record = nickname_sync_plan(
+        interaction.guild
+    )
+
+    lines = []
+
+    if changes:
+        lines.append(f"**{len(changes)} nickname{'s' if len(changes) != 1 else ''} will change:**")
+        for member, new_nick in changes[:40]:
+            lines.append(f"• {member.display_name} → **{new_nick}**")
+        if len(changes) > 40:
+            lines.append(f"• …and {len(changes) - 40} more")
+    else:
+        lines.append("✅ **Every nickname already matches its record.** Nothing to change.")
+
+    if owner_change:
+        member, new_nick = owner_change
+        lines += [
+            "",
+            f"👑 **{member.display_name}** is the server owner. Discord doesn't let "
+            f"bots change the owner's nickname, so change it yourself to **{new_nick}**.",
+        ]
+
+    if no_record:
+        lines += [
+            "",
+            f"ℹ️ {no_record} fighter{'s have' if no_record != 1 else ' has'} no record in the "
+            "bot or their nickname, so they're left alone.",
+        ]
+
+    if changes:
+        lines += ["", "Nothing changes until you press **Update**."]
+
+    embed = discord.Embed(
+        title="Sync nicknames with records?",
+        description="\n".join(lines)[:4000],
+        color=PFO_GOLD
+    )
+
+    apply_branding(
+        embed,
+        author_text="PFO • SYNC NICKNAMES"
+    )
+
+    embed.set_footer(
+        text="Records come from the bot (the same as /profile)",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    if changes:
+        await interaction.followup.send(
+            embed=embed,
+            view=SyncNicknamesView(
+                interaction.user.id,
+                interaction.guild,
+                changes
+            ),
+            ephemeral=True
+        )
+    else:
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True
+        )
 
 
 # ------------------------------------------------------------
