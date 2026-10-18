@@ -3,6 +3,7 @@ import csv
 import difflib
 import hashlib
 import io
+import json
 import os
 import re
 import sqlite3
@@ -367,6 +368,8 @@ def setup_database():
     setup_vote_tables()
     setup_discipline_tables()
     setup_fighter_list_tables()
+    setup_recap_tables()
+    setup_card_draft_tables()
 
 
 # ============================================================
@@ -3818,6 +3821,12 @@ async def create_profile_embed(
             f"win{'s' if stats['title_wins'] != 1 else ''}"
         )
 
+    # Title reigns (from title fights)
+    try:
+        description += title_summary_for_member(guild.id, member.id, member.display_name)
+    except Exception as error:
+        print(f"Profile title lookup failed: {error}")
+
     # Suspension / warnings
     if member.id:
         try:
@@ -6353,42 +6362,142 @@ async def send_card_text(
     if current.strip():
         chunks.append(current)
 
-    first = True
+    if not chunks:
+        chunks = ["(The card is empty.)"]
 
-    for chunk in chunks:
-        if first:
+    for index, chunk in enumerate(chunks):
+        if index == 0 and not interaction.response.is_done():
             await interaction.response.send_message(chunk, ephemeral=True)
-            first = False
         else:
             await interaction.followup.send(chunk, ephemeral=True)
+
+
+async def send_card_text_safely(
+    interaction: discord.Interaction,
+    make_text
+):
+    """Copy as text, but if anything goes wrong say so instead of failing silently."""
+
+    try:
+        text = make_text()
+    except Exception as error:
+        print(f"Copy as text failed: {error!r}")
+        await interaction.response.send_message(
+            f"❌ Couldn't make the text ({type(error).__name__}). Please tell whoever runs the bot.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        await send_card_text(interaction, text)
+    except Exception as error:
+        print(f"Copy as text send failed: {error!r}")
+
+
+def saved_card_bouts(
+    card_id: int
+):
+
+    return [
+        (bout["fighter_a"], bout["fighter_b"], bout["weight"])
+        for bout in get_fight_card_bouts(card_id)
+    ]
 
 
 class CopyCardView(
     discord.ui.View
 ):
-    """Just the copy button (after saving, and on /viewcard)."""
+    """
+    The copy button under a saved card (after saving, and on /viewcard).
+    It keeps working after the bot restarts.
+    """
 
     def __init__(
         self,
-        guild: discord.Guild,
-        event: str,
-        bouts: list
+        card_id: int
     ):
 
         super().__init__(
-            timeout=900
+            timeout=None
         )
 
-        self.guild = guild
-        self.event = event
-        self.bouts = bouts
+        self.card_id = card_id
 
-        copy = discord.ui.Button(label="Copy as text", emoji="📋", style=discord.ButtonStyle.blurple)
+        copy = discord.ui.Button(
+            label="Copy as text",
+            emoji="📋",
+            style=discord.ButtonStyle.blurple,
+            custom_id=f"pfo_copycard_{card_id}"
+        )
         copy.callback = self.copy
         self.add_item(copy)
 
     async def copy(self, interaction):
-        await send_card_text(interaction, card_as_text(self.guild, self.event, self.bouts))
+
+        rows = discipline_query("SELECT * FROM fight_cards WHERE id = ?", (self.card_id,))
+
+        if not rows:
+            await interaction.response.send_message("❌ That card no longer exists.", ephemeral=True)
+            return
+
+        await send_card_text_safely(
+            interaction,
+            lambda: card_as_text(interaction.guild, rows[0]["event"], saved_card_bouts(self.card_id))
+        )
+
+
+def restore_copy_buttons():
+
+    try:
+        for row in discipline_query("SELECT id FROM fight_cards ORDER BY id DESC LIMIT 50"):
+            bot.add_view(CopyCardView(row["id"]))
+    except Exception as error:
+        print(f"Could not restore copy buttons: {error}")
+
+
+# ------------------------------------------------------------
+# Builder drafts: the panel is saved as you go, so it keeps
+# working after the bot restarts (kept for 3 days).
+# ------------------------------------------------------------
+
+DRAFT_DAYS = 3
+
+
+def setup_card_draft_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS card_drafts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            signup_ids TEXT NOT NULL,
+            signup_type TEXT,
+            shared INTEGER NOT NULL DEFAULT 1,
+            bouts TEXT NOT NULL DEFAULT '[]',
+            page INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def create_card_draft(
+    guild_id: int,
+    author_id: int,
+    event: str,
+    signup_ids: list,
+    signup_type: str,
+    shared: bool
+):
+
+    return discipline_query("""
+        INSERT INTO card_drafts (guild_id, author_id, event, signup_ids, signup_type, shared, bouts, page, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, '[]', 0, ?)
+    """, (guild_id, author_id, event, json.dumps(signup_ids), signup_type, 1 if shared else 0, int(time.time())),
+        write=True)
 
 
 # ------------------------------------------------------------
@@ -6417,14 +6526,16 @@ class CardBuilderView(
         event: str,
         signup_ids: list,
         signup_type: str = None,
-        shared: bool = True
+        shared: bool = True,
+        draft_id: int = None
     ):
 
         super().__init__(
-            timeout=3600
+            timeout=None
         )
 
         self.shared = shared
+        self.draft_id = draft_id
 
         self.author_id = author_id
         self.guild = guild
@@ -6437,6 +6548,32 @@ class CardBuilderView(
         self.rebuild()
 
     # -------- state --------
+
+    def cid(self, name: str):
+        """Button ids unique to this panel, so it can be restored after a restart."""
+        return f"pfo_cb_{self.draft_id}_{name}" if self.draft_id else None
+
+    def save_draft(self):
+
+        if not self.draft_id:
+            return
+
+        try:
+            discipline_query(
+                "UPDATE card_drafts SET bouts = ?, page = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(self.bouts), self.page, int(time.time()), self.draft_id),
+                write=True
+            )
+        except Exception as error:
+            print(f"Could not save card draft: {error}")
+
+    def delete_draft(self):
+
+        if self.draft_id:
+            try:
+                discipline_query("DELETE FROM card_drafts WHERE id = ?", (self.draft_id,), write=True)
+            except Exception as error:
+                print(f"Could not delete card draft: {error}")
 
     @property
     def pairs(self):
@@ -6536,7 +6673,8 @@ class CardBuilderView(
                     discord.SelectOption(label=self.label(user_id), value=str(user_id))
                     for user_id in page_ids
                 ],
-                row=0
+                row=0,
+                custom_id=self.cid("signups")
             )
             signup_select.callback = self.pick_from_signups
             self.add_item(signup_select)
@@ -6548,7 +6686,8 @@ class CardBuilderView(
                 ),
                 options=[discord.SelectOption(label="-", value="0")],
                 disabled=True,
-                row=0
+                row=0,
+                custom_id=self.cid("signups_off")
             ))
 
         # Row 1: anyone in the server (people who didn't sign up)
@@ -6556,7 +6695,8 @@ class CardBuilderView(
             placeholder="Or pick any 2 members (search by typing)",
             min_values=2,
             max_values=2,
-            row=1
+            row=1,
+            custom_id=self.cid("anyone")
         )
         anyone.callback = self.pick_anyone
         self.add_item(anyone)
@@ -6571,7 +6711,8 @@ class CardBuilderView(
                     discord.SelectOption(label=weight, value=weight, default=(weight == current))
                     for weight in DIVISION_NAMES
                 ] + [discord.SelectOption(label="No weight class", value=NO_WEIGHT, default=current is None)],
-                row=2
+                row=2,
+                custom_id=self.cid("weight")
             )
             weight_select.callback = self.pick_weight
             self.add_item(weight_select)
@@ -6580,36 +6721,39 @@ class CardBuilderView(
                 placeholder="Weight class (add a fight first)",
                 options=[discord.SelectOption(label="-", value="0")],
                 disabled=True,
-                row=2
+                row=2,
+                custom_id=self.cid("weight_off")
             ))
 
         # Row 3: paging, undo, copy
         previous = discord.ui.Button(label="◀ Page", style=discord.ButtonStyle.grey,
-                                     disabled=self.page == 0, row=3)
+                                     disabled=self.page == 0, row=3, custom_id=self.cid("prev"))
         previous.callback = self.previous_page
         following = discord.ui.Button(label="Page ▶", style=discord.ButtonStyle.grey,
-                                      disabled=self.page >= pages - 1, row=3)
+                                      disabled=self.page >= pages - 1, row=3, custom_id=self.cid("next"))
         following.callback = self.next_page
         undo = discord.ui.Button(label="Undo last fight", emoji="↩️", style=discord.ButtonStyle.grey,
-                                 disabled=not self.bouts, row=3)
+                                 disabled=not self.bouts, row=3, custom_id=self.cid("undo"))
         undo.callback = self.undo
         copy = discord.ui.Button(label="Copy as text", emoji="📋", style=discord.ButtonStyle.blurple,
-                                 disabled=not self.bouts, row=3)
+                                 disabled=not self.bouts, row=3, custom_id=self.cid("copy"))
         copy.callback = self.copy
         for item in (previous, following, undo, copy):
             self.add_item(item)
 
         # Row 4: finish
         save = discord.ui.Button(label="Save card", emoji="💾", style=discord.ButtonStyle.green,
-                                 disabled=not self.bouts, row=4)
+                                 disabled=not self.bouts, row=4, custom_id=self.cid("save"))
         save.callback = self.save
-        cancel = discord.ui.Button(label="Close", style=discord.ButtonStyle.grey, row=4)
+        cancel = discord.ui.Button(label="Close", style=discord.ButtonStyle.grey, row=4,
+                                   custom_id=self.cid("close"))
         cancel.callback = self.cancel
         self.add_item(save)
         self.add_item(cancel)
 
     async def redraw(self, interaction, note: str = None):
         self.rebuild()
+        self.save_draft()
 
         # With several staff on the same panel, say who did what.
         if note and self.shared:
@@ -6703,10 +6847,14 @@ class CardBuilderView(
             await self.redraw(interaction)
 
     async def copy(self, interaction):
-        await send_card_text(interaction, card_as_text(self.guild, self.event, self.bouts))
+        await send_card_text_safely(
+            interaction,
+            lambda: card_as_text(self.guild, self.event, [tuple(bout) for bout in self.bouts])
+        )
 
     async def cancel(self, interaction):
         self.stop()
+        self.delete_draft()
         await interaction.response.edit_message(
             content=f"Closed by {interaction.user.display_name}. Nothing was saved.",
             embed=None,
@@ -6716,8 +6864,9 @@ class CardBuilderView(
     async def save(self, interaction):
 
         self.stop()
+        self.delete_draft()
 
-        save_fight_card(
+        card_id = save_fight_card(
             self.guild.id,
             self.event,
             interaction.user.id,
@@ -6730,7 +6879,7 @@ class CardBuilderView(
                 "See it again any time with `/viewcard`."
             ),
             embed=self.embed(),
-            view=CopyCardView(self.guild, self.event, [tuple(bout) for bout in self.bouts])
+            view=CopyCardView(card_id)
         )
 
 
@@ -6795,13 +6944,22 @@ async def createfights(
 
     shared = not private or private.value != "yes"
 
+    try:
+        draft_id = create_card_draft(
+            interaction.guild.id, interaction.user.id, event, signup_ids, signup_type, shared
+        )
+    except Exception as error:
+        print(f"Could not create card draft: {error}")
+        draft_id = None
+
     builder = CardBuilderView(
         interaction.user.id,
         interaction.guild,
         event,
         signup_ids,
         signup_type,
-        shared
+        shared,
+        draft_id
     )
 
     # Shortcut: typed @mentions fill the fights straight away.
@@ -6818,6 +6976,7 @@ async def createfights(
 
         builder.pairs = [(a, b) for a, b in pairs if a != b]
         builder.rebuild()
+        builder.save_draft()
 
         await interaction.response.send_message(
             content="Check the pairings and weight classes, then press **Save card** or **Copy as text**.",
@@ -6911,7 +7070,7 @@ async def viewcard(
 
     await interaction.response.send_message(
         embed=embed,
-        view=CopyCardView(interaction.guild, card["event"], bouts),
+        view=CopyCardView(card["id"]),
         ephemeral=True
     )
 
@@ -11605,7 +11764,7 @@ STARTING_FIGHTER_LIST = {
     ],
 }
 
-WEIGHT_CHOICES = [
+LIST_WEIGHT_CHOICES = [
     app_commands.Choice(name=weight, value=weight)
     for weight in LIST_WEIGHTS
 ]
@@ -11845,7 +12004,7 @@ async def listpaste(
     weight="Weight class to list them under"
 )
 @app_commands.choices(
-    weight=WEIGHT_CHOICES
+    weight=LIST_WEIGHT_CHOICES
 )
 async def addfighter(
     interaction: discord.Interaction,
@@ -11919,7 +12078,7 @@ async def listed_fighter_autocomplete(
     weight="Only needed if the same name is listed in two weight classes"
 )
 @app_commands.choices(
-    weight=WEIGHT_CHOICES
+    weight=LIST_WEIGHT_CHOICES
 )
 @app_commands.autocomplete(
     name=listed_fighter_autocomplete
@@ -11986,6 +12145,1011 @@ async def removefighter(
 
 
 
+# ============================================================
+# TITLE HISTORY AND EVENT RECAPS
+#
+# /titlehistory  champions of each division, worked out from fights
+#                logged with title_fight: True
+# /recap         a results recap for an event. Opens an editor first
+#                so you can put fights in Main Event / Co-Main /
+#                Main Card / Prelims / Early Prelims (or leave them
+#                out), add notes, then post it.
+# ============================================================
+
+RECAP_BANNER = "recap.gif"
+TITLE_HISTORY_BANNER = "title_history.gif"
+
+RECAP_SECTIONS = ["Main Event", "Co-Main Event", "Main Card", "Prelims", "Early Prelims"]
+RECAP_HIDDEN = "Hidden"
+RECAP_SECTION_ICONS = {
+    "Main Event": "🏆",
+    "Co-Main Event": "⭐",
+    "Main Card": "🥊",
+    "Prelims": "🔸",
+    "Early Prelims": "▫️",
+    RECAP_HIDDEN: "🚫",
+}
+
+
+def setup_recap_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS recap_layouts (
+            guild_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            fight_id INTEGER NOT NULL,
+            section TEXT NOT NULL,
+            position INTEGER NOT NULL,
+
+            PRIMARY KEY(guild_id, event_key, fight_id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS recap_details (
+            guild_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            title TEXT,
+            notes TEXT,
+
+            PRIMARY KEY(guild_id, event_key)
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def short_day(
+    text: str
+):
+
+    try:
+        day = datetime.fromisoformat((text or "")[:10]).date()
+        return f"{day.day} {day:%b %y}"
+    except Exception:
+        return "?"
+
+
+def fight_day(
+    fight
+):
+
+    return fight["fight_date"] or (fight["created_at"] or "")[:10]
+
+
+def fighter_key(
+    user_id,
+    name: str
+):
+
+    return f"id:{user_id}" if user_id else f"name:{normalise_name(name or '')}"
+
+
+def fight_display_name(
+    guild: discord.Guild,
+    user_id,
+    stored_name: str
+):
+    """Their name as it is now (without the record), or the saved name."""
+
+    member = guild.get_member(user_id) if (guild and user_id) else None
+
+    return name_without_record(member.display_name if member else (stored_name or "Unknown"))
+
+
+# ------------------------------------------------------------
+# Title history
+# ------------------------------------------------------------
+
+def title_lineage(
+    guild_id: int,
+    division: str
+):
+    """
+    Reigns oldest first, plus what each title fight meant.
+
+    reigns:   [{key, user_id, name, won_fight, start, end, end_fight, defences}]
+    outcomes: {fight_id: "new" | "defence" | "first" | "draw"}
+    """
+
+    fights = discipline_query("""
+        SELECT * FROM fights
+        WHERE guild_id = ? AND title_fight = 1 AND division = ?
+        ORDER BY COALESCE(fight_date, substr(created_at, 1, 10)) ASC, id ASC
+    """, (guild_id, division))
+
+    reigns = []
+    outcomes = {}
+    current = None
+
+    for fight in fights:
+
+        if fight["method"] in ("DRAW", "NC"):
+            outcomes[fight["id"]] = "draw"
+            continue
+
+        winner = fighter_key(fight["winner_id"], fight["winner_name"])
+
+        if current and current["key"] == winner:
+            current["defences"] += 1
+            outcomes[fight["id"]] = "defence"
+            continue
+
+        if current:
+            current["end"] = fight_day(fight)
+            current["end_fight"] = fight
+
+        outcomes[fight["id"]] = "new" if current else "first"
+
+        current = {
+            "key": winner,
+            "user_id": fight["winner_id"],
+            "name": fight["winner_name"],
+            "won_fight": fight,
+            "start": fight_day(fight),
+            "end": None,
+            "end_fight": None,
+            "defences": 0,
+        }
+
+        reigns.append(current)
+
+    return reigns, outcomes
+
+
+def all_title_outcomes(
+    guild_id: int
+):
+
+    outcomes = {}
+
+    for division in DIVISION_NAMES:
+        outcomes.update(title_lineage(guild_id, division)[1])
+
+    return outcomes
+
+
+def reign_days(
+    reign
+):
+
+    try:
+        start = datetime.fromisoformat(reign["start"]).date()
+        end = datetime.fromisoformat(reign["end"]).date() if reign["end"] else datetime.now(timezone.utc).date()
+        return (end - start).days
+    except Exception:
+        return None
+
+
+def plural(
+    count: int,
+    word: str
+):
+
+    if count == 1:
+        return f"{count} {word}"
+
+    return f"{count} {word}{'es' if word.endswith(('sh', 'ch', 's', 'x')) else 's'}"
+
+
+def title_summary_for_member(
+    guild_id: int,
+    user_id: int,
+    name: str = None
+):
+    """Lines for /profile, e.g. 'Lightweight: 2× champion, 5 title defences'."""
+
+    key = fighter_key(user_id, name)
+    lines = []
+
+    for division in DIVISION_NAMES:
+
+        reigns = [reign for reign in title_lineage(guild_id, division)[0] if reign["key"] == key]
+
+        if not reigns:
+            continue
+
+        defences = sum(reign["defences"] for reign in reigns)
+        times = f"{len(reigns)}× champion" if len(reigns) > 1 else "champion"
+        status = "" if reigns[-1]["end"] is None else " (former)"
+
+        lines.append(f"🏅 {division} {times}{status} · {plural(defences, 'defence')}")
+
+    return lines
+
+
+@bot.tree.command(
+    name="titlehistory",
+    description="Champions of each division, from title fights logged with /result."
+)
+@app_commands.describe(
+    division="Pick a division for its full list of champions (empty = every division)"
+)
+@app_commands.choices(
+    division=DIVISION_CHOICES
+)
+async def titlehistory(
+    interaction: discord.Interaction,
+    division: app_commands.Choice[str] = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can post title history.",
+            ephemeral=True
+        )
+        return
+
+    guild = interaction.guild
+
+    embed = discord.Embed(
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    if division:
+
+        reigns, _ = title_lineage(guild.id, division.value)
+        embed.title = f"👑 {division.value} Title History"
+
+        if not reigns:
+            embed.description = (
+                f"No {division.value} title fights have been logged yet.\n"
+                "Log them with `/result` and **title_fight: True**."
+            )
+        else:
+            lines = []
+
+            for number, reign in enumerate(reigns, start=1):
+
+                name = fight_display_name(guild, reign["user_id"], reign["name"])
+                fight = reign["won_fight"]
+                beat = fight_display_name(guild, fight["loser_id"], fight["loser_name"])
+                days = reign_days(reign)
+                length = f" · {plural(days, 'day')}" if days is not None else ""
+
+                if reign["end"] is None:
+                    lines.append(f"👑 **{name}** · *current champion*")
+                else:
+                    lines.append(f"`{number:>2}.` **{name}**")
+
+                lines.append(
+                    f"└ Won {short_day(reign['start'])} vs {beat} ({fight_method_text(fight)})"
+                    f" · {plural(reign['defences'], 'defence')}{length}"
+                )
+
+            embed.description = "\n".join(lines)[:4000]
+
+            current = reigns[-1]
+            ranked = [
+                row for row in get_division_rankings(guild.id, division.value)
+                if row["rank"] == 0
+            ]
+
+            if ranked and ranked[0]["discord_user_id"] != current["user_id"]:
+                embed.add_field(
+                    name="ℹ️ Rankings don't match",
+                    value=(
+                        f"The rankings list <@{ranked[0]['discord_user_id']}> as champion. "
+                        "Log their title fight with `/result` (title_fight: True) to add it here."
+                    ),
+                    inline=False
+                )
+
+    else:
+
+        embed.title = "👑 Title History"
+        any_found = False
+
+        for weight in DIVISION_NAMES:
+
+            reigns, _ = title_lineage(guild.id, weight)
+
+            if not reigns:
+                continue
+
+            any_found = True
+            current = reigns[-1]
+            name = fight_display_name(guild, current["user_id"], current["name"])
+
+            embed.add_field(
+                name=f"{weight}",
+                value=(
+                    f"👑 **{name}** · {plural(current['defences'], 'defence')} · "
+                    f"since {short_day(current['start'])}\n"
+                    f"└ {plural(len(reigns), 'champion')} in total"
+                ),
+                inline=False
+            )
+
+        embed.description = (
+            "Current champions and how many there have been. "
+            "Pick a **division** for its full list."
+            if any_found else
+            "No title fights have been logged yet. Log them with `/result` and **title_fight: True**."
+        )
+
+    apply_branding(
+        embed,
+        banner_file=TITLE_HISTORY_BANNER,
+        author_text="PFO • TITLE HISTORY"
+    )
+
+    embed.set_footer(
+        text="From fights logged with title_fight: True • a draw or no contest keeps the champion",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    await interaction.response.send_message(embed=embed)
+
+
+# ------------------------------------------------------------
+# Event recaps
+# ------------------------------------------------------------
+
+def event_key(
+    event: str
+):
+
+    return " ".join((event or "").split()).casefold()
+
+
+def event_fights(
+    guild_id: int,
+    event: str
+):
+    """Fights logged under this event name (any capitals/spacing), in the order they happened."""
+
+    key = event_key(event)
+
+    return [
+        fight for fight in discipline_query("""
+            SELECT * FROM fights WHERE guild_id = ? AND event IS NOT NULL
+            ORDER BY COALESCE(fight_date, substr(created_at, 1, 10)) ASC, id ASC
+        """, (guild_id,))
+        if event_key(fight["event"]) == key
+    ]
+
+
+def recent_events(
+    guild_id: int
+):
+    """Event names, most recent first."""
+
+    seen = {}
+
+    for row in discipline_query("""
+        SELECT event, MAX(id) AS last FROM fights
+        WHERE guild_id = ? AND event IS NOT NULL AND TRIM(event) != ''
+        GROUP BY event ORDER BY last DESC
+    """, (guild_id,)):
+        seen.setdefault(event_key(row["event"]), (row["last"], row["event"]))
+
+    return [name for _, name in sorted(seen.values(), reverse=True)]
+
+
+def default_recap_layout(
+    fights: list
+):
+    """Last fight = Main Event, then Co-Main, next 3 Main Card, the rest Prelims."""
+
+    layout = {}
+    newest_first = list(reversed(fights))
+
+    for index, fight in enumerate(newest_first):
+
+        if index == 0:
+            section = "Main Event"
+        elif index == 1:
+            section = "Co-Main Event"
+        elif index <= 4:
+            section = "Main Card"
+        else:
+            section = "Prelims"
+
+        layout[fight["id"]] = [section, index]
+
+    return layout
+
+
+def load_recap_layout(
+    guild_id: int,
+    event: str,
+    fights: list
+):
+
+    saved = {
+        row["fight_id"]: [row["section"], row["position"]]
+        for row in discipline_query(
+            "SELECT * FROM recap_layouts WHERE guild_id = ? AND event_key = ?",
+            (guild_id, event_key(event))
+        )
+    }
+
+    layout = default_recap_layout(fights)
+
+    # Saved spots win; fights logged since get the default spot at the end.
+    for fight_id in layout:
+        if fight_id in saved:
+            layout[fight_id] = saved[fight_id]
+        elif saved:
+            layout[fight_id] = [layout[fight_id][0], 10_000 + layout[fight_id][1]]
+
+    details = discipline_query(
+        "SELECT * FROM recap_details WHERE guild_id = ? AND event_key = ?",
+        (guild_id, event_key(event))
+    )
+
+    title = details[0]["title"] if details and details[0]["title"] else None
+    notes = details[0]["notes"] if details else None
+
+    return layout, title, notes
+
+
+def save_recap(
+    guild_id: int,
+    event: str,
+    layout: dict,
+    title: str,
+    notes: str
+):
+
+    key = event_key(event)
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("DELETE FROM recap_layouts WHERE guild_id = ? AND event_key = ?", (guild_id, key))
+    cursor.executemany("""
+        INSERT INTO recap_layouts (guild_id, event_key, fight_id, section, position)
+        VALUES (?, ?, ?, ?, ?)
+    """, [(guild_id, key, fight_id, section, position) for fight_id, (section, position) in layout.items()])
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO recap_details (guild_id, event_key, title, notes)
+        VALUES (?, ?, ?, ?)
+    """, (guild_id, key, title, notes))
+
+    db.commit()
+    db.close()
+
+
+def recap_fight_line(
+    guild: discord.Guild,
+    fight,
+    outcome: str = None
+):
+
+    winner = fight_display_name(guild, fight["winner_id"], fight["winner_name"])
+    loser = fight_display_name(guild, fight["loser_id"], fight["loser_name"])
+    method = fight["method"]
+    belt = "👑 " if fight["title_fight"] else ""
+    weight = f" · {fight['division']}" if fight["division"] else ""
+
+    if method == "DRAW":
+        line = f"{belt}**{winner}** vs **{loser}** · Draw{weight}"
+    elif method == "NC":
+        line = f"{belt}**{winner}** vs **{loser}** · No Contest{weight}"
+    else:
+        line = f"{belt}**{winner}** def. **{loser}** · {fight_method_text(fight)}{weight}"
+
+    division = fight["division"] or "the"
+
+    if outcome == "new":
+        line += f"\n└ 🆕 **New {division} Champion**"
+    elif outcome == "first":
+        line += f"\n└ 🆕 **Inaugural {division} Champion**"
+    elif outcome == "defence":
+        line += f"\n└ 🛡️ Retains the {division} title"
+    elif outcome == "draw":
+        line += "\n└ 🛡️ The champion keeps the belt"
+
+    return line
+
+
+def ordered_sections(
+    layout: dict
+):
+    """{section: [fight_id, ...]} in card order."""
+
+    grouped = {section: [] for section in RECAP_SECTIONS + [RECAP_HIDDEN]}
+
+    for fight_id, (section, position) in sorted(layout.items(), key=lambda item: item[1][1]):
+        grouped.setdefault(section, []).append(fight_id)
+
+    return grouped
+
+
+def recap_embed(
+    guild: discord.Guild,
+    event: str,
+    fights: list,
+    layout: dict,
+    title: str = None,
+    notes: str = None
+):
+    """The recap as it's posted."""
+
+    by_id = {fight["id"]: fight for fight in fights}
+    outcomes = all_title_outcomes(guild.id)
+    grouped = ordered_sections(layout)
+    shown = [fight_id for section in RECAP_SECTIONS for fight_id in grouped[section]]
+
+    finishes = sum(1 for fight_id in shown if by_id[fight_id]["method"] in ("KO/TKO", "SUB"))
+    new_champs = sum(1 for fight_id in shown if outcomes.get(fight_id) in ("new", "first"))
+
+    summary = f"**{plural(len(shown), 'fight')}** · **{plural(finishes, 'finish')}**"
+
+    if new_champs:
+        summary += f" · 👑 **{plural(new_champs, 'new champion')}**"
+
+    embed = discord.Embed(
+        title=title or event,
+        description=((notes.strip() + "\n\n") if notes and notes.strip() else "") + summary,
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    size = len(embed.title) + len(embed.description)
+
+    for section in RECAP_SECTIONS:
+
+        lines = [recap_fight_line(guild, by_id[fight_id], outcomes.get(fight_id)) for fight_id in grouped[section]]
+
+        if not lines:
+            continue
+
+        # Fields hold 1024 characters; long sections carry on in another.
+        chunks = [[]]
+
+        for line in lines:
+            if len("\n".join(chunks[-1] + [line])) > 1000:
+                chunks.append([])
+            chunks[-1].append(line)
+
+        for index, chunk in enumerate(chunks):
+
+            name = f"{RECAP_SECTION_ICONS[section]} {section}" + (" (cont.)" if index else "")
+            value = "\n".join(chunk)
+
+            if size + len(name) + len(value) > 5700 or len(embed.fields) >= 25:
+                break
+
+            size += len(name) + len(value)
+            embed.add_field(name=name, value=value, inline=False)
+
+    apply_branding(
+        embed,
+        banner_file=RECAP_BANNER,
+        author_text="PFO • EVENT RECAP"
+    )
+
+    embed.set_footer(
+        text="Official PFO results",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+class RecapTextModal(
+    discord.ui.Modal,
+    title="Recap title & notes"
+):
+
+    recap_title = discord.ui.TextInput(
+        label="Title",
+        placeholder="e.g. PFO Fight Night 16: Van vs Lopes",
+        max_length=200,
+        required=False
+    )
+
+    recap_notes = discord.ui.TextInput(
+        label="Notes (optional, shown under the title)",
+        style=discord.TextStyle.paragraph,
+        placeholder="e.g. Fight of the Night: Van vs Lopes",
+        max_length=1000,
+        required=False
+    )
+
+    def __init__(self, builder):
+        super().__init__()
+        self.builder = builder
+        self.recap_title.default = builder.title or builder.event
+        self.recap_notes.default = builder.notes or ""
+
+    async def on_submit(self, interaction):
+        title = (self.recap_title.value or "").strip()
+        self.builder.title = title if title and title != self.builder.event else None
+        self.builder.notes = (self.recap_notes.value or "").strip() or None
+        self.builder.save()
+        await self.builder.redraw(interaction, "✏️ Title and notes updated.")
+
+
+class RecapBuilderView(
+    discord.ui.View
+):
+    """Arrange an event's fights into card sections, then post the recap."""
+
+    def __init__(
+        self,
+        guild: discord.Guild,
+        event: str,
+        fights: list
+    ):
+
+        super().__init__(
+            timeout=3600
+        )
+
+        self.guild = guild
+        self.event = event
+        self.fights = fights
+        self.by_id = {fight["id"]: fight for fight in fights}
+        self.layout, self.title, self.notes = load_recap_layout(guild.id, event, fights)
+        self.selected = []
+        self.normalise()
+        self.rebuild()
+
+    # -------- state --------
+
+    def normalise(self):
+        """Renumbers positions 0..n in card order."""
+        order = [
+            fight_id
+            for section in RECAP_SECTIONS + [RECAP_HIDDEN]
+            for fight_id in ordered_sections(self.layout)[section]
+        ]
+        for position, fight_id in enumerate(order):
+            self.layout[fight_id][1] = position
+
+    def save(self):
+        save_recap(self.guild.id, self.event, self.layout, self.title, self.notes)
+
+    def short(self, fight_id):
+        fight = self.by_id[fight_id]
+        a = fight_display_name(self.guild, fight["winner_id"], fight["winner_name"])
+        b = fight_display_name(self.guild, fight["loser_id"], fight["loser_name"])
+        return f"{a} vs {b}"
+
+    def number(self, fight_id):
+        return sorted(self.layout, key=lambda f: self.layout[f][1]).index(fight_id) + 1
+
+    # -------- display --------
+
+    def embed(self):
+
+        grouped = ordered_sections(self.layout)
+        lines = []
+
+        for section in RECAP_SECTIONS + [RECAP_HIDDEN]:
+
+            if not grouped[section]:
+                continue
+
+            label = "Left out" if section == RECAP_HIDDEN else section
+            lines.append(f"**{RECAP_SECTION_ICONS[section]} {label}**")
+
+            for fight_id in grouped[section]:
+                tick = "▶️ " if fight_id in self.selected else ""
+                belt = " 👑" if self.by_id[fight_id]["title_fight"] else ""
+                lines.append(f"`{self.number(fight_id):>2}` {tick}{self.short(fight_id)}{belt}")
+
+            lines.append("")
+
+        embed = discord.Embed(
+            title=f"Recap editor: {self.title or self.event}",
+            description="\n".join(lines)[:4000],
+            color=PFO_GOLD
+        )
+
+        if self.notes:
+            embed.add_field(name="Notes", value=self.notes[:1000], inline=False)
+
+        apply_branding(embed, author_text="PFO • EVENT RECAP")
+
+        embed.set_footer(
+            text="1) pick fights  2) choose where they go  3) Post recap • saved as you go",
+            icon_url=asset_url(LOGO_FILE)
+        )
+
+        return embed
+
+    def rebuild(self):
+
+        self.clear_items()
+        order = sorted(self.layout, key=lambda f: self.layout[f][1])
+
+        pick = discord.ui.Select(
+            placeholder=(
+                f"Selected: {', '.join('#' + str(n) for n in sorted(self.number(f) for f in self.selected))}"
+                if self.selected else "1) Pick the fight(s) to move"
+            ),
+            min_values=1,
+            max_values=min(25, len(order)),
+            options=[
+                discord.SelectOption(
+                    label=f"#{self.number(fight_id)} {self.short(fight_id)}"[:100],
+                    description=self.layout[fight_id][0] if self.layout[fight_id][0] != RECAP_HIDDEN else "Left out",
+                    value=str(fight_id),
+                    default=fight_id in self.selected
+                )
+                for fight_id in order[:25]
+            ],
+            row=0
+        )
+        pick.callback = self.pick
+        self.add_item(pick)
+
+        move = discord.ui.Select(
+            placeholder="2) Move them to…",
+            options=[
+                discord.SelectOption(label=section, value=section, emoji=RECAP_SECTION_ICONS[section])
+                for section in RECAP_SECTIONS
+            ] + [discord.SelectOption(label="Leave out of the recap", value=RECAP_HIDDEN, emoji="🚫")],
+            disabled=not self.selected,
+            row=1
+        )
+        move.callback = self.move
+        self.add_item(move)
+
+        up = discord.ui.Button(label="Move up", emoji="⬆️", style=discord.ButtonStyle.grey,
+                               disabled=len(self.selected) != 1, row=2)
+        up.callback = self.move_up
+        down = discord.ui.Button(label="Move down", emoji="⬇️", style=discord.ButtonStyle.grey,
+                                 disabled=len(self.selected) != 1, row=2)
+        down.callback = self.move_down
+        text = discord.ui.Button(label="Title & notes", emoji="✏️", style=discord.ButtonStyle.grey, row=2)
+        text.callback = self.edit_text
+        reset = discord.ui.Button(label="Reset", emoji="🔄", style=discord.ButtonStyle.grey, row=2)
+        reset.callback = self.reset
+        for item in (up, down, text, reset):
+            self.add_item(item)
+
+        preview = discord.ui.Button(label="Preview", emoji="👁️", style=discord.ButtonStyle.blurple, row=3)
+        preview.callback = self.preview
+        post = discord.ui.Button(label="Post recap", emoji="📢", style=discord.ButtonStyle.green, row=3)
+        post.callback = self.post
+        close = discord.ui.Button(label="Close", style=discord.ButtonStyle.grey, row=3)
+        close.callback = self.close
+        for item in (preview, post, close):
+            self.add_item(item)
+
+    async def redraw(self, interaction, note: str = None):
+        self.normalise()
+        self.rebuild()
+        await interaction.response.edit_message(content=note, embed=self.embed(), view=self)
+
+    # -------- actions --------
+
+    async def interaction_check(self, interaction):
+
+        if is_staff(interaction):
+            return True
+
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can edit recaps.",
+            ephemeral=True
+        )
+        return False
+
+    async def pick(self, interaction):
+        values = interaction.data.get("values", [])
+        self.selected = [int(value) for value in values if int(value) in self.layout]
+        await self.redraw(interaction)
+
+    async def move(self, interaction):
+
+        values = interaction.data.get("values", [])
+
+        if not values or not self.selected:
+            await self.redraw(interaction)
+            return
+
+        section = values[0]
+        end = max((pos for _, pos in self.layout.values()), default=0) + 1
+
+        # Keep their current order, put them at the bottom of the section.
+        for offset, fight_id in enumerate(sorted(self.selected, key=lambda f: self.layout[f][1])):
+            self.layout[fight_id] = [section, end + offset]
+
+        moved = len(self.selected)
+        self.selected = []
+        self.save()
+
+        label = "left out of the recap" if section == RECAP_HIDDEN else f"moved to **{section}**"
+        await self.redraw(interaction, f"✅ {plural(moved, 'fight')} {label}.")
+
+    async def shift(self, interaction, direction: int):
+
+        fight_id = self.selected[0]
+        section = self.layout[fight_id][0]
+        same = ordered_sections(self.layout)[section]
+        index = same.index(fight_id)
+        other = index + direction
+
+        if 0 <= other < len(same):
+            swap = same[other]
+            self.layout[fight_id][1], self.layout[swap][1] = self.layout[swap][1], self.layout[fight_id][1]
+            self.save()
+            await self.redraw(interaction)
+        else:
+            await self.redraw(interaction, f"Already at the {'top' if direction < 0 else 'bottom'} of **{section}**.")
+
+    async def move_up(self, interaction):
+        await self.shift(interaction, -1)
+
+    async def move_down(self, interaction):
+        await self.shift(interaction, 1)
+
+    async def edit_text(self, interaction):
+        await interaction.response.send_modal(RecapTextModal(self))
+
+    async def reset(self, interaction):
+        self.layout = default_recap_layout(self.fights)
+        self.selected = []
+        self.save()
+        await self.redraw(interaction, "🔄 Back to the default order (last fight = Main Event).")
+
+    async def preview(self, interaction):
+        await interaction.response.send_message(
+            content="👁️ Preview (only you can see this):",
+            embed=recap_embed(self.guild, self.event, self.fights, self.layout, self.title, self.notes),
+            ephemeral=True
+        )
+
+    async def post(self, interaction):
+
+        shown = [f for f, (section, _) in self.layout.items() if section != RECAP_HIDDEN]
+
+        if not shown:
+            await self.redraw(interaction, "❌ Every fight is left out. Move at least one into a section.")
+            return
+
+        self.save()
+
+        try:
+            await interaction.channel.send(
+                embed=recap_embed(self.guild, self.event, self.fights, self.layout, self.title, self.notes)
+            )
+        except discord.Forbidden:
+            await self.redraw(interaction, "❌ I can't post in this channel. Check my permissions here.")
+            return
+
+        await self.redraw(
+            interaction,
+            f"📢 Recap posted by {interaction.user.display_name}. "
+            "Changed something? Edit and press **Post recap** again."
+        )
+
+    async def close(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(
+            content="Closed. Your layout is saved for next time.",
+            embed=None,
+            view=None
+        )
+
+
+async def recap_event_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+
+    typed = event_key(current or "")
+
+    return [
+        app_commands.Choice(name=name[:100], value=name[:100])
+        for name in recent_events(interaction.guild.id)
+        if typed in event_key(name)
+    ][:25]
+
+
+@bot.tree.command(
+    name="recap",
+    description="Make an event recap: put fights in main card, prelims etc., then post it."
+)
+@app_commands.describe(
+    event="The event name used in /result (start typing to pick)"
+)
+@app_commands.autocomplete(
+    event=recap_event_autocomplete
+)
+async def recap(
+    interaction: discord.Interaction,
+    event: str
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can make recaps.",
+            ephemeral=True
+        )
+        return
+
+    fights = event_fights(interaction.guild.id, event)
+
+    if not fights:
+        names = {event_key(name): name for name in recent_events(interaction.guild.id)}
+        close = difflib.get_close_matches(event_key(event), list(names), n=3, cutoff=0.5)
+        await interaction.response.send_message(
+            f"❌ No fights are logged under **{event}**."
+            + (f" Did you mean: {', '.join(f'**{names[c]}**' for c in close)}?" if close else "")
+            + "\nFights are matched by the **event** you typed in `/result`.",
+            ephemeral=True
+        )
+        return
+
+    # A dropdown holds 25, so very big events show their last 25 fights.
+    if len(fights) > 25:
+        fights = fights[-25:]
+
+    event_name = fights[-1]["event"].strip()
+    builder = RecapBuilderView(interaction.guild, event_name, fights)
+
+    await interaction.response.send_message(
+        content=(
+            f"Found **{plural(len(fights), 'fight')}** for **{event_name}**. The last fight logged is the "
+            "Main Event to start with: rearrange anything, then press **Post recap** "
+            "(it posts in this channel). Your layout is saved, so you can come back to it."
+        ),
+        embed=builder.embed(),
+        view=builder,
+        ephemeral=True
+    )
+
+
+
+_drafts_restored = False
+
+
+def restore_card_drafts():
+    """Puts open /createfights panels back after a restart (needs the servers loaded)."""
+
+    global _drafts_restored
+
+    if _drafts_restored:
+        return
+
+    _drafts_restored = True
+
+    try:
+        cutoff = int(time.time()) - DRAFT_DAYS * 86400
+        discipline_query("DELETE FROM card_drafts WHERE updated_at < ?", (cutoff,), write=True)
+
+        restored = 0
+
+        for draft in discipline_query("SELECT * FROM card_drafts"):
+
+            guild = bot.get_guild(draft["guild_id"])
+
+            if not guild:
+                continue
+
+            view = CardBuilderView(
+                draft["author_id"],
+                guild,
+                draft["event"],
+                json.loads(draft["signup_ids"]),
+                draft["signup_type"],
+                bool(draft["shared"]),
+                draft["id"]
+            )
+            view.bouts = [list(bout) for bout in json.loads(draft["bouts"])]
+            view.page = draft["page"]
+            view.rebuild()
+            bot.add_view(view)
+            restored += 1
+
+        print(f"Restored {restored} fight card panel(s).")
+
+    except Exception as error:
+        print(f"Could not restore fight card panels: {error}")
+
+
 async def setup_hook():
 
     setup_database()
@@ -11995,12 +13159,15 @@ async def setup_hook():
     setup_vote_tables()
     setup_discipline_tables()
     setup_fighter_list_tables()
+    setup_recap_tables()
+    setup_card_draft_tables()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
     restore_checkin_buttons()
     restore_suggestion_buttons()
     restore_vote_buttons()
+    restore_copy_buttons()
 
     if not vote_closer.is_running():
         vote_closer.start()
@@ -12013,6 +13180,8 @@ bot.setup_hook = setup_hook
 
 @bot.event
 async def on_ready():
+
+    restore_card_drafts()
 
     print(
         f"Logged in as {bot.user}"
