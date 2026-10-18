@@ -1,5 +1,6 @@
 import asyncio
 import csv
+import difflib
 import hashlib
 import io
 import os
@@ -11,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 
@@ -359,6 +360,14 @@ def setup_database():
     db.commit()
     db.close()
 
+    # Tables for the newer features (safe to run every start).
+    setup_card_tables()
+    setup_fight_card_tables()
+    setup_suggestion_tables()
+    setup_vote_tables()
+    setup_discipline_tables()
+    setup_fighter_list_tables()
+
 
 # ============================================================
 # SIGNUP DATABASE FUNCTIONS
@@ -597,6 +606,10 @@ SIGNUP_INFO = {
     }
 }
 
+SIGNUP_NO_GUARANTEE = (
+    "Signing up does not guarantee you a fight. Fights are picked by staff."
+)
+
 # Short names used only for the small line above the embed title.
 SIGNUP_LABELS = {
     "fight_night": "FIGHT NIGHT",
@@ -624,7 +637,8 @@ def create_signup_embed(
         description=(
             f"**{info['message']}**\n\n"
             f"🥊 **Current Sign-Ups: {count}**\n"
-            f"🟢 **Status:** Open"
+            f"🟢 **Status:** Open\n\n"
+            f"⚠️ *{SIGNUP_NO_GUARANTEE}*"
         ),
         color=PFO_GOLD,
         timestamp=discord.utils.utcnow()
@@ -637,7 +651,7 @@ def create_signup_embed(
     )
 
     embed.set_footer(
-        text="Press the button below to sign up.",
+        text="Press Sign Up to join • Press Withdraw to take yourself off the list",
         icon_url=asset_url(LOGO_FILE)
     )
 
@@ -715,6 +729,61 @@ class SignupView(
             button
         )
 
+        withdraw = discord.ui.Button(
+            label="Withdraw",
+            style=discord.ButtonStyle.red,
+            emoji="↩️",
+            custom_id=f"pfo_withdraw_{session_id}"
+        )
+
+        withdraw.callback = self.withdraw_button
+
+        self.add_item(
+            withdraw
+        )
+
+    async def withdraw_button(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        session = get_session(
+            self.session_id
+        )
+
+        if not session or session["active"] != 1:
+
+            await interaction.response.send_message(
+                "❌ Sign-ups are closed, so the list can't be changed. "
+                "Please contact a member of staff.",
+                ephemeral=True
+            )
+
+            return
+
+        if not is_signed_up(self.session_id, interaction.user.id):
+
+            await interaction.response.send_message(
+                "❌ You're not on the sign-up list.",
+                ephemeral=True
+            )
+
+            return
+
+        await interaction.response.send_message(
+            (
+                "⚠️ **This will take you off the sign-up list** for "
+                f"**{SIGNUP_INFO[self.signup_type]['title']}**.\n\n"
+                "Are you sure you want to withdraw?"
+            ),
+            view=WithdrawConfirmView(
+                self.session_id,
+                self.signup_type,
+                interaction.user.id
+            ),
+            ephemeral=True
+        )
+
     async def signup_button(
         self,
         interaction: discord.Interaction
@@ -732,6 +801,25 @@ class SignupView(
 
             await interaction.response.send_message(
                 "❌ This signup is closed.",
+                ephemeral=True
+            )
+
+            return
+
+        # ----------------------------------------------------
+        # Suspended fighters (2 warnings) can't sign up.
+        # ----------------------------------------------------
+
+        try:
+            suspension = get_active_suspension(interaction.guild.id, interaction.user.id)
+        except Exception as error:
+            print(f"Suspension check failed: {error}")
+            suspension = None
+
+        if suspension:
+
+            await interaction.response.send_message(
+                suspension_signup_text(suspension),
                 ephemeral=True
             )
 
@@ -806,7 +894,9 @@ class SignupView(
         await interaction.response.send_message(
             (
                 "✅ **You have been signed up!**\n\n"
-                f"**Current Sign-Ups: {count}**"
+                f"**Current Sign-Ups: {count}**\n\n"
+                f"⚠️ {SIGNUP_NO_GUARANTEE} "
+                "Changed your mind? Press **Withdraw** to take yourself off the list."
             ),
             ephemeral=True
         )
@@ -843,6 +933,178 @@ class SignupView(
             print(
                 f"Could not update signup message: {error}"
             )
+
+
+def is_signed_up(
+    session_id: int,
+    discord_user_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        SELECT id
+        FROM signups
+        WHERE session_id = ?
+        AND discord_user_id = ?
+    """, (
+        session_id,
+        discord_user_id
+    ))
+
+    found = cursor.fetchone() is not None
+
+    db.close()
+
+    return found
+
+
+def remove_signup(
+    session_id: int,
+    discord_user_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        DELETE FROM signups
+        WHERE session_id = ?
+        AND discord_user_id = ?
+    """, (
+        session_id,
+        discord_user_id
+    ))
+
+    removed = cursor.rowcount > 0
+
+    db.commit()
+    db.close()
+
+    return removed
+
+
+async def refresh_signup_message(
+    guild: discord.Guild,
+    session,
+    signup_type: str
+):
+
+    try:
+
+        channel = guild.get_channel(
+            session["channel_id"]
+        )
+
+        if channel:
+
+            message = await channel.fetch_message(
+                session["message_id"]
+            )
+
+            await message.edit(
+                embed=create_signup_embed(
+                    signup_type,
+                    session["id"]
+                ),
+                view=SignupView(
+                    session["id"],
+                    signup_type
+                )
+            )
+
+    except Exception as error:
+
+        print(
+            f"Could not update signup message: {error}"
+        )
+
+
+class WithdrawConfirmView(
+    discord.ui.View
+):
+    """'Are you sure?' step before taking someone off the list."""
+
+    def __init__(
+        self,
+        session_id: int,
+        signup_type: str,
+        user_id: int
+    ):
+
+        super().__init__(
+            timeout=120
+        )
+
+        self.session_id = session_id
+        self.signup_type = signup_type
+        self.user_id = user_id
+
+        confirm = discord.ui.Button(
+            label="Yes, take me off the list",
+            style=discord.ButtonStyle.red
+        )
+        confirm.callback = self.confirm
+
+        cancel = discord.ui.Button(
+            label="Stay signed up",
+            style=discord.ButtonStyle.grey
+        )
+        cancel.callback = self.cancel
+
+        self.add_item(confirm)
+        self.add_item(cancel)
+
+    async def confirm(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        session = get_session(self.session_id)
+
+        if not session or session["active"] != 1:
+
+            await interaction.response.edit_message(
+                content="❌ Sign-ups have closed, so the list can't be changed. "
+                        "Please contact a member of staff.",
+                view=None
+            )
+
+            return
+
+        remove_signup(
+            self.session_id,
+            self.user_id
+        )
+
+        await interaction.response.edit_message(
+            content=(
+                "✅ **You've been taken off the sign-up list.**\n"
+                "You can sign up again while sign-ups are still open."
+            ),
+            view=None
+        )
+
+        await refresh_signup_message(
+            interaction.guild,
+            session,
+            self.signup_type
+        )
+
+    async def cancel(
+        self,
+        interaction: discord.Interaction
+    ):
+
+        self.stop()
+
+        await interaction.response.edit_message(
+            content="👍 You're still signed up.",
+            view=None
+        )
 
 
 # ============================================================
@@ -1167,6 +1429,16 @@ async def signupclose(
         f"**Sign-Ups Closed! [{count}]!**",
         ephemeral=True
     )
+
+    # Flag fighters who didn't sign up (posted in the staff bot channel).
+    try:
+        await report_missed_signup(
+            interaction.guild,
+            session["id"],
+            SIGNUP_INFO[signup_type_value]["title"]
+        )
+    except Exception as error:
+        print(f"Missed sign-up report error: {error}")
 
 
 # ============================================================
@@ -3546,6 +3818,25 @@ async def create_profile_embed(
             f"win{'s' if stats['title_wins'] != 1 else ''}"
         )
 
+    # Suspension / warnings
+    if member.id:
+        try:
+            suspension = get_active_suspension(guild.id, member.id)
+
+            if suspension:
+                description.insert(
+                    0,
+                    f"⛔ **Suspended** until <t:{suspension['ends_at']}:f> "
+                    f"(<t:{suspension['ends_at']}:R>)"
+                )
+            else:
+                warns = len(active_warnings(guild.id, member.id))
+
+                if warns:
+                    description.append(f"⚠️ {warns}/{MAX_WARNINGS} warnings")
+        except Exception as error:
+            print(f"Profile warning lookup failed: {error}")
+
     if description:
         embed.description = "\n".join(description)
 
@@ -4249,6 +4540,28 @@ async def result(
             ephemeral=True
         )
 
+    # Extras after the result is safely saved; a problem here never
+    # undoes or blocks the result itself.
+    suggestion_problem = None
+
+    try:
+        for poll_id in resolve_votes_for_fight(interaction.guild.id, get_fight(interaction.guild.id, fight_id)):
+            await refresh_vote_message(poll_id)
+
+        suggestion_problem = await post_ranking_suggestions(
+            interaction.guild,
+            fight_id,
+            fight
+        )
+    except Exception as error:
+        print(f"After-result extras failed: {error}")
+
+    if suggestion_problem:
+        await interaction.followup.send(
+            suggestion_problem,
+            ephemeral=True
+        )
+
 
 # ------------------------------------------------------------
 # /PROFILE
@@ -4667,6 +4980,9 @@ async def editfight(
         fight_id
     )
 
+    polls_changed = set(unresolve_votes_for_fight(fight_id))
+    polls_changed.update(resolve_votes_for_fight(interaction.guild.id, updated))
+
     await interaction.response.send_message(
         (
             "✏️ **Fight updated.** Records, streaks and profiles now use the new details.\n\n"
@@ -4675,6 +4991,9 @@ async def editfight(
         ),
         ephemeral=True
     )
+
+    for poll_id in polls_changed:
+        await refresh_vote_message(poll_id)
 
     problems = await sync_nicknames(
         interaction.guild,
@@ -5071,7 +5390,7 @@ class ResetRecordView(
             view=None
         )
 
-        problems = await sync_nicknames(interaction.client.get_guild(self.guild_id) or interaction.guild, affected)
+        problems = await sync_nicknames(interaction.guild or bot.get_guild(self.guild_id), affected)
 
         if problems:
             await interaction.edit_original_response(
@@ -5328,6 +5647,9 @@ class RemoveFightView(
             fight["id"]
         )
 
+        for poll_id in unresolve_votes_for_fight(fight["id"]):
+            await refresh_vote_message(poll_id)
+
         text = (
             f"🗑️ **Removed fight #{fight['id']}**: {fight_summary(fight)}\n\n"
             + "\n".join(
@@ -5342,7 +5664,7 @@ class RemoveFightView(
             view=None
         )
 
-        guild = interaction.client.get_guild(self.guild_id) or interaction.guild
+        guild = interaction.guild or bot.get_guild(self.guild_id)
 
         problems = await sync_nicknames(
             guild,
@@ -5759,6 +6081,1947 @@ async def syncnicknames(
             embed=embed,
             ephemeral=True
         )
+
+
+# ------------------------------------------------------------
+# /CREATEFIGHTS and /VIEWCARD
+#
+# Saves a fight card to the records: @mention fighters in fight
+# order, every two mentions are a fight. Nothing is posted publicly.
+# /dmfightnight, /dmlivecard and /mainvote use the last saved card
+# when their "fighters" box is left empty.
+# ------------------------------------------------------------
+
+def setup_fight_card_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fight_cards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fight_card_bouts (
+            card_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            fighter_a INTEGER NOT NULL,
+            fighter_b INTEGER NOT NULL,
+
+            PRIMARY KEY(card_id, position)
+        )
+    """)
+
+    cursor.execute("PRAGMA table_info(fight_card_bouts)")
+
+    if "weight" not in [column[1] for column in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE fight_card_bouts ADD COLUMN weight TEXT")
+
+    db.commit()
+    db.close()
+
+
+def save_fight_card(
+    guild_id: int,
+    event: str,
+    created_by: int,
+    bouts: list
+):
+    """bouts: [(fighter_a, fighter_b, weight or None)]"""
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        INSERT INTO fight_cards (guild_id, event, created_by, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (guild_id, event, created_by, now_utc()))
+
+    card_id = cursor.lastrowid
+
+    cursor.executemany("""
+        INSERT INTO fight_card_bouts (card_id, position, fighter_a, fighter_b, weight)
+        VALUES (?, ?, ?, ?, ?)
+    """, [
+        (card_id, position, bout[0], bout[1], bout[2] if len(bout) > 2 else None)
+        for position, bout in enumerate(bouts, start=1)
+    ])
+
+    db.commit()
+    db.close()
+
+    return card_id
+
+
+def get_latest_fight_card(
+    guild_id: int,
+    event_search: str = None
+):
+
+    setup_fight_card_tables()
+
+    db = get_db()
+    cursor = db.cursor()
+
+    if event_search:
+        cursor.execute("""
+            SELECT * FROM fight_cards
+            WHERE guild_id = ? AND LOWER(event) LIKE ?
+            ORDER BY id DESC LIMIT 1
+        """, (guild_id, f"%{event_search.lower()}%"))
+    else:
+        cursor.execute("""
+            SELECT * FROM fight_cards
+            WHERE guild_id = ?
+            ORDER BY id DESC LIMIT 1
+        """, (guild_id,))
+
+    row = cursor.fetchone()
+    db.close()
+
+    return row
+
+
+def get_fight_card_bouts(
+    card_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("""
+        SELECT * FROM fight_card_bouts
+        WHERE card_id = ?
+        ORDER BY position ASC
+    """, (card_id,))
+    rows = cursor.fetchall()
+    db.close()
+
+    return rows
+
+
+def get_latest_signup_session(
+    guild_id: int,
+    signup_type: str = None
+):
+    """Most recent sign-up (open or closed), optionally of one type."""
+
+    db = get_db()
+    cursor = db.cursor()
+
+    if signup_type:
+        cursor.execute("""
+            SELECT * FROM signup_sessions
+            WHERE guild_id = ? AND signup_type = ?
+            ORDER BY id DESC LIMIT 1
+        """, (guild_id, signup_type))
+    else:
+        cursor.execute("""
+            SELECT * FROM signup_sessions
+            WHERE guild_id = ?
+            ORDER BY id DESC LIMIT 1
+        """, (guild_id,))
+
+    row = cursor.fetchone()
+    db.close()
+
+    return row
+
+
+# ------------------------------------------------------------
+# Card text: names, records, rankings and weight classes
+# ------------------------------------------------------------
+
+DIVISION_NAMES = [weight for weight in WEIGHTS.keys() if weight != P4P_WEIGHT]
+
+
+def auto_weight(
+    guild_id: int,
+    fighter_a: int,
+    fighter_b: int
+):
+    """The division both are ranked in, else either one's division."""
+
+    def divisions(user_id):
+        return [
+            weight for weight in DIVISION_NAMES
+            if get_user_ranking_in_division(guild_id, user_id, weight)
+        ]
+
+    a, b = divisions(fighter_a), divisions(fighter_b)
+    both = [weight for weight in a if weight in b]
+
+    if both:
+        return both[0]
+
+    if a:
+        return a[0]
+
+    if b:
+        return b[0]
+
+    return None
+
+
+def ranking_tag(
+    guild_id: int,
+    user_id: int,
+    weight: str
+):
+    """'[C]', '[#3]' or '' for this fighter in this weight class."""
+
+    if not weight:
+        return ""
+
+    row = get_user_ranking_in_division(guild_id, user_id, weight)
+
+    if not row:
+        return ""
+
+    return "[C]" if row["rank"] == 0 else f"[#{row['rank']}]"
+
+
+def card_fighter_text(
+    guild: discord.Guild,
+    user_id: int,
+    weight: str
+):
+
+    member = guild.get_member(user_id)
+    name = member.display_name if member else "Unknown fighter"
+    tag = ranking_tag(guild.id, user_id, weight)
+
+    return f"{name} {tag}".strip()
+
+
+def card_bout_line(
+    guild: discord.Guild,
+    number: int,
+    fighter_a: int,
+    fighter_b: int,
+    weight: str
+):
+
+    line = (
+        f"{number}. {card_fighter_text(guild, fighter_a, weight)} vs "
+        f"{card_fighter_text(guild, fighter_b, weight)}"
+    )
+
+    if weight:
+        line += f" - {weight}"
+
+    return line
+
+
+def card_as_text(
+    guild: discord.Guild,
+    event: str,
+    bouts: list
+):
+    """Plain text, ready to copy and paste."""
+
+    lines = [event, ""]
+
+    lines += [
+        card_bout_line(guild, number, a, b, weight)
+        for number, (a, b, weight) in enumerate(bouts, start=1)
+    ]
+
+    return "\n".join(lines)
+
+
+async def send_card_text(
+    interaction: discord.Interaction,
+    text: str
+):
+    """Sends the card as plain text (split if it's very long)."""
+
+    chunks = []
+    current = ""
+
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > 1900:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+
+    if current.strip():
+        chunks.append(current)
+
+    first = True
+
+    for chunk in chunks:
+        if first:
+            await interaction.response.send_message(chunk, ephemeral=True)
+            first = False
+        else:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+
+class CopyCardView(
+    discord.ui.View
+):
+    """Just the copy button (after saving, and on /viewcard)."""
+
+    def __init__(
+        self,
+        guild: discord.Guild,
+        event: str,
+        bouts: list
+    ):
+
+        super().__init__(
+            timeout=900
+        )
+
+        self.guild = guild
+        self.event = event
+        self.bouts = bouts
+
+        copy = discord.ui.Button(label="Copy as text", emoji="📋", style=discord.ButtonStyle.blurple)
+        copy.callback = self.copy
+        self.add_item(copy)
+
+    async def copy(self, interaction):
+        await send_card_text(interaction, card_as_text(self.guild, self.event, self.bouts))
+
+
+# ------------------------------------------------------------
+# The fight card builder
+#
+# /createfights opens a builder loaded with the sign-up list. It's
+# posted in the channel so any staff member can work on it at the
+# same time (private: Yes keeps it to just you). Pick two names from the dropdown = one fight. A checklist
+# shows who still needs a fight. Each fight gets a weight class
+# (worked out from the rankings, changeable). "Copy as text" gives
+# the card as plain text. Saving keeps it in the records only.
+# ------------------------------------------------------------
+
+SELECT_PAGE_SIZE = 25  # Discord's limit per dropdown
+NO_WEIGHT = "none"
+
+
+class CardBuilderView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        author_id: int,
+        guild: discord.Guild,
+        event: str,
+        signup_ids: list,
+        signup_type: str = None,
+        shared: bool = True
+    ):
+
+        super().__init__(
+            timeout=3600
+        )
+
+        self.shared = shared
+
+        self.author_id = author_id
+        self.guild = guild
+        self.event = event
+        self.signup_ids = signup_ids
+        self.signup_type = signup_type
+        self.bouts = []      # [fighter_a, fighter_b, weight]
+        self.page = 0
+
+        self.rebuild()
+
+    # -------- state --------
+
+    @property
+    def pairs(self):
+        return [(a, b) for a, b, _ in self.bouts]
+
+    @pairs.setter
+    def pairs(self, value):
+        self.bouts = [
+            [a, b, auto_weight(self.guild.id, a, b)]
+            for a, b in value
+        ]
+
+    def paired_ids(self):
+        return {user_id for a, b, _ in self.bouts for user_id in (a, b)}
+
+    def unpaired(self):
+        paired = self.paired_ids()
+        return [user_id for user_id in self.signup_ids if user_id not in paired]
+
+    def name(self, user_id):
+        member = self.guild.get_member(user_id)
+        return name_without_record(member.display_name) if member else f"User {user_id}"
+
+    def label(self, user_id):
+        member = self.guild.get_member(user_id)
+        return (member.display_name if member else f"User {user_id}")[:100]
+
+    # -------- display --------
+
+    def embed(self):
+
+        lines = []
+
+        if self.bouts:
+            lines.append(f"**Fights ({len(self.bouts)})**")
+            for number, (a, b, weight) in enumerate(self.bouts, start=1):
+                lines.append(
+                    f"`{number:>2}` **{card_fighter_text(self.guild, a, weight)}**  vs  "
+                    f"**{card_fighter_text(self.guild, b, weight)}**"
+                    f"  ·  *{weight or 'no weight class'}*"
+                )
+        else:
+            lines.append("**No fights yet.** Pick two fighters from the first dropdown to make a fight.")
+
+        lines.append("")
+
+        if self.signup_ids:
+            paired = self.paired_ids()
+            left = len(self.unpaired())
+            lines.append(
+                f"**Sign-up checklist** ({len(self.signup_ids) - left}/{len(self.signup_ids)} matched"
+                + (f", **{left} left**" if left else ", all done ✅") + ")"
+            )
+            # Still needing a fight first, then the ones already matched.
+            lines += [f"⬜ {self.name(user_id)}" for user_id in self.signup_ids if user_id not in paired]
+            lines += [f"✅ ~~{self.name(user_id)}~~" for user_id in self.signup_ids if user_id in paired]
+        else:
+            lines.append("ℹ️ No sign-up list found, so use the second dropdown to pick anyone.")
+
+        embed = discord.Embed(
+            title=self.event,
+            description="\n".join(lines)[:4000],
+            color=PFO_GOLD
+        )
+
+        apply_branding(
+            embed,
+            author_text="PFO • CREATE FIGHTS"
+        )
+
+        embed.set_footer(
+            text="✅ has a fight  ⬜ still needs one • Weight classes come from the rankings",
+            icon_url=asset_url(LOGO_FILE)
+        )
+
+        return embed
+
+    def rebuild(self):
+
+        self.clear_items()
+
+        left = self.unpaired()
+        pages = max(1, (len(left) + SELECT_PAGE_SIZE - 1) // SELECT_PAGE_SIZE)
+        self.page = min(self.page, pages - 1)
+        page_ids = left[self.page * SELECT_PAGE_SIZE:(self.page + 1) * SELECT_PAGE_SIZE]
+
+        # Row 0: the sign-up list (only people still needing a fight)
+        if len(page_ids) >= 2:
+            signup_select = discord.ui.Select(
+                placeholder=(
+                    "Pick 2 signed-up fighters to make a fight"
+                    + (f" (page {self.page + 1}/{pages})" if pages > 1 else "")
+                ),
+                min_values=2,
+                max_values=2,
+                options=[
+                    discord.SelectOption(label=self.label(user_id), value=str(user_id))
+                    for user_id in page_ids
+                ],
+                row=0
+            )
+            signup_select.callback = self.pick_from_signups
+            self.add_item(signup_select)
+        else:
+            self.add_item(discord.ui.Select(
+                placeholder=(
+                    "Everyone on the list has a fight" if self.signup_ids and not left
+                    else "Not enough unmatched sign-ups on this page"
+                ),
+                options=[discord.SelectOption(label="-", value="0")],
+                disabled=True,
+                row=0
+            ))
+
+        # Row 1: anyone in the server (people who didn't sign up)
+        anyone = discord.ui.UserSelect(
+            placeholder="Or pick any 2 members (search by typing)",
+            min_values=2,
+            max_values=2,
+            row=1
+        )
+        anyone.callback = self.pick_anyone
+        self.add_item(anyone)
+
+        # Row 2: weight class for the newest fight
+        if self.bouts:
+            number = len(self.bouts)
+            current = self.bouts[-1][2]
+            weight_select = discord.ui.Select(
+                placeholder=f"Weight class for fight {number}: {current or 'none'} (change)",
+                options=[
+                    discord.SelectOption(label=weight, value=weight, default=(weight == current))
+                    for weight in DIVISION_NAMES
+                ] + [discord.SelectOption(label="No weight class", value=NO_WEIGHT, default=current is None)],
+                row=2
+            )
+            weight_select.callback = self.pick_weight
+            self.add_item(weight_select)
+        else:
+            self.add_item(discord.ui.Select(
+                placeholder="Weight class (add a fight first)",
+                options=[discord.SelectOption(label="-", value="0")],
+                disabled=True,
+                row=2
+            ))
+
+        # Row 3: paging, undo, copy
+        previous = discord.ui.Button(label="◀ Page", style=discord.ButtonStyle.grey,
+                                     disabled=self.page == 0, row=3)
+        previous.callback = self.previous_page
+        following = discord.ui.Button(label="Page ▶", style=discord.ButtonStyle.grey,
+                                      disabled=self.page >= pages - 1, row=3)
+        following.callback = self.next_page
+        undo = discord.ui.Button(label="Undo last fight", emoji="↩️", style=discord.ButtonStyle.grey,
+                                 disabled=not self.bouts, row=3)
+        undo.callback = self.undo
+        copy = discord.ui.Button(label="Copy as text", emoji="📋", style=discord.ButtonStyle.blurple,
+                                 disabled=not self.bouts, row=3)
+        copy.callback = self.copy
+        for item in (previous, following, undo, copy):
+            self.add_item(item)
+
+        # Row 4: finish
+        save = discord.ui.Button(label="Save card", emoji="💾", style=discord.ButtonStyle.green,
+                                 disabled=not self.bouts, row=4)
+        save.callback = self.save
+        cancel = discord.ui.Button(label="Close", style=discord.ButtonStyle.grey, row=4)
+        cancel.callback = self.cancel
+        self.add_item(save)
+        self.add_item(cancel)
+
+    async def redraw(self, interaction, note: str = None):
+        self.rebuild()
+
+        # With several staff on the same panel, say who did what.
+        if note and self.shared:
+            note = f"{note}  ·  *{name_without_record(interaction.user.display_name)}*"
+
+        await interaction.response.edit_message(
+            content=note,
+            embed=self.embed(),
+            view=self
+        )
+
+    # -------- actions --------
+
+    async def interaction_check(self, interaction):
+
+        if self.shared:
+            if is_staff(interaction):
+                return True
+
+            await interaction.response.send_message(
+                f"❌ {STAFF_ONLY_TEXT} can edit the fight card.",
+                ephemeral=True
+            )
+            return False
+
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who opened this builder can use it.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    async def add_pair(self, interaction, a: int, b: int):
+
+        if a == b:
+            await self.redraw(interaction, "❌ Pick two different fighters.")
+            return
+
+        paired = self.paired_ids()
+        already = [user_id for user_id in (a, b) if user_id in paired]
+
+        if already:
+            await self.redraw(interaction, f"❌ **{self.name(already[0])}** already has a fight. Undo it first to change it.")
+            return
+
+        weight = auto_weight(self.guild.id, a, b)
+        self.bouts.append([a, b, weight])
+
+        await self.redraw(
+            interaction,
+            f"✅ Added **{self.name(a)}** vs **{self.name(b)}**"
+            + (f" at **{weight}**" if weight else " (no weight class: pick one below if needed)")
+        )
+
+    async def pick_from_signups(self, interaction):
+        values = [int(value) for value in interaction.data.get("values", [])]
+        if len(values) == 2:
+            await self.add_pair(interaction, values[0], values[1])
+
+    async def pick_anyone(self, interaction):
+        values = [int(value) for value in interaction.data.get("values", [])]
+        if len(values) == 2:
+            for user_id in values:
+                member = self.guild.get_member(user_id)
+                if member and member.bot:
+                    await self.redraw(interaction, "❌ Bots can't fight.")
+                    return
+            await self.add_pair(interaction, values[0], values[1])
+
+    async def pick_weight(self, interaction):
+        values = interaction.data.get("values", [])
+        if values and self.bouts:
+            self.bouts[-1][2] = None if values[0] == NO_WEIGHT else values[0]
+            await self.redraw(interaction, f"⚖️ Fight {len(self.bouts)} is now **{self.bouts[-1][2] or 'no weight class'}**")
+
+    async def previous_page(self, interaction):
+        self.page = max(0, self.page - 1)
+        await self.redraw(interaction)
+
+    async def next_page(self, interaction):
+        self.page += 1
+        await self.redraw(interaction)
+
+    async def undo(self, interaction):
+        if self.bouts:
+            a, b, _ = self.bouts.pop()
+            await self.redraw(interaction, f"↩️ Removed **{self.name(a)}** vs **{self.name(b)}**")
+        else:
+            await self.redraw(interaction)
+
+    async def copy(self, interaction):
+        await send_card_text(interaction, card_as_text(self.guild, self.event, self.bouts))
+
+    async def cancel(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(
+            content=f"Closed by {interaction.user.display_name}. Nothing was saved.",
+            embed=None,
+            view=None
+        )
+
+    async def save(self, interaction):
+
+        self.stop()
+
+        save_fight_card(
+            self.guild.id,
+            self.event,
+            interaction.user.id,
+            [tuple(bout) for bout in self.bouts]
+        )
+
+        await interaction.response.edit_message(
+            content=(
+                f"💾 **Saved {self.event}** ({len(self.bouts)} fights) to the records. "
+                "See it again any time with `/viewcard`."
+            ),
+            embed=self.embed(),
+            view=CopyCardView(self.guild, self.event, [tuple(bout) for bout in self.bouts])
+        )
+
+
+@bot.tree.command(
+    name="createfights",
+    description="Build a fight card from the sign-up list by picking pairs (records only)."
+)
+@app_commands.describe(
+    sign_ups="Which sign-up list to build from (default: the most recent one)",
+    event="Event name for the records, e.g. PFO Fight Night 16",
+    fighters="Optional shortcut: @mention in fight order instead of using the dropdowns",
+    private="Yes = only you can see and edit it. Default: posted so all staff can edit together"
+)
+@app_commands.choices(
+    sign_ups=[
+        app_commands.Choice(name="Fight Night", value="fight_night"),
+        app_commands.Choice(name="Live Card", value="live_card"),
+    ],
+    private=[
+        app_commands.Choice(name="Yes", value="yes"),
+        app_commands.Choice(name="No", value="no"),
+    ]
+)
+async def createfights(
+    interaction: discord.Interaction,
+    sign_ups: app_commands.Choice[str] = None,
+    event: str = None,
+    fighters: str = None,
+    private: app_commands.Choice[str] = None
+):
+
+    if not is_staff(interaction):
+
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can create fights.",
+            ephemeral=True
+        )
+
+        return
+
+    session = get_latest_signup_session(
+        interaction.guild.id,
+        sign_ups.value if sign_ups else None
+    )
+
+    signup_type = session["signup_type"] if session else (sign_ups.value if sign_ups else None)
+
+    if event and event.strip():
+        event = event.strip()
+    elif signup_type:
+        event = f"PFO {SIGNUP_LABELS[signup_type].title()} {datetime.now(timezone.utc):%d/%m/%Y}"
+    else:
+        event = f"PFO Card {datetime.now(timezone.utc):%d/%m/%Y}"
+
+    signup_ids = []
+
+    if session:
+        for row in get_signups(session["id"]):
+            member = interaction.guild.get_member(row["discord_user_id"])
+            if member and not member.bot and member.id not in signup_ids:
+                signup_ids.append(member.id)
+
+    shared = not private or private.value != "yes"
+
+    builder = CardBuilderView(
+        interaction.user.id,
+        interaction.guild,
+        event,
+        signup_ids,
+        signup_type,
+        shared
+    )
+
+    # Shortcut: typed @mentions fill the fights straight away.
+    if fighters and MENTION_PATTERN.search(fighters):
+
+        pairs = parse_fight_pairs(fighters)
+
+        if pairs[-1][1] is None:
+            await interaction.response.send_message(
+                f"❌ That's an odd number of fighters: <@{pairs[-1][0]}> has no opponent.",
+                ephemeral=True
+            )
+            return
+
+        builder.pairs = [(a, b) for a, b in pairs if a != b]
+        builder.rebuild()
+
+        await interaction.response.send_message(
+            content="Check the pairings and weight classes, then press **Save card** or **Copy as text**.",
+            embed=builder.embed(),
+            view=builder,
+            ephemeral=not shared
+        )
+        return
+
+    intro = (
+        f"Loaded **{len(signup_ids)}** fighters from the "
+        f"**{SIGNUP_INFO[signup_type]['title']}** list. "
+        if session else ""
+    ) + "Pick two names to make a fight; repeat until the card is done."
+
+    if shared:
+        intro += "\n👥 Any staff member can use this panel at the same time. Copy as text only shows to whoever presses it."
+
+    await interaction.response.send_message(
+        content=intro,
+        embed=builder.embed(),
+        view=builder,
+        ephemeral=not shared
+    )
+
+
+@bot.tree.command(
+    name="viewcard",
+    description="Show the last fight card saved with /createfights."
+)
+@app_commands.describe(
+    event="Search for an older card by event name (optional)"
+)
+async def viewcard(
+    interaction: discord.Interaction,
+    event: str = None
+):
+
+    if not is_staff(interaction):
+
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can view saved cards.",
+            ephemeral=True
+        )
+
+        return
+
+    card = get_latest_fight_card(
+        interaction.guild.id,
+        event.strip() if event else None
+    )
+
+    if not card:
+
+        await interaction.response.send_message(
+            "❌ No saved card found. Save one with `/createfights`.",
+            ephemeral=True
+        )
+
+        return
+
+    bouts = [
+        (bout["fighter_a"], bout["fighter_b"], bout["weight"])
+        for bout in get_fight_card_bouts(card["id"])
+    ]
+
+    lines = []
+
+    for number, (a, b, weight) in enumerate(bouts, start=1):
+        lines.append(
+            f"`{number:>2}` **{card_fighter_text(interaction.guild, a, weight)}**  vs  "
+            f"**{card_fighter_text(interaction.guild, b, weight)}**"
+            f"  ·  *{weight or 'no weight class'}*"
+        )
+
+    embed = discord.Embed(
+        title=card["event"],
+        description="\n".join(lines)[:4000],
+        color=PFO_GOLD
+    )
+
+    apply_branding(
+        embed,
+        author_text="PFO • SAVED FIGHT CARD"
+    )
+
+    embed.set_footer(
+        text=f"{len(bouts)} fights • saved {card['created_at'][:10]} • rankings shown as they are now",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=CopyCardView(interaction.guild, card["event"], bouts),
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# RANKING SUGGESTIONS
+#
+# After /result, the bot checks whether the rankings should change
+# and posts a suggestion in the staff channel (🔒│pfo-bot) with
+# Apply / Dismiss buttons. Nothing changes until staff press Apply.
+#
+# Rules:
+#   • Title fight won by a non-champion -> winner becomes Champion
+#   • Winner beats someone ranked above them (or is unranked) ->
+#     winner takes the loser's spot, loser drops one place
+#   • Beating the champion in a non-title fight -> winner to #1
+#   • P4P works the same way (no champion)
+#
+# Set RANKING_SUGGESTIONS_CHANNEL in Railway to use another channel
+# (name or channel ID).
+# ------------------------------------------------------------
+
+RANKING_SUGGESTIONS_CHANNEL = os.getenv(
+    "RANKING_SUGGESTIONS_CHANNEL",
+    "pfo-bot"
+).strip()
+
+
+def setup_suggestion_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ranking_suggestions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            fight_id INTEGER,
+            weight TEXT NOT NULL,
+            winner_id INTEGER NOT NULL,
+            loser_id INTEGER,
+            target_rank INTEGER NOT NULL,
+            reason TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            channel_id INTEGER,
+            message_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def find_suggestions_channel(
+    guild: discord.Guild
+):
+
+    setting = RANKING_SUGGESTIONS_CHANNEL
+
+    if setting.isdigit():
+        return guild.get_channel(int(setting))
+
+    wanted = role_key(setting)
+
+    for channel in getattr(guild, "text_channels", []):
+        if role_key(channel.name) == wanted:
+            return channel
+
+    return None
+
+
+def rank_text(
+    weight: str,
+    rank
+):
+
+    if rank is None:
+        return "Unranked"
+
+    if rank == 0:
+        return "👑 Champion"
+
+    return f"#{rank}"
+
+
+def work_out_suggestions(
+    guild_id: int,
+    fight: dict
+):
+    """[(weight, target_rank, reason)] for a fight result."""
+
+    if fight["method"] in ("DRAW", "NC"):
+        return []
+
+    winner_id = fight.get("winner_id")
+    loser_id = fight.get("loser_id")
+
+    if not winner_id:
+        return []
+
+    def rank_of(user_id, weight):
+        if not user_id:
+            return None
+        row = get_user_ranking_in_division(guild_id, user_id, weight)
+        return row["rank"] if row else None
+
+    if fight.get("division"):
+        weights = [fight["division"]]
+    else:
+        weights = [
+            weight for weight in WEIGHTS.keys()
+            if weight != P4P_WEIGHT and rank_of(loser_id, weight) is not None
+        ]
+
+    suggestions = []
+
+    for weight in weights + [P4P_WEIGHT]:
+
+        winner_rank = rank_of(winner_id, weight)
+        loser_rank = rank_of(loser_id, weight)
+
+        if (
+            weight != P4P_WEIGHT
+            and fight.get("title_fight")
+            and fight.get("division") == weight
+            and winner_rank != 0
+        ):
+            suggestions.append((
+                weight, 0,
+                f"won the {weight} title"
+            ))
+            continue
+
+        if loser_rank is None:
+            continue
+
+        target = 1 if loser_rank == 0 else loser_rank
+
+        if winner_rank is not None and winner_rank != 0 and winner_rank <= target:
+            continue  # already ranked at or above that spot
+
+        if winner_rank == 0:
+            continue  # champion beating a contender: no change
+
+        suggestions.append((
+            weight, target,
+            f"{rank_text(weight, loser_rank)} in {'P4P' if weight == P4P_WEIGHT else weight}"
+        ))
+
+    return suggestions
+
+
+def create_suggestion_embed(
+    guild: discord.Guild,
+    row,
+    status_line: str = None
+):
+
+    def name(user_id):
+        if not user_id:
+            return "Unknown"
+        member = guild.get_member(user_id)
+        return name_without_record(member.display_name) if member else f"<@{user_id}>"
+
+    weight = row["weight"]
+    board = "P4P" if weight == P4P_WEIGHT else weight
+
+    current = get_user_ranking_in_division(guild.id, row["winner_id"], weight)
+    now_rank = current["rank"] if current else None
+
+    if row["target_rank"] == 0 and row["reason"].startswith("won"):
+        headline = (
+            f"👑 **{name(row['winner_id'])}** {row['reason']}"
+            + (f" against **{name(row['loser_id'])}**" if row["loser_id"] else "") + "."
+        )
+    else:
+        headline = (
+            f"🥊 **{name(row['winner_id'])}** beat **{name(row['loser_id'])}** "
+            f"({row['reason']})."
+        )
+
+    lines = [
+        headline,
+        "",
+        f"**Suggestion:** move **{name(row['winner_id'])}** to "
+        f"**{rank_text(weight, row['target_rank'])}** in **{board}**",
+        f"Currently: {rank_text(weight, now_rank)}",
+    ]
+
+    if row["target_rank"] == 0:
+        lines.append("The current champion would move to #1.")
+    elif row["loser_id"]:
+        lines.append(f"Everyone from {rank_text(weight, row['target_rank'])} down moves one place.")
+
+    if status_line:
+        lines += ["", status_line]
+
+    embed = discord.Embed(
+        title=f"Ranking suggestion: {board}",
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        author_text="PFO • RANKING SUGGESTION"
+    )
+
+    if row["fight_id"]:
+        embed.set_footer(
+            text=f"From fight #{row['fight_id']}",
+            icon_url=asset_url(LOGO_FILE)
+        )
+
+    return embed
+
+
+def get_suggestion(
+    suggestion_id: int
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT * FROM ranking_suggestions WHERE id = ?", (suggestion_id,))
+    row = cursor.fetchone()
+    db.close()
+
+    return row
+
+
+def update_suggestion(
+    suggestion_id: int,
+    **changes
+):
+
+    columns = ", ".join(f"{column} = ?" for column in changes)
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(
+        f"UPDATE ranking_suggestions SET {columns} WHERE id = ?",
+        (*changes.values(), suggestion_id)
+    )
+    db.commit()
+    db.close()
+
+
+class SuggestionView(
+    discord.ui.View
+):
+    """Apply / Dismiss buttons. Work after restarts."""
+
+    def __init__(
+        self,
+        suggestion_id: int
+    ):
+
+        super().__init__(
+            timeout=None
+        )
+
+        self.suggestion_id = suggestion_id
+
+        apply = discord.ui.Button(
+            label="Apply",
+            style=discord.ButtonStyle.green,
+            emoji="✅",
+            custom_id=f"pfo_rsug_apply_{suggestion_id}"
+        )
+        apply.callback = self.apply
+
+        dismiss = discord.ui.Button(
+            label="Dismiss",
+            style=discord.ButtonStyle.grey,
+            custom_id=f"pfo_rsug_dismiss_{suggestion_id}"
+        )
+        dismiss.callback = self.dismiss
+
+        self.add_item(apply)
+        self.add_item(dismiss)
+
+    async def interaction_check(self, interaction):
+
+        if not is_staff(interaction):
+            await interaction.response.send_message(
+                f"❌ {STAFF_ONLY_TEXT} can change the rankings.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    async def apply(self, interaction):
+
+        row = get_suggestion(self.suggestion_id)
+
+        if not row or row["status"] != "pending":
+            await interaction.response.send_message("This suggestion has already been dealt with.", ephemeral=True)
+            return
+
+        target = row["target_rank"]
+
+        # If the loser has moved since, take their current spot instead.
+        if target != 0 and row["loser_id"]:
+            current = get_user_ranking_in_division(interaction.guild.id, row["loser_id"], row["weight"])
+            if current is not None:
+                target = 1 if current["rank"] == 0 else current["rank"]
+
+        update_ranking(
+            interaction.guild.id,
+            row["weight"],
+            row["winner_id"],
+            target
+        )
+
+        update_suggestion(self.suggestion_id, status="applied")
+
+        await interaction.response.edit_message(
+            embed=create_suggestion_embed(
+                interaction.guild,
+                get_suggestion(self.suggestion_id),
+                f"✅ **Applied by {interaction.user.display_name}**: now "
+                f"{rank_text(row['weight'], target)} in "
+                f"{'P4P' if row['weight'] == P4P_WEIGHT else row['weight']}."
+            ),
+            view=None
+        )
+
+        await refresh_ranking_message(
+            interaction.guild,
+            row["weight"]
+        )
+
+    async def dismiss(self, interaction):
+
+        row = get_suggestion(self.suggestion_id)
+
+        if not row or row["status"] != "pending":
+            await interaction.response.send_message("This suggestion has already been dealt with.", ephemeral=True)
+            return
+
+        update_suggestion(self.suggestion_id, status="dismissed")
+
+        await interaction.response.edit_message(
+            embed=create_suggestion_embed(
+                interaction.guild,
+                row,
+                f"✖️ **Dismissed by {interaction.user.display_name}**. Rankings unchanged."
+            ),
+            view=None
+        )
+
+
+async def post_ranking_suggestions(
+    guild: discord.Guild,
+    fight_id: int,
+    fight: dict
+):
+    """Returns a problem message for staff, or None."""
+
+    suggestions = work_out_suggestions(guild.id, fight)
+
+    if not suggestions:
+        return None
+
+    channel = find_suggestions_channel(guild)
+
+    if channel is None:
+        return (
+            f"⚠️ This result should change the rankings, but I couldn't find the "
+            f"**{RANKING_SUGGESTIONS_CHANNEL}** channel to post the suggestion in."
+        )
+
+    problems = []
+
+    for weight, target, reason in suggestions:
+
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("""
+            INSERT INTO ranking_suggestions
+            (guild_id, fight_id, weight, winner_id, loser_id, target_rank, reason, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            guild.id, fight_id, weight, fight["winner_id"], fight.get("loser_id"),
+            target, reason, now_utc()
+        ))
+        suggestion_id = cursor.lastrowid
+        db.commit()
+        db.close()
+
+        try:
+            message = await channel.send(
+                embed=create_suggestion_embed(guild, get_suggestion(suggestion_id)),
+                view=SuggestionView(suggestion_id)
+            )
+            update_suggestion(
+                suggestion_id,
+                channel_id=channel.id,
+                message_id=message.id
+            )
+        except discord.Forbidden:
+            problems.append(f"⚠️ I can't post in {channel.mention}. Give the bot **Send Messages** there.")
+            update_suggestion(suggestion_id, status="failed")
+            break
+        except Exception as error:
+            print(f"Could not post ranking suggestion: {error}")
+
+    return problems[0] if problems else None
+
+
+def restore_suggestion_buttons():
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("SELECT id FROM ranking_suggestions WHERE status = 'pending'")
+    rows = cursor.fetchall()
+    db.close()
+
+    for row in rows:
+        try:
+            bot.add_view(SuggestionView(row["id"]))
+        except Exception as error:
+            print(f"Could not restore suggestion {row['id']}: {error}")
+
+
+# ============================================================
+# MAIN CARD VOTING
+#
+# /mainvote posts the main card fights with a button for each
+# fighter. Anyone can pick who they think will win each fight, and
+# change their picks until the deadline. At the deadline voting
+# closes by itself and shows how everyone voted. When results are
+# logged with /result, correct picks are counted for the voting
+# leaderboard.
+# ============================================================
+
+VOTE_BANNER = "vote.gif"
+VOTE_CLOSED_BANNER = "vote_closed.gif"
+LEADERBOARD_BANNER = "leaderboard.gif"
+MAX_VOTE_FIGHTS = 5  # Discord allows 5 rows of buttons
+
+
+def setup_vote_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vote_polls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            deadline INTEGER NOT NULL,
+            channel_id INTEGER,
+            message_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vote_bouts (
+            poll_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            fighter_a INTEGER NOT NULL,
+            fighter_b INTEGER NOT NULL,
+            name_a TEXT NOT NULL,
+            name_b TEXT NOT NULL,
+            winner_id INTEGER,
+            result_fight_id INTEGER,
+            resolved INTEGER NOT NULL DEFAULT 0,
+
+            PRIMARY KEY(poll_id, position)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS votes (
+            poll_id INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            pick INTEGER NOT NULL,
+            voted_at TEXT NOT NULL,
+
+            PRIMARY KEY(poll_id, position, user_id)
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def vote_query(
+    sql: str,
+    params: tuple = (),
+    one: bool = False,
+    write: bool = False
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(sql, params)
+
+    if write:
+        db.commit()
+        result = cursor.lastrowid
+    else:
+        result = cursor.fetchone() if one else cursor.fetchall()
+
+    db.close()
+
+    return result
+
+
+def get_poll(poll_id: int):
+    return vote_query("SELECT * FROM vote_polls WHERE id = ?", (poll_id,), one=True)
+
+
+def get_poll_bouts(poll_id: int):
+    return vote_query(
+        "SELECT * FROM vote_bouts WHERE poll_id = ? ORDER BY position", (poll_id,)
+    )
+
+
+def vote_counts(poll_id: int):
+    """{position: {fighter_id: count}}"""
+
+    counts = {}
+
+    for row in vote_query(
+        "SELECT position, pick, COUNT(*) AS n FROM votes WHERE poll_id = ? GROUP BY position, pick",
+        (poll_id,)
+    ):
+        counts.setdefault(row["position"], {})[row["pick"]] = row["n"]
+
+    return counts
+
+
+def poll_is_open(poll):
+    return poll and poll["status"] == "open" and time.time() < poll["deadline"]
+
+
+def create_vote_embed(
+    poll
+):
+
+    bouts = get_poll_bouts(poll["id"])
+    is_open = poll_is_open(poll)
+    counts = vote_counts(poll["id"])
+    voters = vote_query(
+        "SELECT COUNT(DISTINCT user_id) AS n FROM votes WHERE poll_id = ?", (poll["id"],), one=True
+    )["n"]
+
+    lines = []
+
+    if is_open:
+        lines += [
+            "**Pick the winner of each main card fight.**",
+            f"Voting closes **<t:{poll['deadline']}:F>** (<t:{poll['deadline']}:R>).",
+            "You can change your picks until then.",
+            "",
+        ]
+    else:
+        lines += [
+            "🔒 **Voting has closed.**",
+            "",
+        ]
+
+    for bout in bouts:
+
+        a, b = bout["fighter_a"], bout["fighter_b"]
+        number = f"`{bout['position']}`"
+
+        if is_open:
+            lines.append(f"{number} **{bout['name_a']}**  vs  **{bout['name_b']}**")
+            continue
+
+        split = counts.get(bout["position"], {})
+        total = sum(split.values())
+        pa = round(100 * split.get(a, 0) / total) if total else 0
+        pb = 100 - pa if total else 0
+
+        mark_a = mark_b = ""
+
+        if bout["resolved"] and bout["winner_id"]:
+            mark_a = " ✅" if bout["winner_id"] == a else ""
+            mark_b = " ✅" if bout["winner_id"] == b else ""
+        elif bout["resolved"]:
+            mark_a = mark_b = " 🤝"
+
+        lines.append(
+            f"{number} **{bout['name_a']}**{mark_a} {pa}%  ·  {pb}% **{bout['name_b']}**{mark_b}"
+            f"  ({total} vote{'s' if total != 1 else ''})"
+        )
+
+    lines += ["", f"👥 **{voters}** {'person has' if voters == 1 else 'people have'} voted"]
+
+    embed = discord.Embed(
+        title=poll["event"],
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=VOTE_BANNER if is_open else VOTE_CLOSED_BANNER,
+        author_text="PFO • MAIN CARD VOTE"
+    )
+
+    embed.set_footer(
+        text="Correct picks count towards the /leaderboard",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+class VoteView(
+    discord.ui.View
+):
+    """A button for each fighter. Works after restarts."""
+
+    def __init__(
+        self,
+        poll_id: int
+    ):
+
+        super().__init__(
+            timeout=None
+        )
+
+        self.poll_id = poll_id
+
+        for bout in get_poll_bouts(poll_id):
+            for side, name in (("a", bout["name_a"]), ("b", bout["name_b"])):
+                button = discord.ui.Button(
+                    label=name[:80],
+                    style=discord.ButtonStyle.blurple if side == "a" else discord.ButtonStyle.red,
+                    custom_id=f"pfo_vote_{poll_id}_{bout['position']}_{side}",
+                    row=bout["position"] - 1
+                )
+                button.callback = self.make_callback(bout["position"], side)
+                self.add_item(button)
+
+    def make_callback(self, position: int, side: str):
+
+        async def callback(interaction: discord.Interaction):
+            await self.vote(interaction, position, side)
+
+        return callback
+
+    async def vote(self, interaction, position: int, side: str):
+
+        poll = get_poll(self.poll_id)
+
+        if not poll_is_open(poll):
+            await interaction.response.send_message(
+                "🔒 Voting for this card has closed.",
+                ephemeral=True
+            )
+            return
+
+        bout = vote_query(
+            "SELECT * FROM vote_bouts WHERE poll_id = ? AND position = ?",
+            (self.poll_id, position), one=True
+        )
+
+        pick, other = (
+            (bout["fighter_a"], bout["name_b"]) if side == "a"
+            else (bout["fighter_b"], bout["name_a"])
+        )
+        pick_name = bout["name_a"] if side == "a" else bout["name_b"]
+
+        previous = vote_query(
+            "SELECT pick FROM votes WHERE poll_id = ? AND position = ? AND user_id = ?",
+            (self.poll_id, position, interaction.user.id), one=True
+        )
+
+        vote_query(
+            "INSERT OR REPLACE INTO votes (poll_id, position, user_id, pick, voted_at) VALUES (?, ?, ?, ?, ?)",
+            (self.poll_id, position, interaction.user.id, pick, now_utc()), write=True
+        )
+
+        changed = previous and previous["pick"] != pick
+
+        await interaction.response.send_message(
+            f"{'🔄 Changed: you' if changed else '✅ You'} picked **{pick_name}** to beat **{other}**.\n"
+            f"You can change it until <t:{poll['deadline']}:t>.",
+            ephemeral=True
+        )
+
+
+async def refresh_vote_message(
+    poll_id: int
+):
+
+    poll = get_poll(poll_id)
+
+    if not poll or not poll["message_id"]:
+        return
+
+    try:
+        channel = bot.get_channel(poll["channel_id"]) or await bot.fetch_channel(poll["channel_id"])
+        message = await channel.fetch_message(poll["message_id"])
+
+        if poll_is_open(poll):
+            await message.edit(embed=create_vote_embed(poll), view=VoteView(poll_id))
+        else:
+            await message.edit(embed=create_vote_embed(poll), view=None)
+
+    except Exception as error:
+        print(f"Could not refresh vote {poll_id}: {error}")
+
+
+def resolve_votes_for_fight(
+    guild_id: int,
+    fight
+):
+    """Marks main card vote fights decided by this result. Returns poll ids."""
+
+    if not fight or not fight["winner_id"] or not fight["loser_id"]:
+        return []
+
+    pair = {fight["winner_id"], fight["loser_id"]}
+    changed = []
+
+    for bout in vote_query("""
+        SELECT vote_bouts.* FROM vote_bouts
+        JOIN vote_polls ON vote_polls.id = vote_bouts.poll_id
+        WHERE vote_polls.guild_id = ? AND vote_bouts.resolved = 0
+    """, (guild_id,)):
+
+        if {bout["fighter_a"], bout["fighter_b"]} != pair:
+            continue
+
+        winner = None if fight["method"] in ("DRAW", "NC") else fight["winner_id"]
+
+        vote_query(
+            "UPDATE vote_bouts SET resolved = 1, winner_id = ?, result_fight_id = ? "
+            "WHERE poll_id = ? AND position = ?",
+            (winner, fight["id"], bout["poll_id"], bout["position"]), write=True
+        )
+
+        changed.append(bout["poll_id"])
+
+    return changed
+
+
+def unresolve_votes_for_fight(
+    fight_id: int
+):
+
+    rows = vote_query(
+        "SELECT DISTINCT poll_id FROM vote_bouts WHERE result_fight_id = ?", (fight_id,)
+    )
+
+    vote_query(
+        "UPDATE vote_bouts SET resolved = 0, winner_id = NULL, result_fight_id = NULL "
+        "WHERE result_fight_id = ?",
+        (fight_id,), write=True
+    )
+
+    return [row["poll_id"] for row in rows]
+
+
+async def close_due_polls():
+
+    now = int(time.time())
+
+    for poll in vote_query(
+        "SELECT * FROM vote_polls WHERE status = 'open' AND deadline <= ?", (now,)
+    ):
+        vote_query("UPDATE vote_polls SET status = 'closed' WHERE id = ?", (poll["id"],), write=True)
+        await refresh_vote_message(poll["id"])
+
+
+@tasks.loop(minutes=1)
+async def vote_closer():
+    try:
+        await close_due_polls()
+    except Exception as error:
+        print(f"Vote closer error: {error}")
+
+    # Suspensions ending.
+    await run_discipline_checks()
+
+
+@vote_closer.before_loop
+async def before_vote_closer():
+    await bot.wait_until_ready()
+
+
+def restore_vote_buttons():
+
+    for poll in vote_query("SELECT id FROM vote_polls WHERE status = 'open'"):
+        try:
+            bot.add_view(VoteView(poll["id"]))
+        except Exception as error:
+            print(f"Could not restore vote {poll['id']}: {error}")
+
+
+@bot.tree.command(
+    name="mainvote",
+    description="Post a vote where everyone picks the winners of the main card fights."
+)
+@app_commands.describe(
+    event="Event name, e.g. PFO Fight Night 16",
+    deadline="When voting closes, in UK time, e.g. 24/10/2026 19:00",
+    fighters="Main card in fight order: @Joe @Dan @Tom @Ben (max 5 fights). Empty = last saved card"
+)
+async def mainvote(
+    interaction: discord.Interaction,
+    event: str,
+    deadline: str,
+    fighters: str = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can start votes.",
+            ephemeral=True
+        )
+        return
+
+    moment = parse_event_datetime(deadline)
+
+    if not moment:
+        await interaction.response.send_message(
+            "❌ Write the deadline like **24/10/2026 19:00** or **24/10 7pm** (UK time).",
+            ephemeral=True
+        )
+        return
+
+    if moment <= datetime.now(timezone.utc):
+        await interaction.response.send_message(
+            "❌ That deadline has already passed.",
+            ephemeral=True
+        )
+        return
+
+    if fighters and MENTION_PATTERN.search(fighters):
+        pairs = parse_fight_pairs(fighters)
+    else:
+        card = get_latest_fight_card(interaction.guild.id)
+        pairs = [
+            (bout["fighter_a"], bout["fighter_b"])
+            for bout in get_fight_card_bouts(card["id"])
+        ] if card else []
+
+        if not pairs:
+            await interaction.response.send_message(
+                "❌ @mention the main card in fight order, e.g. `@Joe @Dan @Tom @Ben`, "
+                "or save a card with `/createfights` first.",
+                ephemeral=True
+            )
+            return
+
+    if pairs[-1][1] is None:
+        await interaction.response.send_message(
+            f"❌ Odd number of fighters: <@{pairs[-1][0]}> has no opponent.",
+            ephemeral=True
+        )
+        return
+
+    if len(pairs) > MAX_VOTE_FIGHTS:
+        await interaction.response.send_message(
+            f"❌ That's {len(pairs)} fights. Votes can have up to {MAX_VOTE_FIGHTS} "
+            "(the main card). @mention just the main card fights in **fighters**.",
+            ephemeral=True
+        )
+        return
+
+    def name(user_id):
+        member = interaction.guild.get_member(user_id)
+        return name_without_record(member.display_name) if member else f"User {user_id}"
+
+    poll_id = vote_query(
+        "INSERT INTO vote_polls (guild_id, event, deadline, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+        (interaction.guild.id, event.strip(), int(moment.timestamp()), interaction.user.id, now_utc()),
+        write=True
+    )
+
+    for position, (a, b) in enumerate(pairs, start=1):
+        vote_query(
+            "INSERT INTO vote_bouts (poll_id, position, fighter_a, fighter_b, name_a, name_b) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (poll_id, position, a, b, name(a), name(b)), write=True
+        )
+
+    await interaction.response.send_message(
+        embed=create_vote_embed(get_poll(poll_id)),
+        view=VoteView(poll_id)
+    )
+
+    message = await interaction.original_response()
+
+    vote_query(
+        "UPDATE vote_polls SET channel_id = ?, message_id = ? WHERE id = ?",
+        (message.channel.id, message.id, poll_id), write=True
+    )
+
+
+# ============================================================
+# LEADERBOARDS
+# ============================================================
+
+LEADERBOARD_CHOICES = [
+    app_commands.Choice(name="Most wins", value="wins"),
+    app_commands.Choice(name="Current win streak", value="streak"),
+    app_commands.Choice(name="KO/TKO wins", value="ko"),
+    app_commands.Choice(name="Submission wins", value="sub"),
+    app_commands.Choice(name="Finish rate", value="finish"),
+    app_commands.Choice(name="Title fight wins", value="titles"),
+    app_commands.Choice(name="Voting: correct picks", value="votes"),
+    app_commands.Choice(name="Suspended fighters (countdown)", value="suspended"),
+]
+
+LEADERBOARD_TITLES = {
+    "wins": "🏆 Most Wins",
+    "streak": "🔥 Current Win Streak",
+    "ko": "💥 KO/TKO Wins",
+    "sub": "🔒 Submission Wins",
+    "finish": "⚡ Finish Rate",
+    "titles": "👑 Title Fight Wins",
+    "votes": "🗳️ Voting: Correct Picks",
+    "suspended": "⛔ Suspended Fighters",
+}
+
+
+def fighter_leaderboard(
+    guild: discord.Guild,
+    category: str
+):
+    """[(member, value, display_text)] best first."""
+
+    rows = []
+
+    for member in guild.members:
+
+        if member.bot or not has_record_data(guild.id, member.id):
+            continue
+
+        stats = get_fighter_stats(guild.id, member.id)
+
+        if category == "wins":
+            value = stats["wins"]
+            text = f"{value} win{'s' if value != 1 else ''} ({stats_record(stats)})"
+        elif category == "streak":
+            streak = stats["streak"]
+            if not streak.startswith("W"):
+                continue
+            value = int(streak[1:])
+            text = f"{value} win{'s' if value != 1 else ''} in a row"
+        elif category == "ko":
+            value = stats["wins_by"].get("KO/TKO", 0)
+            text = f"{value} KO/TKO win{'s' if value != 1 else ''}"
+        elif category == "sub":
+            value = stats["wins_by"].get("SUB", 0)
+            text = f"{value} submission win{'s' if value != 1 else ''}"
+        elif category == "finish":
+            if stats["logged_wins"] < 3 or stats["finish_rate"] is None:
+                continue
+            value = stats["finish_rate"]
+            text = f"{value}% of {stats['logged_wins']} wins"
+        else:
+            value = stats["title_wins"]
+            text = f"{value} title fight win{'s' if value != 1 else ''}"
+
+        if value <= 0:
+            continue
+
+        rows.append((member, value, stats["wins"], text))
+
+    rows.sort(key=lambda row: (row[1], row[2]), reverse=True)
+
+    return [(member, value, text) for member, value, _, text in rows]
+
+
+def voting_leaderboard(
+    guild: discord.Guild
+):
+
+    rows = []
+
+    for row in vote_query("""
+        SELECT votes.user_id,
+               SUM(CASE WHEN votes.pick = vote_bouts.winner_id THEN 1 ELSE 0 END) AS correct,
+               COUNT(*) AS total
+        FROM votes
+        JOIN vote_bouts ON vote_bouts.poll_id = votes.poll_id
+                       AND vote_bouts.position = votes.position
+        JOIN vote_polls ON vote_polls.id = votes.poll_id
+        WHERE vote_polls.guild_id = ?
+          AND vote_bouts.resolved = 1
+          AND vote_bouts.winner_id IS NOT NULL
+        GROUP BY votes.user_id
+    """, (guild.id,)):
+
+        member = guild.get_member(row["user_id"])
+
+        if not member or not row["correct"]:
+            continue
+
+        accuracy = round(100 * row["correct"] / row["total"])
+        rows.append((member, row["correct"], accuracy,
+                     f"{row['correct']} correct of {row['total']} ({accuracy}%)"))
+
+    rows.sort(key=lambda row: (row[1], row[2]), reverse=True)
+
+    return [(member, value, text) for member, value, _, text in rows]
+
+
+@bot.tree.command(
+    name="leaderboard",
+    description="Post a top 10 leaderboard for fights or voting."
+)
+@app_commands.describe(
+    category="What to rank by"
+)
+@app_commands.choices(
+    category=LEADERBOARD_CHOICES
+)
+async def leaderboard(
+    interaction: discord.Interaction,
+    category: app_commands.Choice[str]
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can post leaderboards.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+
+    if category.value == "suspended":
+
+        lines = suspended_board_lines(interaction.guild) or ["✅ Nobody is suspended right now."]
+
+        embed = discord.Embed(
+            title=LEADERBOARD_TITLES["suspended"],
+            description="\n".join(lines)[:4000],
+            color=PFO_GOLD,
+            timestamp=discord.utils.utcnow()
+        )
+
+        apply_branding(
+            embed,
+            banner_file=SUSPENDED_BANNER,
+            author_text="PFO • SUSPENSIONS"
+        )
+
+        embed.set_footer(
+            text=f"{MAX_WARNINGS} missed fights = {SUSPENSION_DAYS}-day suspension • countdowns update live",
+            icon_url=asset_url(LOGO_FILE)
+        )
+
+        await interaction.followup.send(embed=embed)
+        return
+
+    if category.value == "votes":
+        rows = voting_leaderboard(interaction.guild)
+    else:
+        rows = fighter_leaderboard(interaction.guild, category.value)
+
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = []
+    place = 0
+    previous = None
+
+    for index, (member, value, text) in enumerate(rows[:10], start=1):
+        if value != previous:
+            place = index
+            previous = value
+        badge = medals.get(place, f"`{place:>2}.`")
+        lines.append(f"{badge} **{name_without_record(member.display_name)}**  ·  {text}")
+
+    if not lines:
+        lines = ["Nobody on this leaderboard yet."]
+
+    embed = discord.Embed(
+        title=LEADERBOARD_TITLES[category.value],
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=LEADERBOARD_BANNER,
+        author_text="PFO • LEADERBOARD"
+    )
+
+    footers = {
+        "finish": "Finish rate = KO/TKO + submission wins • minimum 3 logged wins",
+        "votes": "Correct picks from /mainvote once results are logged",
+    }
+
+    embed.set_footer(
+        text=footers.get(category.value, "From the bot's fight records (same as /profile)"),
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    await interaction.followup.send(embed=embed)
 
 
 # ------------------------------------------------------------
@@ -6203,15 +8466,17 @@ class ImportConfirmView(
         db = get_db()
         cursor = db.cursor()
 
+        new_ids = []
+
         try:
             for fight in self.fights:
-                add_fight(
+                new_ids.append(add_fight(
                     self.guild_id,
                     fight,
                     "import",
                     self.author_id,
                     cursor=cursor
-                )
+                ))
 
             db.commit()
 
@@ -6232,6 +8497,14 @@ class ImportConfirmView(
 
         db.close()
 
+        # Imported results also settle any main card votes.
+        polls_changed = set()
+
+        for fight_id in new_ids:
+            polls_changed.update(
+                resolve_votes_for_fight(self.guild_id, get_fight(self.guild_id, fight_id))
+            )
+
         fighters = {
             f["winner_id"] or normalise_name(f["winner_name"]) for f in self.fights
         } | {
@@ -6249,6 +8522,9 @@ class ImportConfirmView(
             embed=None,
             view=None
         )
+
+        for poll_id in polls_changed:
+            await refresh_vote_message(poll_id)
 
     async def cancel(
         self,
@@ -7294,21 +9570,52 @@ class CardInputError(Exception):
     pass
 
 
+def parse_fight_pairs(
+    text: str
+):
+    """
+    "@joe @dan @tom @ben" -> [(joe, dan), (tom, ben)]
+    Consecutive @mentions are opponents. An odd one out gets None.
+    """
+
+    ids = [int(found) for found in MENTION_PATTERN.findall(text or "")]
+
+    return [
+        (ids[index], ids[index + 1] if index + 1 < len(ids) else None)
+        for index in range(0, len(ids), 2)
+    ]
+
+
 async def collect_card(
     guild: discord.Guild,
     fighters_text: str
 ):
     """
-    Everyone @mentioned, in the order typed, without repeats.
-    Returns a list of (user_id, name, member or None).
+    Everyone @mentioned, in the order typed. Each pair of mentions
+    are opponents.
+
+    Returns a list of (user_id, name, member or None, opponent_id).
     """
 
-    order = []
+    if not MENTION_PATTERN.search(fighters_text or ""):
+        raise CardInputError(
+            "@mention everyone on the card in **fighters** in fight order, "
+            "e.g. `@Joe @Dan @Tom @Ben` (Joe vs Dan, Tom vs Ben)."
+        )
 
-    for found in MENTION_PATTERN.findall(fighters_text or ""):
-        user_id = int(found)
-        if user_id not in order:
-            order.append(user_id)
+    pairs = parse_fight_pairs(fighters_text)
+
+    order = []
+    opponents = {}
+
+    for a, b in pairs:
+        for me, them in ((a, b), (b, a)):
+            if me is None:
+                continue
+            if me not in order:
+                order.append(me)
+            if them is not None and them != me:
+                opponents.setdefault(me, them)
 
     fighters = []
 
@@ -7321,12 +9628,12 @@ async def collect_card(
 
         name = member.display_name if member else await departed_name(user_id)
 
-        fighters.append((user_id, name, member))
+        fighters.append((user_id, name, member, opponents.get(user_id)))
 
     if not fighters:
         raise CardInputError(
             "I didn't find anyone. @mention everyone on the card in "
-            "**fighters**, e.g. `@Razor @Dima @Jordan ...`"
+            "**fighters**, e.g. `@Joe @Dan @Tom @Ben`"
         )
 
     if len(fighters) > MAX_CARD_FIGHTERS:
@@ -7345,7 +9652,8 @@ def create_selection_dm_embed(
     kind: str,
     event: str = None,
     event_date: str = None,
-    deadline: str = None
+    deadline: str = None,
+    opponent_text: str = None
 ):
 
     if kind == "fight_night":
@@ -7376,6 +9684,13 @@ def create_selection_dm_embed(
         banner_file=banner,
         author_text=author
     )
+
+    if opponent_text:
+        embed.add_field(
+            name="🆚 Your Opponent",
+            value=opponent_text,
+            inline=False
+        )
 
     embed.set_footer(
         text="Prestige Fighting Organisation",
@@ -7502,10 +9817,23 @@ def create_checkin_board_embed(
             icon = "⏳"
         return f"{icon} <@{row['user_id']}>"
 
-    lines = [
-        f"`{number:>2}` {fighter_text(row)}"
-        for number, row in enumerate(fighters, start=1)
-    ]
+    by_id = {row["user_id"]: row for row in fighters}
+    lines = []
+    shown = set()
+
+    for row in fighters:
+
+        if row["user_id"] in shown:
+            continue
+
+        shown.add(row["user_id"])
+        opponent = by_id.get(row["opponent_id"])
+
+        if opponent and opponent["user_id"] not in shown:
+            shown.add(opponent["user_id"])
+            lines.append(f"`{len(lines) + 1:>2}` {fighter_text(row)}  vs  {fighter_text(opponent)}")
+        else:
+            lines.append(f"`{len(lines) + 1:>2}` {fighter_text(row)}")
 
     header = []
 
@@ -7652,7 +9980,7 @@ class SendDMsView(
             self.guild.id,
             self.kind,
             self.author_id,
-            [(user_id, name, None) for user_id, name, _ in self.fighters],
+            [(user_id, name, opponent_id) for user_id, name, _, opponent_id in self.fighters],
             event=self.event,
             event_date=self.event_date,
             deadline=self.deadline
@@ -7661,7 +9989,9 @@ class SendDMsView(
         sent = []
         failed = []
 
-        for index, (user_id, name, member) in enumerate(self.fighters):
+        names = {user_id: name for user_id, name, _, _ in self.fighters}
+
+        for index, (user_id, name, member, opponent_id) in enumerate(self.fighters):
 
             if index:
                 await asyncio.sleep(DM_DELAY_SECONDS)
@@ -7671,8 +10001,17 @@ class SendDMsView(
                 update_card_fighter(notice_id, user_id, dm_status="failed")
                 continue
 
+            if opponent_id:
+                opponent_text = (
+                    f"**{name_without_record(names.get(opponent_id, 'Your opponent'))}** "
+                    f"(<@{opponent_id}>)"
+                )
+            else:
+                opponent_text = None
+
             embed = create_selection_dm_embed(
                 self.kind,
+                opponent_text=opponent_text,
                 event=self.event,
                 event_date=self.event_date,
                 deadline=self.deadline
@@ -7730,12 +10069,27 @@ def create_dm_preview_embed(
 ):
 
     lines = []
+    shown = set()
+    number = 0
+    by_id = {user_id: (name, member, opponent_id) for user_id, name, member, opponent_id in fighters}
 
-    for user_id, name, member in fighters[:60]:
-        line = f"• <@{user_id}>"
-        if member is None:
-            line += " ⚠️ not in server"
-        lines.append(line)
+    def tag(user_id):
+        member = by_id.get(user_id, (None, None, None))[1]
+        return f"<@{user_id}>" + ("" if member else " ⚠️ not in server")
+
+    for user_id, name, member, opponent_id in fighters:
+
+        if user_id in shown:
+            continue
+
+        number += 1
+        shown.add(user_id)
+
+        if opponent_id and opponent_id in by_id and opponent_id not in shown:
+            shown.add(opponent_id)
+            lines.append(f"`{number:>2}` {tag(user_id)}  vs  {tag(opponent_id)}")
+        else:
+            lines.append(f"`{number:>2}` {tag(user_id)}  ⚠️ no opponent (odd number of fighters)")
 
     if kind == "fight_night":
         details = f"**Deadline:** {format_saved_time(deadline)}"
@@ -7824,13 +10178,13 @@ async def start_card_dms(
     description="DM everyone you @mention that they've been selected for a Fight Night."
 )
 @app_commands.describe(
-    fighters="@mention everyone on the card, e.g. @Razor @Dima @Jordan ...",
-    deadline="Deadline in UK time, e.g. 19/10/2026 22:00 (or any text, e.g. Sunday night)"
+    deadline="Deadline in UK time, e.g. 19/10/2026 22:00 (or any text, e.g. Sunday night)",
+    fighters="@mention in fight order: @Joe @Dan @Tom @Ben = Joe v Dan, Tom v Ben"
 )
 async def dmfightnight(
     interaction: discord.Interaction,
-    fighters: str,
-    deadline: str
+    deadline: str,
+    fighters: str
 ):
 
     moment = parse_event_datetime(deadline)
@@ -7848,15 +10202,15 @@ async def dmfightnight(
     description="DM everyone you @mention for a Live Card, with a button to check in."
 )
 @app_commands.describe(
-    fighters="@mention everyone on the card, e.g. @Razor @Dima @Jordan ...",
     event="Event name, e.g. PFO Live Card 6",
-    date="Date and time in UK time, e.g. 24/10/2026 20:00 or 24/10 8pm"
+    date="Date and time in UK time, e.g. 24/10/2026 20:00 or 24/10 8pm",
+    fighters="@mention in fight order: @Joe @Dan @Tom @Ben = Joe v Dan, Tom v Ben"
 )
 async def dmlivecard(
     interaction: discord.Interaction,
-    fighters: str,
     event: str,
-    date: str
+    date: str,
+    fighters: str
 ):
 
     moment = parse_event_datetime(date)
@@ -8130,14 +10484,1526 @@ async def sync_commands_if_changed():
         )
 
 
+# ============================================================
+# WARNINGS, SUSPENSIONS AND INACTIVITY
+#
+# /warn         warn a fighter for missing a booked fight (DM optional)
+#               2 warnings = suspended from events for a week
+# /warnings     see someone's warnings, or everyone with warnings
+# /removewarning  take the latest warning back off
+# /unsuspend    end a suspension early
+# /inactive     fighters (record in their name) missing sign-ups
+#
+# Suspended fighters can't sign up. Suspensions end by themselves
+# and a note is posted in the staff bot channel.
+# When a sign-up is closed, everyone with a record in their name
+# who didn't sign up is flagged in the same channel
+# (INACTIVE_REPORT=off in Railway turns that off).
+# ============================================================
+
+WARNING_BANNER = "warning.gif"
+SUSPENDED_BANNER = "suspended.gif"
+INACTIVE_BANNER = "inactive.gif"
+
+MAX_WARNINGS = 2
+SUSPENSION_DAYS = int(os.getenv("SUSPENSION_DAYS", "7"))
+INACTIVE_REPORT = os.getenv("INACTIVE_REPORT", "on").strip().lower() not in ("off", "no", "false", "0")
+
+WARNING_DM_INTRO = (
+    "You have been warned for missing your fight in PFO, in the future "
+    "please let us know why and this can be avoided."
+)
+
+
+def setup_discipline_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS warnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            reason TEXT,
+            warned_by INTEGER,
+            created_at INTEGER NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS suspensions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            starts_at INTEGER NOT NULL,
+            ends_at INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_by INTEGER
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def discipline_query(
+    sql: str,
+    params: tuple = (),
+    write: bool = False
+):
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute(sql, params)
+
+    if write:
+        db.commit()
+        result = cursor.lastrowid
+    else:
+        result = cursor.fetchall()
+
+    db.close()
+
+    return result
+
+
+def active_warnings(
+    guild_id: int,
+    user_id: int
+):
+
+    return discipline_query("""
+        SELECT * FROM warnings
+        WHERE guild_id = ? AND user_id = ? AND active = 1
+        ORDER BY id ASC
+    """, (guild_id, user_id))
+
+
+def get_active_suspension(
+    guild_id: int,
+    user_id: int
+):
+
+    rows = discipline_query("""
+        SELECT * FROM suspensions
+        WHERE guild_id = ? AND user_id = ? AND status = 'active'
+        ORDER BY ends_at DESC LIMIT 1
+    """, (guild_id, user_id))
+
+    return rows[0] if rows else None
+
+
+def all_active_suspensions(
+    guild_id: int
+):
+
+    return discipline_query("""
+        SELECT * FROM suspensions
+        WHERE guild_id = ? AND status = 'active'
+        ORDER BY ends_at ASC
+    """, (guild_id,))
+
+
+def clear_warnings(
+    guild_id: int,
+    user_id: int
+):
+
+    discipline_query(
+        "UPDATE warnings SET active = 0 WHERE guild_id = ? AND user_id = ? AND active = 1",
+        (guild_id, user_id),
+        write=True
+    )
+
+
+def time_tag(
+    unix: int
+):
+    """Full date in everyone's own timezone, plus a live countdown."""
+
+    return f"<t:{unix}:f> (<t:{unix}:R>)"
+
+
+def is_member_fighter(
+    member
+):
+
+    return has_any_role(member, FIGHTER_ROLE_NAMES)
+
+
+def suspension_signup_text(
+    suspension
+):
+
+    return (
+        "⛔ **You're suspended from PFO events** after missing "
+        f"{MAX_WARNINGS} booked fights, so you can't sign up right now.\n\n"
+        f"Your suspension ends {time_tag(suspension['ends_at'])}."
+    )
+
+
+def create_warning_dm_embed(
+    count: int,
+    ends_at: int = None,
+    reason: str = None
+):
+
+    lines = [WARNING_DM_INTRO, ""]
+
+    if count >= MAX_WARNINGS:
+        lines += [
+            f"You currently have **{count}/{MAX_WARNINGS}** warnings. Your fighter will now "
+            "be removed and you will be suspended for one week from events.",
+            "",
+            f"⛔ **Suspended until:** {time_tag(ends_at)}",
+        ]
+    else:
+        lines.append(
+            f"You currently have **{count}/{MAX_WARNINGS}** warnings. You have one more "
+            "chance at showing for the next event you sign up for."
+        )
+
+    embed = discord.Embed(
+        title="⛔ You have been suspended" if count >= MAX_WARNINGS else "⚠️ You have been warned",
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    if reason:
+        embed.add_field(name="📝 Note from staff", value=reason[:1000], inline=False)
+
+    apply_branding(
+        embed,
+        banner_file=SUSPENDED_BANNER if count >= MAX_WARNINGS else WARNING_BANNER,
+        author_text="PFO • SUSPENSION" if count >= MAX_WARNINGS else "PFO • WARNING"
+    )
+
+    embed.set_footer(
+        text="Prestige Fighting Organisation",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+async def post_staff_log(
+    guild: discord.Guild,
+    embed: discord.Embed
+):
+    """Posts in the staff bot channel (same one as ranking suggestions)."""
+
+    channel = find_suggestions_channel(guild)
+
+    if not channel:
+        return False
+
+    try:
+        await channel.send(embed=embed)
+        return True
+    except Exception as error:
+        print(f"Could not post staff log: {error}")
+        return False
+
+
+def staff_log_embed(
+    title: str,
+    lines: list,
+    banner: str = None
+):
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(
+        embed,
+        banner_file=banner,
+        author_text="PFO • DISCIPLINE"
+    )
+
+    return embed
+
+
+async def take_off_open_signups(
+    guild: discord.Guild,
+    user_id: int
+):
+    """Suspended fighters come off any sign-up list that's still open."""
+
+    removed_from = []
+
+    for signup_type in SIGNUP_INFO.keys():
+
+        session = get_active_session(guild.id, signup_type)
+
+        if session and remove_signup(session["id"], user_id):
+            removed_from.append(SIGNUP_INFO[signup_type]["title"])
+            await refresh_signup_message(guild, session, signup_type)
+
+    return removed_from
+
+
+class WarnConfirmView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        author_id: int,
+        member,
+        reason: str,
+        send_dm: bool
+    ):
+
+        super().__init__(
+            timeout=600
+        )
+
+        self.author_id = author_id
+        self.member = member
+        self.reason = reason
+        self.send_dm = send_dm
+
+        confirm = discord.ui.Button(label="Give warning", emoji="⚠️", style=discord.ButtonStyle.red)
+        confirm.callback = self.confirm
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey)
+        cancel.callback = self.cancel
+        self.add_item(confirm)
+        self.add_item(cancel)
+
+    async def interaction_check(self, interaction):
+
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Only the person who ran /warn can use these buttons.",
+                ephemeral=True
+            )
+            return False
+
+        return True
+
+    async def confirm(self, interaction):
+
+        self.stop()
+
+        guild = interaction.guild
+        member = self.member
+
+        await interaction.response.edit_message(
+            content="⏳ Giving the warning...",
+            embed=None,
+            view=None
+        )
+
+        if get_active_suspension(guild.id, member.id):
+            await interaction.edit_original_response(
+                content=f"❌ **{member.display_name}** is already suspended."
+            )
+            return
+
+        now = int(time.time())
+
+        discipline_query("""
+            INSERT INTO warnings (guild_id, user_id, reason, warned_by, created_at, active)
+            VALUES (?, ?, ?, ?, ?, 1)
+        """, (guild.id, member.id, self.reason, interaction.user.id, now), write=True)
+
+        count = len(active_warnings(guild.id, member.id))
+        name = name_without_record(member.display_name)
+        lines = [f"⚠️ **Warned {name}** ({count}/{MAX_WARNINGS})."]
+        log = [f"⚠️ **{name}** (<@{member.id}>) was warned by <@{interaction.user.id}>: **{count}/{MAX_WARNINGS}**."]
+
+        if self.reason:
+            log.append(f"📝 {self.reason}")
+
+        ends_at = None
+
+        if count >= MAX_WARNINGS:
+
+            ends_at = now + SUSPENSION_DAYS * 86400
+
+            discipline_query("""
+                INSERT INTO suspensions (guild_id, user_id, starts_at, ends_at, status, created_by)
+                VALUES (?, ?, ?, ?, 'active', ?)
+            """, (guild.id, member.id, now, ends_at, interaction.user.id), write=True)
+
+            lines.append(f"⛔ Suspended until {time_tag(ends_at)}. They can't sign up until then.")
+            log.append(f"⛔ Suspended until {time_tag(ends_at)}.")
+
+            removed_from = await take_off_open_signups(guild, member.id)
+
+            if removed_from:
+                lines.append(f"↩️ Taken off: {', '.join(removed_from)}.")
+
+        if self.send_dm:
+            try:
+                await member.send(embed=create_warning_dm_embed(count, ends_at, self.reason))
+                lines.append("📨 DM sent.")
+            except discord.Forbidden:
+                lines.append("📭 **DM not sent**: they have DMs closed. Let them know another way.")
+            except Exception as error:
+                print(f"Warning DM failed: {error}")
+                lines.append("📭 DM not sent (Discord error).")
+        else:
+            lines.append("🔕 No DM sent (you chose not to).")
+
+        await interaction.edit_original_response(content="\n".join(lines))
+
+        await post_staff_log(
+            guild,
+            staff_log_embed(
+                "⛔ Fighter suspended" if ends_at else "⚠️ Warning given",
+                log,
+                SUSPENDED_BANNER if ends_at else None
+            )
+        )
+
+    async def cancel(self, interaction):
+
+        self.stop()
+
+        await interaction.response.edit_message(
+            content="Cancelled. No warning was given.",
+            embed=None,
+            view=None
+        )
+
+
+YES_NO_CHOICES = [
+    app_commands.Choice(name="Yes", value="yes"),
+    app_commands.Choice(name="No", value="no"),
+]
+
+
+@bot.tree.command(
+    name="warn",
+    description="Warn a fighter for missing a booked fight. 2 warnings = suspended for a week."
+)
+@app_commands.describe(
+    member="Who missed their fight",
+    reason="Optional note (shown in their DM and the staff log)",
+    dm="DM them the warning? (default: yes)"
+)
+@app_commands.choices(
+    dm=YES_NO_CHOICES
+)
+async def warn(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    reason: str = None,
+    dm: app_commands.Choice[str] = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can give warnings.",
+            ephemeral=True
+        )
+        return
+
+    if member.bot:
+        await interaction.response.send_message("❌ Bots can't be warned.", ephemeral=True)
+        return
+
+    suspension = get_active_suspension(interaction.guild.id, member.id)
+
+    if suspension:
+        await interaction.response.send_message(
+            f"❌ **{member.display_name}** is already suspended until {time_tag(suspension['ends_at'])}.",
+            ephemeral=True
+        )
+        return
+
+    send_dm = not dm or dm.value == "yes"
+    count = len(active_warnings(interaction.guild.id, member.id)) + 1
+    reason = reason.strip()[:500] if reason and reason.strip() else None
+    preview_end = int(time.time()) + SUSPENSION_DAYS * 86400
+
+    lines = [
+        f"This will be warning **{count}/{MAX_WARNINGS}** for **{member.display_name}**."
+    ]
+
+    if count >= MAX_WARNINGS:
+        lines += [
+            "",
+            "**It will also:**",
+            f"⛔ suspend them for {SUSPENSION_DAYS} days (no sign-ups)",
+            "↩️ take them off any sign-up list that's still open",
+        ]
+
+    lines += [
+        "",
+        "📨 They'll get this DM:" if send_dm else "🔕 **No DM will be sent.** This is what it would have said:",
+    ]
+
+    await interaction.response.send_message(
+        content="\n".join(lines),
+        embed=create_warning_dm_embed(count, preview_end, reason),
+        view=WarnConfirmView(interaction.user.id, member, reason, send_dm),
+        ephemeral=True
+    )
+
+
+@bot.tree.command(
+    name="removewarning",
+    description="Take the most recent warning off a fighter."
+)
+@app_commands.describe(
+    member="Whose warning to remove"
+)
+async def removewarning(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can remove warnings.",
+            ephemeral=True
+        )
+        return
+
+    if get_active_suspension(interaction.guild.id, member.id):
+        await interaction.response.send_message(
+            f"❌ **{member.display_name}** is suspended. Use `/unsuspend` to end the "
+            "suspension (that also clears their warnings).",
+            ephemeral=True
+        )
+        return
+
+    warnings_now = active_warnings(interaction.guild.id, member.id)
+
+    if not warnings_now:
+        await interaction.response.send_message(
+            f"**{member.display_name}** has no warnings.",
+            ephemeral=True
+        )
+        return
+
+    discipline_query(
+        "UPDATE warnings SET active = 0 WHERE id = ?",
+        (warnings_now[-1]["id"],),
+        write=True
+    )
+
+    left = len(warnings_now) - 1
+
+    await interaction.response.send_message(
+        f"✅ Removed a warning from **{member.display_name}**. They now have "
+        f"**{left}/{MAX_WARNINGS}**.",
+        ephemeral=True
+    )
+
+    await post_staff_log(
+        interaction.guild,
+        staff_log_embed(
+            "↩️ Warning removed",
+            [f"<@{interaction.user.id}> removed a warning from <@{member.id}>: now **{left}/{MAX_WARNINGS}**."]
+        )
+    )
+
+
+@bot.tree.command(
+    name="unsuspend",
+    description="End a fighter's suspension early and clear their warnings."
+)
+@app_commands.describe(
+    member="Who to unsuspend"
+)
+async def unsuspend(
+    interaction: discord.Interaction,
+    member: discord.Member
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can end suspensions.",
+            ephemeral=True
+        )
+        return
+
+    suspension = get_active_suspension(interaction.guild.id, member.id)
+
+    if not suspension:
+        await interaction.response.send_message(
+            f"**{member.display_name}** isn't suspended.",
+            ephemeral=True
+        )
+        return
+
+    discipline_query(
+        "UPDATE suspensions SET status = 'lifted' WHERE id = ?",
+        (suspension["id"],),
+        write=True
+    )
+
+    clear_warnings(interaction.guild.id, member.id)
+
+    await interaction.response.send_message(
+        f"✅ **{member.display_name}** is no longer suspended and can sign up again. "
+        f"Warnings cleared (0/{MAX_WARNINGS}).",
+        ephemeral=True
+    )
+
+    await post_staff_log(
+        interaction.guild,
+        staff_log_embed(
+            "✅ Suspension ended early",
+            [f"<@{interaction.user.id}> ended <@{member.id}>'s suspension. Warnings cleared."]
+        )
+    )
+
+
+@bot.tree.command(
+    name="warnings",
+    description="See a fighter's warnings, or everyone who has warnings or is suspended."
+)
+@app_commands.describe(
+    member="Leave empty to see everyone with warnings"
+)
+async def warnings_command(
+    interaction: discord.Interaction,
+    member: discord.Member = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can see warnings.",
+            ephemeral=True
+        )
+        return
+
+    guild = interaction.guild
+
+    if member:
+
+        suspension = get_active_suspension(guild.id, member.id)
+        history = discipline_query(
+            "SELECT * FROM warnings WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT 15",
+            (guild.id, member.id)
+        )
+        active = len(active_warnings(guild.id, member.id))
+
+        lines = []
+
+        if suspension:
+            lines.append(f"⛔ **Suspended** until {time_tag(suspension['ends_at'])}")
+
+        lines.append(f"⚠️ **{active}/{MAX_WARNINGS}** warnings right now")
+        lines.append("")
+
+        if history:
+            lines.append("**History**")
+            for row in history:
+                status = "" if row["active"] else " *(cleared)*"
+                note = f": {row['reason']}" if row["reason"] else ""
+                lines.append(f"• <t:{row['created_at']}:d> by <@{row['warned_by']}>{note}{status}")
+        else:
+            lines.append("No warnings ever given.")
+
+        embed = discord.Embed(
+            title=member.display_name,
+            description="\n".join(lines)[:4000],
+            color=PFO_GOLD,
+            timestamp=discord.utils.utcnow()
+        )
+
+    else:
+
+        suspended = all_active_suspensions(guild.id)
+        suspended_ids = {row["user_id"] for row in suspended}
+        warned = discipline_query("""
+            SELECT user_id, COUNT(*) AS total FROM warnings
+            WHERE guild_id = ? AND active = 1
+            GROUP BY user_id ORDER BY total DESC
+        """, (guild.id,))
+
+        lines = []
+
+        if suspended:
+            lines.append(f"**⛔ Suspended ({len(suspended)})**")
+            for row in suspended:
+                lines.append(f"<@{row['user_id']}> · back <t:{row['ends_at']}:R>")
+            lines.append("")
+
+        on_warning = [row for row in warned if row["user_id"] not in suspended_ids]
+
+        if on_warning:
+            lines.append(f"**⚠️ On a warning ({len(on_warning)})**")
+            for row in on_warning:
+                lines.append(f"<@{row['user_id']}> · {row['total']}/{MAX_WARNINGS}")
+
+        if not lines:
+            lines = ["✅ Nobody has a warning or a suspension."]
+
+        embed = discord.Embed(
+            title="Warnings & Suspensions",
+            description="\n".join(lines)[:4000],
+            color=PFO_GOLD,
+            timestamp=discord.utils.utcnow()
+        )
+
+    apply_branding(embed, author_text="PFO • WARNINGS")
+
+    embed.set_footer(
+        text=f"{MAX_WARNINGS} warnings = {SUSPENSION_DAYS}-day suspension from events",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+def suspended_board_lines(
+    guild: discord.Guild
+):
+
+    lines = []
+
+    for row in all_active_suspensions(guild.id):
+        member = guild.get_member(row["user_id"])
+        name = name_without_record(member.display_name) if member else f"<@{row['user_id']}>"
+        lines.append(
+            f"⛔ **{name}**  ·  back <t:{row['ends_at']}:R>\n"
+            f"└ until <t:{row['ends_at']}:f>"
+        )
+
+    return lines
+
+
+# ------------------------------------------------------------
+# Inactivity
+#
+# Checks everyone with a record in their name, e.g. "Joe (3-1-0)".
+# Names with N/A in them are skipped. Each time a sign-up is
+# closed, anyone who didn't sign up is flagged in the staff bot
+# channel with their last fight and last sign-up, worst first
+# (most sign-ups missed in a row). /inactive shows the same any time.
+# ------------------------------------------------------------
+
+NA_IN_NAME = re.compile(r"n\s*/\s*a", re.IGNORECASE)
+
+
+def is_tracked_fighter(
+    member
+):
+    """Has a record in their name and isn't N/A."""
+
+    if getattr(member, "bot", False):
+        return False
+
+    name = member.display_name or ""
+
+    return bool(RECORD_IN_NAME.search(name)) and not NA_IN_NAME.search(name)
+
+
+def parse_stamp(
+    text: str
+):
+
+    try:
+        stamp = datetime.fromisoformat(text)
+        return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def activity_data(
+    guild_id: int
+):
+    """Closed sign-ups (oldest first), who signed up to what, and last fights."""
+
+    sessions = [
+        (row["id"], parse_stamp(row["created_at"]))
+        for row in discipline_query(
+            "SELECT id, created_at FROM signup_sessions WHERE guild_id = ? AND active = 0 ORDER BY id ASC",
+            (guild_id,)
+        )
+    ]
+
+    signed = {}
+    last_signup = {}
+
+    for row in discipline_query("""
+        SELECT signups.discord_user_id AS user_id, signups.session_id, signups.created_at
+        FROM signups
+        JOIN signup_sessions ON signup_sessions.id = signups.session_id
+        WHERE signup_sessions.guild_id = ?
+    """, (guild_id,)):
+        signed.setdefault(row["user_id"], set()).add(row["session_id"])
+        stamp = parse_stamp(row["created_at"])
+        if stamp and (row["user_id"] not in last_signup or stamp > last_signup[row["user_id"]]):
+            last_signup[row["user_id"]] = stamp
+
+    last_fight = {}
+
+    for row in discipline_query("""
+        SELECT user_id, MAX(day) AS last FROM (
+            SELECT winner_id AS user_id, COALESCE(fight_date, substr(created_at, 1, 10)) AS day
+            FROM fights WHERE guild_id = ? AND winner_id IS NOT NULL
+            UNION ALL
+            SELECT loser_id AS user_id, COALESCE(fight_date, substr(created_at, 1, 10)) AS day
+            FROM fights WHERE guild_id = ? AND loser_id IS NOT NULL
+        ) GROUP BY user_id
+    """, (guild_id, guild_id)):
+        try:
+            last_fight[row["user_id"]] = datetime.fromisoformat((row["last"] or "")[:10]).date()
+        except Exception:
+            pass
+
+    return sessions, signed, last_signup, last_fight
+
+
+def missed_in_a_row(
+    member,
+    sessions: list,
+    signed_ids: set
+):
+    """Closed sign-ups missed since their last one (only ones posted after they joined)."""
+
+    joined = getattr(member, "joined_at", None)
+    missed = 0
+
+    for session_id, created in reversed(sessions):
+
+        if session_id in signed_ids:
+            break
+
+        if joined and created and created < joined:
+            break
+
+        missed += 1
+
+    return missed
+
+
+def find_inactive_fighters(
+    guild: discord.Guild,
+    minimum_missed: int = 1,
+    only_session: int = None
+):
+    """
+    [(member, missed, last_fight, last_signup)] worst first.
+    only_session: just the people who didn't sign up for that one.
+    """
+
+    sessions, signed, last_signup, last_fight = activity_data(guild.id)
+    suspended = {row["user_id"] for row in all_active_suspensions(guild.id)}
+    found = []
+
+    for member in guild.members:
+
+        if not is_tracked_fighter(member) or member.id in suspended:
+            continue
+
+        signed_ids = signed.get(member.id, set())
+
+        if only_session is not None and only_session in signed_ids:
+            continue
+
+        missed = missed_in_a_row(member, sessions, signed_ids)
+
+        if missed < max(1, minimum_missed):
+            continue
+
+        signup_stamp = last_signup.get(member.id)
+        found.append((
+            member,
+            missed,
+            last_fight.get(member.id),
+            signup_stamp.date() if signup_stamp else None
+        ))
+
+    oldest = datetime.min.date()
+
+    # Most missed in a row first, then the longest since their last fight.
+    found.sort(key=lambda row: (-row[1], row[2] or oldest, row[3] or oldest))
+
+    return found
+
+
+def short_date(
+    day
+):
+
+    return f"{day.day} {day:%b %y}" if day else "never"
+
+
+def inactive_embeds(
+    guild: discord.Guild,
+    found: list,
+    header: str
+):
+
+    entries = []
+
+    for member, missed, last_fight, last_signup in found:
+        warns = len(active_warnings(guild.id, member.id))
+        warn_tag = f"  ·  ⚠️ {warns}/{MAX_WARNINGS}" if warns else ""
+        badge = "🔴" if missed >= 3 else "🟠" if missed == 2 else "🟡"
+        entries.append(
+            f"{badge} **{name_without_record(member.display_name)}**  ·  missed {missed}{warn_tag}\n"
+            f"└ 🥊 {short_date(last_fight)}  ·  📝 {short_date(last_signup)}"
+        )
+
+    pages = []
+    current = [header, ""]
+
+    for entry in entries:
+        if len("\n".join(current)) + len(entry) > 3800:
+            pages.append(current)
+            current = []
+        current.append(entry)
+
+    pages.append(current)
+    pages = pages[:10]
+
+    embeds = []
+
+    for index, page in enumerate(pages):
+
+        embed = discord.Embed(
+            title="Inactive Fighters" if index == 0 else None,
+            description="\n".join(page),
+            color=PFO_GOLD
+        )
+
+        if index == 0:
+            apply_branding(embed, banner_file=INACTIVE_BANNER, author_text="PFO • INACTIVITY")
+
+        if index == len(pages) - 1:
+            embed.timestamp = discord.utils.utcnow()
+            embed.set_footer(
+                text="Missed = sign-ups missed in a row (🔴 3+ 🟠 2 🟡 1) • 🥊 last fight • 📝 last sign-up",
+                icon_url=asset_url(LOGO_FILE)
+            )
+
+        embeds.append(embed)
+
+    return embeds
+
+
+class MentionsCopyView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        user_ids: list
+    ):
+
+        super().__init__(
+            timeout=900
+        )
+
+        self.user_ids = user_ids
+
+        copy = discord.ui.Button(label="Copy @mentions", emoji="📋", style=discord.ButtonStyle.blurple)
+        copy.callback = self.copy
+        self.add_item(copy)
+
+    async def copy(self, interaction):
+        await send_card_text(
+            interaction,
+            " ".join(f"<@{user_id}>" for user_id in self.user_ids)
+        )
+
+
+@bot.tree.command(
+    name="inactive",
+    description="Fighters (record in their name) who've been missing sign-ups, worst first."
+)
+@app_commands.describe(
+    missed="Only show people who missed at least this many sign-ups in a row (default 1)"
+)
+async def inactive(
+    interaction: discord.Interaction,
+    missed: app_commands.Range[int, 1, 50] = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can check inactivity.",
+            ephemeral=True
+        )
+        return
+
+    missed = missed or 1
+    found = find_inactive_fighters(interaction.guild, missed)
+
+    header = (
+        f"**{len(found)} fighter{'s' if len(found) != 1 else ''}** missed "
+        + ("the last sign-up" if missed == 1 else f"the last {missed}+ sign-ups")
+        + " (closed sign-ups only)."
+        if found else
+        "✅ Every fighter signed up to the last closed sign-up." if missed == 1 else
+        f"✅ Nobody has missed {missed}+ sign-ups in a row."
+    )
+
+    embeds = inactive_embeds(interaction.guild, found, header)
+
+    if found:
+        await interaction.response.send_message(
+            embeds=embeds,
+            view=MentionsCopyView([member.id for member, *_ in found]),
+            ephemeral=True
+        )
+    else:
+        await interaction.response.send_message(
+            embeds=embeds,
+            ephemeral=True
+        )
+
+
+async def report_missed_signup(
+    guild: discord.Guild,
+    session_id: int,
+    title: str
+):
+    """After a sign-up closes: who didn't sign up, worst first, in the staff bot channel."""
+
+    if not INACTIVE_REPORT:
+        return False
+
+    key = f"missed_report_{session_id}"
+
+    if get_meta(key):
+        return False
+
+    channel = find_suggestions_channel(guild)
+
+    if not channel:
+        return False
+
+    set_meta(key, "1")
+
+    found = find_inactive_fighters(guild, 1, only_session=session_id)
+
+    if not found:
+        header = f"✅ Every fighter signed up for **{title}**."
+    else:
+        header = (
+            f"**{len(found)} fighter{'s' if len(found) != 1 else ''}** didn't sign up for "
+            f"**{title}**. Worst first."
+        )
+
+    try:
+        await channel.send(
+            content=f"📋 **Sign-up check: {title}** (run `/inactive` for a list you can copy @mentions from)",
+            embeds=inactive_embeds(guild, found, header)
+        )
+        return True
+    except Exception as error:
+        print(f"Missed sign-up report failed: {error}")
+        return False
+
+
+async def end_due_suspensions():
+
+    now = int(time.time())
+
+    for row in discipline_query(
+        "SELECT * FROM suspensions WHERE status = 'active' AND ends_at <= ?", (now,)
+    ):
+
+        discipline_query("UPDATE suspensions SET status = 'ended' WHERE id = ?", (row["id"],), write=True)
+        clear_warnings(row["guild_id"], row["user_id"])
+
+        guild = bot.get_guild(row["guild_id"])
+
+        if guild:
+            await post_staff_log(
+                guild,
+                staff_log_embed(
+                    "✅ Suspension over",
+                    [
+                        f"<@{row['user_id']}>'s suspension has ended. They can sign up again "
+                        f"and their warnings are back to 0/{MAX_WARNINGS}.",
+                    ]
+                )
+            )
+
+
+async def run_discipline_checks():
+
+    try:
+        await end_due_suspensions()
+    except Exception as error:
+        print(f"Suspension check error: {error}")
+
+
+
+
+# ============================================================
+# AVAILABLE FIGHTER LIST
+#
+# /listpaste      post the available fighter list in this channel
+# /addfighter     add a fighter to a weight class
+# /removefighter  take a fighter off (e.g. once someone picks them)
+#
+# The last list posted with /listpaste updates by itself whenever
+# a fighter is added or removed. Staff only.
+# ============================================================
+
+FIGHTER_LIST_BANNER = "available_fighters.gif"
+
+# Lightest first, like the list in the server.
+LIST_WEIGHTS = [weight for weight in reversed(list(WEIGHTS.keys())) if weight != P4P_WEIGHT]
+
+# The list as it was when this feature was added. Only used once,
+# to fill the list the first time (it's in the database after that).
+STARTING_FIGHTER_LIST = {
+    "Flyweight": [
+        "Asu Almabayev", "Kai Asakura", "Steve Erceg", "Kai Kara-France", "Alex Perez",
+        "Lone’er Kavanagh", "Tagir Ulambekov", "Charles Johnson",
+    ],
+    "Bantamweight": [
+        "Amir Albazi", "Mario Bautista", "Deiveson Figueiredo", "Rob Font", "Charles Jourdain",
+        "Jonathan Martinez", "Pedro Munhoz", "Kyler Phillips", "Ricky Simeon", "Aiemann Zahabi",
+        "Raul Rosas JR", "Marlon Vera", "Payton Talbott",
+    ],
+    "Featherweight": [
+        "Rafa Garcia", "Calvin Kattar", "Lerone Murphy", "David Onama", "Brian Ortega",
+        "Cub Swanson", "Sodiq Yusuff", "Steve Garcia", "Jean Silva", "Arnold Allen",
+        "Sean Woodson", "Yair Rodriguez", "Aaron Pico", "The Korean Zombie",
+    ],
+    "Lightweight": [
+        "Ignacio Bahamondes", "Beneil Dariush", "Grant Dawson", "Frankie Edgar", "Rafael Fiziev",
+        "Matt Frevola", "Clay Guida", "Alexander Hernandez", "Dan Hooker", "Chase Hooper",
+        "Michael Johnson", "Jim Miller", "Renato Moicano", "Esteban Ribovics", "Benoit Saint Denis",
+        "Jeremy Stephens", "Manuel Torres", "Daniel Zellhuber", "Islam Makhachev",
+    ],
+    "Welterweight": [
+        "Randy Brown", "Joaquin Buckley", "Gilbert Burns", "Michael Chiesa", "Chris Curtis",
+        "Rafael dos Anjos", "Mickey Gall", "Jack Hermansson", "Matt Hughes", "Li Jingliang",
+        "Robbie Lawler", "Kevin Lee", "Vicente Luque", "Neil Magny", "Mike Malott",
+        "Jorge Masvidal", "Jake Matthews", "Court McGee", "Geoff Neal", "Gunnar Nelson",
+        "Santiago Ponzinibbio", "Daniel Rodriguez", "Colby Covington", "Uros Medic",
+    ],
+    "Middleweight": [
+        "Brendan Allen", "Vitor Belfort", "Michael Bisping", "Jared Cannonier", "Roman Dolidze",
+        "Kelvin Gastelum", "Royce Gracie", "Anthony Hernandez", "Roman Kopylov", "Michel Pereira",
+        "Joe Pyfer", "Luke Rockhold", "Gregory Rodrigues", "Edmen Shahbazyan", "Wanderlei Silva",
+        "Chael Sonnen", "Brad Tavares", "Marvin Vettori", "Chris Weidman", "Caio Borrahlo",
+        "Paulo Costa", "Dricus Du Plessis", "Sharaputdin Magomedov", "Israel Adesanya",
+    ],
+    "Light Heavyweight": [
+        "Mark Coleman", "Paul Craig", "Forrest Griffin", "Bogdan Guskov", "Nikita Krylov",
+        "Lyoto Machida", "Azamat Murzakanov", "Volkan Oezdemir", "Tito Ortiz", "Shogun Rua",
+        "Ovince Saint Preux", "Ken Shamrock", "Anthony Smith", "Alonzo Menifield",
+        "Glover Teixeira", "Rumble Johnson", "Jan Blachowicz", "Dominick Reyes",
+    ],
+    "Heavyweight": [
+        "Andrei Arlovski", "Randy Couture", "Rashad Evans", "Mark Kerr", "Stipe Miocic",
+        "Vitor Petrino", "Jairzinho Rozenstruik", "Dan Severn", "Serghei Spivac", "Marcin Tybura",
+        "Sergei Pavlovich", "Aleksander Rakic", "Derrick Lewis", "Daniel Cormier",
+    ],
+}
+
+WEIGHT_CHOICES = [
+    app_commands.Choice(name=weight, value=weight)
+    for weight in LIST_WEIGHTS
+]
+
+
+def list_key(
+    name: str
+):
+    """For matching names: ignores case, spaces, dots, accents-ish punctuation."""
+
+    return "".join(ch for ch in name.casefold() if ch.isalnum())
+
+
+def setup_fighter_list_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS available_fighters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            weight TEXT NOT NULL,
+            name TEXT NOT NULL,
+            added_at TEXT NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fighter_list_messages (
+            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def get_fighter_list(
+    guild_id: int
+):
+    """{weight: [rows]} in list order. Fills the starting list the first time."""
+
+    if not get_meta(f"fighter_list_seeded_{guild_id}"):
+
+        db = get_db()
+        cursor = db.cursor()
+        cursor.execute("SELECT COUNT(*) AS n FROM available_fighters WHERE guild_id = ?", (guild_id,))
+
+        if cursor.fetchone()["n"] == 0:
+            cursor.executemany("""
+                INSERT INTO available_fighters (guild_id, weight, name, added_at)
+                VALUES (?, ?, ?, ?)
+            """, [
+                (guild_id, weight, name, now_utc())
+                for weight in LIST_WEIGHTS
+                for name in STARTING_FIGHTER_LIST.get(weight, [])
+            ])
+
+        db.commit()
+        db.close()
+
+        set_meta(f"fighter_list_seeded_{guild_id}", "1")
+
+    rows = discipline_query(
+        "SELECT * FROM available_fighters WHERE guild_id = ? ORDER BY id ASC",
+        (guild_id,)
+    )
+
+    grouped = {weight: [] for weight in LIST_WEIGHTS}
+
+    for row in rows:
+        grouped.setdefault(row["weight"], []).append(row)
+
+    return grouped
+
+
+def find_listed_fighter(
+    guild_id: int,
+    name: str,
+    weight: str = None
+):
+
+    key = list_key(name)
+
+    return [
+        row
+        for listed_weight, rows in get_fighter_list(guild_id).items()
+        for row in rows
+        if list_key(row["name"]) == key and (not weight or listed_weight == weight)
+    ]
+
+
+def closest_listed_names(
+    guild_id: int,
+    name: str,
+    limit: int = 3
+):
+
+    names = [row["name"] for rows in get_fighter_list(guild_id).values() for row in rows]
+    by_key = {list_key(listed): listed for listed in names}
+
+    return [
+        by_key[key]
+        for key in difflib.get_close_matches(list_key(name), list(by_key.keys()), n=limit, cutoff=0.6)
+    ]
+
+
+def fighter_list_embed(
+    guild_id: int
+):
+
+    grouped = get_fighter_list(guild_id)
+    total = sum(len(rows) for rows in grouped.values())
+
+    embed = discord.Embed(
+        title="Available Fighters",
+        description=(
+            f"**{total}** fighters available. Ask a member of staff to claim one."
+            if total else "No fighters are available right now."
+        ),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    size = len(embed.title) + len(embed.description)
+
+    for weight in LIST_WEIGHTS:
+
+        names = [row["name"] for row in grouped.get(weight, [])]
+
+        if not names:
+            continue
+
+        # A field holds 1024 characters; long classes carry on in a second field.
+        chunks = [[]]
+
+        for name in names:
+            if len("\n".join(f"- {n}" for n in chunks[-1] + [name])) > 1000:
+                chunks.append([])
+            chunks[-1].append(name)
+
+        for index, chunk in enumerate(chunks):
+
+            field_name = f"🥊 {weight} ({len(names)})" if index == 0 else f"🥊 {weight} (cont.)"
+            value = "\n".join(f"- {name}" for name in chunk)
+
+            if size + len(field_name) + len(value) > 5700 or len(embed.fields) >= 25:
+                embed.add_field(
+                    name="…",
+                    value="The list is too long for one message. Remove some fighters to show the rest.",
+                    inline=False
+                )
+                break
+
+            size += len(field_name) + len(value)
+            embed.add_field(name=field_name, value=value, inline=False)
+
+    apply_branding(
+        embed,
+        banner_file=FIGHTER_LIST_BANNER,
+        author_text="PFO • AVAILABLE FIGHTERS"
+    )
+
+    embed.set_footer(
+        text="Updates by itself when staff add or remove fighters",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+async def refresh_fighter_list_message(
+    guild: discord.Guild
+):
+    """Edits the last list posted with /listpaste. Returns True if it did."""
+
+    rows = discipline_query(
+        "SELECT * FROM fighter_list_messages WHERE guild_id = ?", (guild.id,)
+    )
+
+    if not rows:
+        return False
+
+    try:
+        channel = guild.get_channel(rows[0]["channel_id"])
+
+        if not channel:
+            return False
+
+        message = await channel.fetch_message(rows[0]["message_id"])
+        await message.edit(embed=fighter_list_embed(guild.id))
+        return True
+
+    except Exception as error:
+        print(f"Could not update the fighter list message: {error}")
+        return False
+
+
+@bot.tree.command(
+    name="listpaste",
+    description="Post the available fighter list here (it then updates by itself)."
+)
+async def listpaste(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can post the fighter list.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_message(embed=fighter_list_embed(interaction.guild.id))
+
+    try:
+        message = await interaction.original_response()
+
+        discipline_query("""
+            INSERT OR REPLACE INTO fighter_list_messages (guild_id, channel_id, message_id)
+            VALUES (?, ?, ?)
+        """, (interaction.guild.id, message.channel.id, message.id), write=True)
+
+    except Exception as error:
+        print(f"Could not remember the fighter list message: {error}")
+
+
+@bot.tree.command(
+    name="addfighter",
+    description="Add a fighter to the available fighter list."
+)
+@app_commands.describe(
+    name="Fighter's name, e.g. Alex Pereira",
+    weight="Weight class to list them under"
+)
+@app_commands.choices(
+    weight=WEIGHT_CHOICES
+)
+async def addfighter(
+    interaction: discord.Interaction,
+    name: str,
+    weight: app_commands.Choice[str]
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can edit the fighter list.",
+            ephemeral=True
+        )
+        return
+
+    name = " ".join(name.split())[:80]
+
+    if not list_key(name):
+        await interaction.response.send_message("❌ Type the fighter's name.", ephemeral=True)
+        return
+
+    existing = find_listed_fighter(interaction.guild.id, name)
+
+    if existing:
+        await interaction.response.send_message(
+            f"❌ **{existing[0]['name']}** is already on the list under **{existing[0]['weight']}**.",
+            ephemeral=True
+        )
+        return
+
+    discipline_query("""
+        INSERT INTO available_fighters (guild_id, weight, name, added_at)
+        VALUES (?, ?, ?, ?)
+    """, (interaction.guild.id, weight.value, name, now_utc()), write=True)
+
+    # Editing the posted list can take a moment, so answer after it.
+    await interaction.response.defer(ephemeral=True)
+
+    updated = await refresh_fighter_list_message(interaction.guild)
+    count = len(get_fighter_list(interaction.guild.id)[weight.value])
+
+    await interaction.followup.send(
+        f"✅ Added **{name}** to **{weight.value}** ({count} available)."
+        + ("\n📋 The posted list has been updated." if updated else
+           "\nℹ️ Post the list with `/listpaste` and it'll update by itself from then on."),
+        ephemeral=True
+    )
+
+
+async def listed_fighter_autocomplete(
+    interaction: discord.Interaction,
+    current: str
+):
+
+    key = list_key(current or "")
+    found = []
+
+    for weight, rows in get_fighter_list(interaction.guild.id).items():
+        for row in rows:
+            if key in list_key(row["name"]):
+                found.append(app_commands.Choice(name=f"{row['name']} ({weight})"[:100], value=row["name"][:100]))
+
+    return found[:25]
+
+
+@bot.tree.command(
+    name="removefighter",
+    description="Take a fighter off the available fighter list (e.g. once they're picked)."
+)
+@app_commands.describe(
+    name="Start typing to pick from the list",
+    weight="Only needed if the same name is listed in two weight classes"
+)
+@app_commands.choices(
+    weight=WEIGHT_CHOICES
+)
+@app_commands.autocomplete(
+    name=listed_fighter_autocomplete
+)
+async def removefighter(
+    interaction: discord.Interaction,
+    name: str,
+    weight: app_commands.Choice[str] = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(
+            f"❌ {STAFF_ONLY_TEXT} can edit the fighter list.",
+            ephemeral=True
+        )
+        return
+
+    matches = find_listed_fighter(interaction.guild.id, name, weight.value if weight else None)
+
+    if not matches and weight:
+        elsewhere = find_listed_fighter(interaction.guild.id, name)
+
+        if elsewhere:
+            await interaction.response.send_message(
+                f"❌ **{elsewhere[0]['name']}** is listed under **{elsewhere[0]['weight']}**, "
+                f"not {weight.value}.",
+                ephemeral=True
+            )
+            return
+
+    if not matches:
+        close = closest_listed_names(interaction.guild.id, name)
+        await interaction.response.send_message(
+            f"❌ **{name}** isn't on the list"
+            + (f" under **{weight.value}**" if weight else "") + "."
+            + (f" Did you mean: {', '.join(f'**{n}**' for n in close)}?" if close else ""),
+            ephemeral=True
+        )
+        return
+
+    if len(matches) > 1:
+        await interaction.response.send_message(
+            f"❌ **{matches[0]['name']}** is listed in "
+            + ", ".join(f"**{row['weight']}**" for row in matches)
+            + ". Pick the **weight** too.",
+            ephemeral=True
+        )
+        return
+
+    row = matches[0]
+
+    discipline_query("DELETE FROM available_fighters WHERE id = ?", (row["id"],), write=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    updated = await refresh_fighter_list_message(interaction.guild)
+    count = len(get_fighter_list(interaction.guild.id)[row["weight"]])
+
+    await interaction.followup.send(
+        f"✅ Removed **{row['name']}** from **{row['weight']}** ({count} left)."
+        + ("\n📋 The posted list has been updated." if updated else ""),
+        ephemeral=True
+    )
+
+
+
 async def setup_hook():
 
     setup_database()
     setup_card_tables()
+    setup_fight_card_tables()
+    setup_suggestion_tables()
+    setup_vote_tables()
+    setup_discipline_tables()
+    setup_fighter_list_tables()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
     restore_checkin_buttons()
+    restore_suggestion_buttons()
+    restore_vote_buttons()
+
+    if not vote_closer.is_running():
+        vote_closer.start()
 
     await sync_commands_if_changed()
 
