@@ -372,6 +372,8 @@ def setup_database():
     setup_card_draft_tables()
     setup_signup_time_columns()
     setup_coin_tables()
+    setup_reminder_columns()
+    setup_interview_tables()
 
 
 # ============================================================
@@ -8347,6 +8349,18 @@ async def vote_closer():
     except Exception as error:
         print(f"Vote closer error: {error}")
 
+    # Interviews: catch up after restarts, expire old invitations.
+    try:
+        await check_interviews()
+    except Exception as error:
+        print(f"Interview check error: {error}")
+
+    # Reminder DMs for the latest Live Card / Fight Night.
+    try:
+        await check_card_reminders()
+    except Exception as error:
+        print(f"Reminder error: {error}")
+
     # Betting: lock at closing time, refresh live odds.
     try:
         await sportsbook_tick()
@@ -10767,6 +10781,12 @@ def create_dm_preview_embed(
 
     if kind == "fight_night":
         details = f"**Deadline:** {format_saved_time(deadline)}"
+        if CARD_REMINDERS:
+            details += (
+                "\n**Reminder:** sent automatically 1 day before the deadline"
+                if deadline and str(deadline).isdigit() else
+                "\n**Reminder:** none (type the deadline as a date, e.g. 19/11/2026 22:00, to get one)"
+            )
         author = "PFO • DM FIGHT NIGHT CARD"
     else:
         details = (
@@ -10774,6 +10794,8 @@ def create_dm_preview_embed(
             f"**When:** {format_saved_time(event_date)}\n"
             "**Check-in button:** included"
         )
+        if CARD_REMINDERS:
+            details += "\n**Reminder:** sent automatically 1 hour before"
         author = "PFO • DM LIVE CARD"
 
     embed = discord.Embed(
@@ -14998,6 +15020,1013 @@ def restore_sportsbook_buttons():
 
 
 
+# ------------------------------------------------------------
+# Reminder DMs
+#
+# Live Card:   1 hour before the event starts
+# Fight Night: 1 day before the deadline (only when the deadline
+#              was typed as a date, e.g. 19/11/2026 22:00)
+#
+# Sent to everyone on the most recent /dmlivecard or /dmfightnight.
+# CARD_REMINDERS=off in Railway turns them off.
+# ------------------------------------------------------------
+
+REMINDER_BANNER = "reminder.gif"
+CARD_REMINDERS = os.getenv("CARD_REMINDERS", "on").strip().lower() not in ("off", "no", "false", "0")
+REMINDER_BEFORE = {"live_card": 3600, "fight_night": 86400}
+
+
+def setup_reminder_columns():
+
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute("PRAGMA table_info(card_notices)")
+
+    if "reminder_sent" not in [column[1] for column in cursor.fetchall()]:
+        cursor.execute("ALTER TABLE card_notices ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+
+    db.commit()
+    db.close()
+
+
+def reminder_time(notice):
+    """(when to remind, the event/deadline time) as unix, or (None, None)."""
+
+    value = notice["event_date"] if notice["kind"] == "live_card" else notice["deadline"]
+
+    if not value or not str(value).isdigit():
+        return None, None
+
+    target = int(value)
+
+    return target - REMINDER_BEFORE[notice["kind"]], target
+
+
+def create_reminder_dm_embed(notice, fighter, opponent_text: str = None):
+
+    _, target = reminder_time(notice)
+
+    if notice["kind"] == "live_card":
+        event = notice["event"] or "the Live Card"
+        title = "⏰ Starts in 1 hour!"
+        lines = [f"**{event}** starts <t:{target}:F> (<t:{target}:R>)."]
+
+        if fighter["checked_in_at"]:
+            lines += ["", "✅ **You're checked in.** See you there!"]
+        else:
+            lines += [
+                "",
+                "⚠️ **You haven't checked in yet.** Press **Check In** below so staff know you're coming.",
+            ]
+
+        author = event.upper() if event.upper().startswith("PFO") else f"PFO • {event.upper()}"
+    else:
+        title = "⏰ 1 day left"
+        lines = [
+            "Reminder: you're on the **PFO Fight Night** card.",
+            f"Your fight needs to be done by <t:{target}:F> (<t:{target}:R>).",
+            "",
+            "If you can't make it, let a member of staff know as soon as possible.",
+        ]
+        author = "PFO • FIGHT NIGHT"
+
+    embed = discord.Embed(
+        title=title,
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(embed, banner_file=REMINDER_BANNER, author_text=author)
+
+    if opponent_text:
+        embed.add_field(name="🆚 Your Opponent", value=opponent_text, inline=False)
+
+    embed.set_footer(text="Prestige Fighting Organisation", icon_url=asset_url(LOGO_FILE))
+
+    return embed
+
+
+async def send_reminder_dms(notice_id: int):
+
+    notice = get_notice(notice_id)
+    guild = bot.get_guild(notice["guild_id"]) if notice else None
+
+    if not guild:
+        return
+
+    fighters = get_card_fighters(notice_id)
+    names = {row["user_id"]: row["name"] for row in fighters}
+    sent, failed = 0, []
+
+    for index, fighter in enumerate(fighters):
+
+        if index:
+            await asyncio.sleep(DM_DELAY_SECONDS)
+
+        member = guild.get_member(fighter["user_id"])
+
+        if not member:
+            failed.append((fighter["user_id"], "not in the server"))
+            continue
+
+        opponent_text = None
+
+        if fighter["opponent_id"]:
+            opponent_text = (
+                f"**{name_without_record(names.get(fighter['opponent_id'], 'Your opponent'))}** "
+                f"(<@{fighter['opponent_id']}>)"
+            )
+
+        embed = create_reminder_dm_embed(notice, fighter, opponent_text)
+        needs_button = notice["kind"] == "live_card" and notice["active"] and not fighter["checked_in_at"]
+
+        try:
+            if needs_button:
+                await member.send(embed=embed, view=CheckInView(notice_id))
+            else:
+                await member.send(embed=embed)
+            sent += 1
+        except discord.Forbidden:
+            failed.append((fighter["user_id"], "DMs closed"))
+        except Exception as error:
+            print(f"Reminder DM to {fighter['user_id']} failed: {error}")
+            failed.append((fighter["user_id"], "Discord error"))
+
+    label = notice["event"] or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
+    lines = [f"⏰ Reminder sent to **{sent} of {len(fighters)}** fighters for **{label}**."]
+
+    if notice["kind"] == "live_card":
+        waiting = [row for row in get_card_fighters(notice_id) if not row["checked_in_at"]]
+        if waiting:
+            mentions = " ".join(f"<@{row['user_id']}>" for row in waiting)
+            lines.append(f"⚠️ Not checked in yet: {mentions}")
+
+    if failed:
+        lines.append("📭 Couldn't DM: " + ", ".join(f"<@{user_id}> ({why})" for user_id, why in failed))
+
+    await post_staff_log(guild, staff_log_embed("⏰ Reminder DMs", lines))
+
+
+async def check_card_reminders():
+
+    if not CARD_REMINDERS:
+        return
+
+    now = int(time.time())
+
+    # Only the most recent DM run of each kind, per server.
+    latest = discipline_query("""
+        SELECT * FROM card_notices
+        WHERE id IN (SELECT MAX(id) FROM card_notices GROUP BY guild_id, kind)
+          AND reminder_sent = 0
+    """)
+
+    for notice in latest:
+
+        remind_at, target = reminder_time(notice)
+
+        if remind_at is None:
+            continue
+
+        if now < remind_at:
+            continue
+
+        update_notice(notice["id"], reminder_sent=1)
+
+        created = parse_stamp(notice["created_at"])
+        created_unix = int(created.timestamp()) if created else 0
+
+        # Too late (event already started), or the DMs only just went out.
+        if now >= target or created_unix >= remind_at:
+            continue
+
+        asyncio.create_task(send_reminder_dms(notice["id"]))
+
+
+# ============================================================
+# INTERVIEWS
+#
+# /interview @member   staff type up to 5 questions; the member gets
+#                      a DM invitation (Accept / Decline). Once they
+#                      accept, the questions are asked one by one in
+#                      the interview channel. Each one waits for their
+#                      reply, then the next is asked. At the end the
+#                      bot thanks them.
+#
+# The interview channel is any channel with "interview" in its name,
+# or set INTERVIEW_CHANNEL in Railway (name or ID).
+# ============================================================
+
+INTERVIEW_BANNER = "interview.gif"
+INTERVIEW_CHANNEL = os.getenv("INTERVIEW_CHANNEL", "interviews")
+INTERVIEW_NEXT_DELAY = 6          # seconds of quiet after their reply before the next question
+INVITE_DAYS = 3                   # invitations expire after this
+INTERVIEW_THANKS = "Thank you for taking part in the interview, good luck in your future fights"
+
+_interview_timers = {}
+
+
+def setup_interview_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS interviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            member_id INTEGER NOT NULL,
+            staff_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            questions TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'invited',
+            current INTEGER NOT NULL DEFAULT 0,
+            answered INTEGER NOT NULL DEFAULT 0,
+            last_reply_at INTEGER,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def get_interview(interview_id: int):
+    rows = discipline_query("SELECT * FROM interviews WHERE id = ?", (interview_id,))
+    return rows[0] if rows else None
+
+
+def update_interview(interview_id: int, **changes):
+    columns = ", ".join(f"{column} = ?" for column in changes)
+    discipline_query(
+        f"UPDATE interviews SET {columns} WHERE id = ?", (*changes.values(), interview_id), write=True
+    )
+
+
+def find_interview_channel(guild: discord.Guild):
+
+    setting = INTERVIEW_CHANNEL.strip()
+
+    if setting.isdigit():
+        return guild.get_channel(int(setting))
+
+    wanted = role_key(setting)
+    channels = list(getattr(guild, "text_channels", []))
+
+    for channel in channels:
+        if role_key(channel.name) == wanted:
+            return channel
+
+    for channel in channels:
+        if "interview" in role_key(channel.name):
+            return channel
+
+    return None
+
+
+def interview_questions(interview):
+    return json.loads(interview["questions"])
+
+
+def open_interview_for(guild_id: int, member_id: int):
+    rows = discipline_query(
+        "SELECT * FROM interviews WHERE guild_id = ? AND member_id = ? AND status IN ('invited', 'live') "
+        "ORDER BY id DESC LIMIT 1",
+        (guild_id, member_id)
+    )
+    return rows[0] if rows else None
+
+
+def invitation_embed(guild: discord.Guild, interview, note: str = None):
+
+    channel = guild.get_channel(interview["channel_id"]) if guild else None
+    count = len(interview_questions(interview))
+
+    staff = guild.get_member(interview["staff_id"]) if guild else None
+    staff_name = name_without_record(staff.display_name) if staff else "PFO staff"
+
+    lines = [
+        "**PFO would like to interview you!** 🎙️",
+        f"Interview from **{staff_name}**.",
+        "",
+        f"There {'is' if count == 1 else 'are'} **{count}** question{'s' if count != 1 else ''}. "
+        f"They'll be asked one at a time in {channel.mention if channel else 'the interview channel'}. "
+        "Just reply in the channel after each one and the next will follow.",
+        "",
+        "Press **Accept** when you're ready to start.",
+    ]
+
+    if note:
+        lines = [note, ""] + lines
+
+    embed = discord.Embed(
+        title="🎙️ Interview invitation",
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(embed, banner_file=INTERVIEW_BANNER, author_text="PFO • INTERVIEW")
+    embed.set_footer(
+        text=f"Invitation expires in {INVITE_DAYS} days • Prestige Fighting Organisation",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+def question_embed(interview, number: int, member):
+
+    questions = interview_questions(interview)
+
+    embed = discord.Embed(
+        title=f"Question {number} of {len(questions)}",
+        description=f"## {questions[number - 1]}",
+        color=PFO_GOLD
+    )
+
+    embed.set_author(name="PFO • INTERVIEW", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text=f"{name_without_record(member.display_name)}, reply below 👇")
+
+    return embed
+
+
+async def ask_question(guild: discord.Guild, interview_id: int):
+    """Posts the next question, or the thank-you once they're all answered."""
+
+    interview = get_interview(interview_id)
+
+    if not interview or interview["status"] != "live":
+        return
+
+    channel = guild.get_channel(interview["channel_id"])
+    member = guild.get_member(interview["member_id"])
+
+    if not channel or not member:
+        update_interview(interview_id, status="cancelled")
+        return
+
+    questions = interview_questions(interview)
+    number = interview["current"] + 1
+
+    if number > len(questions):
+
+        update_interview(interview_id, status="done")
+
+        embed = discord.Embed(
+            description=f"🎙️ **{INTERVIEW_THANKS}**, {member.mention}! 🥊",
+            color=PFO_GOLD,
+            timestamp=discord.utils.utcnow()
+        )
+        apply_branding(embed, banner_file=INTERVIEW_BANNER, author_text="PFO • INTERVIEW")
+        embed.set_footer(text="Prestige Fighting Organisation", icon_url=asset_url(LOGO_FILE))
+
+        await channel.send(embed=embed)
+        return
+
+    update_interview(interview_id, current=number, answered=0)
+
+    await channel.send(
+        content=member.mention,
+        embed=question_embed(interview, number, member)
+    )
+
+
+async def start_interview(guild: discord.Guild, interview_id: int):
+
+    interview = get_interview(interview_id)
+    channel = guild.get_channel(interview["channel_id"])
+    member = guild.get_member(interview["member_id"])
+
+    update_interview(interview_id, status="live", current=0, answered=0)
+
+    record = ""
+    try:
+        record = f" · {stats_record(get_fighter_stats(guild.id, member.id))}"
+    except Exception:
+        pass
+
+    embed = discord.Embed(
+        title=f"🎙️ {name_without_record(member.display_name)}",
+        description=(
+            f"**{member.mention}** sits down with PFO{record}.\n"
+            f"{plural(len(interview_questions(interview)), 'question')}"
+        ),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    apply_branding(embed, banner_file=INTERVIEW_BANNER, author_text="PFO • INTERVIEW", show_thumbnail=False)
+
+    avatar = getattr(member, "display_avatar", None)
+    if avatar:
+        embed.set_thumbnail(url=avatar.url)
+
+    await channel.send(embed=embed)
+    await ask_question(guild, interview_id)
+
+
+class InterviewInviteView(
+    discord.ui.View
+):
+    """Accept / Decline in the member's DMs. Works after restarts."""
+
+    def __init__(self, interview_id: int):
+
+        super().__init__(timeout=None)
+
+        self.interview_id = interview_id
+
+        accept = discord.ui.Button(label="Accept", emoji="🎙️", style=discord.ButtonStyle.green,
+                                   custom_id=f"pfo_interview_{interview_id}_yes")
+        accept.callback = self.accept
+        decline = discord.ui.Button(label="Decline", style=discord.ButtonStyle.grey,
+                                    custom_id=f"pfo_interview_{interview_id}_no")
+        decline.callback = self.decline
+        self.add_item(accept)
+        self.add_item(decline)
+
+    async def answer(self, interaction, accepted: bool):
+
+        interview = get_interview(self.interview_id)
+
+        if not interview or interview["status"] != "invited":
+            await interaction.response.edit_message(
+                content="This invitation is no longer open.", embed=None, view=None
+            )
+            return
+
+        if time.time() - interview["created_at"] > INVITE_DAYS * 86400:
+            update_interview(self.interview_id, status="expired")
+            await interaction.response.edit_message(
+                content="⌛ This invitation has expired. Ask a member of staff if you'd still like to do it.",
+                embed=None, view=None
+            )
+            return
+
+        guild = bot.get_guild(interview["guild_id"])
+
+        if not guild:
+            await interaction.response.send_message("❌ I can't find the PFO server right now. Try again soon.")
+            return
+
+        if not accepted:
+            update_interview(self.interview_id, status="declined")
+            await interaction.response.edit_message(
+                content="No problem, the interview has been cancelled.", embed=None, view=None
+            )
+            await post_staff_log(guild, staff_log_embed(
+                "🎙️ Interview declined",
+                [f"<@{interview['member_id']}> declined the interview from <@{interview['staff_id']}>."]
+            ))
+            return
+
+        channel = guild.get_channel(interview["channel_id"])
+
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **Let's go!** Head to {channel.mention if channel else 'the interview channel'}: "
+                "the first question is waiting for you."
+            ),
+            embed=None,
+            view=None
+        )
+
+        await start_interview(guild, self.interview_id)
+
+    async def accept(self, interaction):
+        await self.answer(interaction, True)
+
+    async def decline(self, interaction):
+        await self.answer(interaction, False)
+
+
+class InterviewQuestionsModal(
+    discord.ui.Modal,
+    title="Interview questions"
+):
+
+    q1 = discord.ui.TextInput(label="Question 1", style=discord.TextStyle.paragraph, max_length=300)
+    q2 = discord.ui.TextInput(label="Question 2", style=discord.TextStyle.paragraph, max_length=300, required=False)
+    q3 = discord.ui.TextInput(label="Question 3", style=discord.TextStyle.paragraph, max_length=300, required=False)
+    q4 = discord.ui.TextInput(label="Question 4", style=discord.TextStyle.paragraph, max_length=300, required=False)
+    q5 = discord.ui.TextInput(label="Question 5", style=discord.TextStyle.paragraph, max_length=300, required=False)
+
+    def __init__(self, member, channel):
+        super().__init__()
+        self.member = member
+        self.channel = channel
+        self.q1.placeholder = "e.g. How did it feel to get the finish tonight?"
+        self.q2.placeholder = "e.g. Who do you want next?"
+
+    async def on_submit(self, interaction):
+
+        questions = [
+            (field.value or "").strip()
+            for field in (self.q1, self.q2, self.q3, self.q4, self.q5)
+            if (field.value or "").strip()
+        ]
+
+        if not questions:
+            await interaction.response.send_message("❌ Add at least one question.", ephemeral=True)
+            return
+
+        interview_id = discipline_query("""
+            INSERT INTO interviews (guild_id, member_id, staff_id, channel_id, questions, status, created_at)
+            VALUES (?, ?, ?, ?, ?, 'invited', ?)
+        """, (interaction.guild.id, self.member.id, interaction.user.id, self.channel.id,
+              json.dumps(questions), int(time.time())), write=True)
+
+        interview = get_interview(interview_id)
+
+        try:
+            await self.member.send(
+                embed=invitation_embed(interaction.guild, interview),
+                view=InterviewInviteView(interview_id)
+            )
+        except discord.Forbidden:
+            update_interview(interview_id, status="cancelled")
+            await interaction.response.send_message(
+                f"📭 **{self.member.display_name}** has DMs closed, so the invitation couldn't be sent.",
+                ephemeral=True
+            )
+            return
+
+        listed = "\n".join(f"`{number}.` {question}" for number, question in enumerate(questions, start=1))
+
+        await interaction.response.send_message(
+            f"📨 **Invitation sent to {self.member.display_name}.** Once they accept, the questions will be "
+            f"asked one by one in {self.channel.mention}:\n\n{listed}",
+            ephemeral=True
+        )
+
+
+class CancelInterviewView(
+    discord.ui.View
+):
+
+    def __init__(self, interview_id: int, member, channel):
+        super().__init__(timeout=300)
+        self.interview_id = interview_id
+        self.member = member
+        self.channel = channel
+
+        cancel = discord.ui.Button(label="Cancel it and start a new one", style=discord.ButtonStyle.red)
+        cancel.callback = self.cancel
+        self.add_item(cancel)
+
+    async def cancel(self, interaction):
+        update_interview(self.interview_id, status="cancelled")
+        await interaction.response.send_modal(InterviewQuestionsModal(self.member, self.channel))
+
+
+@bot.tree.command(
+    name="interview",
+    description="Invite a member to an interview: you write up to 5 questions, asked one by one."
+)
+@app_commands.describe(
+    member="Who to interview",
+    channel="Where to hold it (default: the interview channel)"
+)
+async def interview(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    channel: discord.TextChannel = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can set up interviews.", ephemeral=True)
+        return
+
+    if member.bot:
+        await interaction.response.send_message("❌ Bots can't be interviewed.", ephemeral=True)
+        return
+
+    channel = channel or find_interview_channel(interaction.guild)
+
+    if not channel:
+        await interaction.response.send_message(
+            "❌ I couldn't find an interview channel. Make a channel with **interview** in its name, "
+            "or pick one in **channel**.",
+            ephemeral=True
+        )
+        return
+
+    existing = open_interview_for(interaction.guild.id, member.id)
+
+    if existing:
+        state = "is waiting for them to accept" if existing["status"] == "invited" else "is in progress"
+        await interaction.response.send_message(
+            f"⚠️ An interview with **{member.display_name}** {state}.",
+            view=CancelInterviewView(existing["id"], member, channel),
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.send_modal(InterviewQuestionsModal(member, channel))
+
+
+async def advance_after_quiet(guild: discord.Guild, interview_id: int, number: int):
+    """Waits a few seconds after their last message (they may send more), then asks the next question."""
+
+    try:
+        await asyncio.sleep(INTERVIEW_NEXT_DELAY)
+    except asyncio.CancelledError:
+        return
+
+    interview = get_interview(interview_id)
+
+    if interview and interview["status"] == "live" and interview["current"] == number and interview["answered"]:
+        await ask_question(guild, interview_id)
+
+
+@bot.listen("on_message")
+async def interview_replies(message):
+
+    if getattr(message.author, "bot", False) or not message.guild:
+        return
+
+    rows = discipline_query(
+        "SELECT * FROM interviews WHERE guild_id = ? AND member_id = ? AND channel_id = ? AND status = 'live'",
+        (message.guild.id, message.author.id, message.channel.id)
+    )
+
+    if not rows:
+        return
+
+    interview = rows[0]
+
+    if interview["current"] < 1:
+        return
+
+    update_interview(interview["id"], answered=1, last_reply_at=int(time.time()))
+
+    # Restart the short wait each time they send another message.
+    previous = _interview_timers.pop(interview["id"], None)
+    if previous:
+        previous.cancel()
+
+    _interview_timers[interview["id"]] = asyncio.create_task(
+        advance_after_quiet(message.guild, interview["id"], interview["current"])
+    )
+
+
+async def check_interviews():
+    """Catches up after a restart (an answered question with no next one yet), and expires old invites."""
+
+    now = int(time.time())
+
+    discipline_query(
+        "UPDATE interviews SET status = 'expired' WHERE status = 'invited' AND created_at < ?",
+        (now - INVITE_DAYS * 86400,), write=True
+    )
+
+    for interview in discipline_query(
+        "SELECT * FROM interviews WHERE status = 'live' AND answered = 1 AND last_reply_at < ?",
+        (now - INTERVIEW_NEXT_DELAY - 30,)
+    ):
+        if interview["id"] in _interview_timers and not _interview_timers[interview["id"]].done():
+            continue
+
+        guild = bot.get_guild(interview["guild_id"])
+
+        if guild:
+            await ask_question(guild, interview["id"])
+
+
+def restore_interview_buttons():
+
+    try:
+        for interview in discipline_query("SELECT id FROM interviews WHERE status = 'invited'"):
+            bot.add_view(InterviewInviteView(interview["id"]))
+    except Exception as error:
+        print(f"Could not restore interview buttons: {error}")
+
+
+# ============================================================
+# TALE OF THE TAPE
+#
+# /taleofthetape @A @B   side-by-side stats for a fight: record,
+#                        streak, rank, finishes, title wins, recent
+#                        form, head-to-head, plus fan vote and betting
+#                        odds if those are open. Optional notes.
+#                        Shows a preview first; press Post to share.
+# ============================================================
+
+TALE_BANNER = "tale_of_the_tape.gif"
+TAPE_WIDTH = 9    # characters per side in the table (fits phones)
+
+
+def recent_form(guild_id: int, user_id: int, count: int = 5):
+    """e.g. 'W W L W' most recent last."""
+
+    fights = get_fighter_fights(guild_id, user_id)
+    form = []
+
+    for fight in fights[-count:]:
+        if fight["method"] == "NC":
+            form.append("NC")
+        elif fight["method"] == "DRAW":
+            form.append("D")
+        else:
+            form.append("W" if fight["winner_id"] == user_id else "L")
+
+    return form
+
+
+def head_to_head(guild_id: int, a: int, b: int):
+
+    fights = [
+        fight for fight in get_fighter_fights(guild_id, a)
+        if {fight["winner_id"], fight["loser_id"]} == {a, b}
+    ]
+
+    return fights
+
+
+def tape_value(text: str):
+    text = str(text)
+    return text if len(text) <= TAPE_WIDTH else text[:TAPE_WIDTH - 1] + "…"
+
+
+def tape_row(left, label: str, right):
+    return f"{tape_value(left):>{TAPE_WIDTH}}  {label:^10}  {tape_value(right):<{TAPE_WIDTH}}"
+
+
+def fighter_tape(guild_id: int, user_id: int, weight: str):
+
+    stats = get_fighter_stats(guild_id, user_id)
+    rank = get_user_ranking_in_division(guild_id, user_id, weight) if weight else None
+    p4p = get_user_ranking_in_division(guild_id, user_id, P4P_WEIGHT)
+    finishes = stats["wins_by"].get("KO/TKO", 0) + stats["wins_by"].get("SUB", 0)
+    form = recent_form(guild_id, user_id, 3)
+
+    reigns = 0
+    defences = 0
+
+    if weight:
+        for reign in title_lineage(guild_id, weight)[0]:
+            if reign["user_id"] == user_id:
+                reigns += 1
+                defences += reign["defences"]
+
+    return {
+        "record": stats_record(stats),
+        "streak": stats["streak"] or "-",
+        "rank": ("Champ" if rank["rank"] == 0 else f"#{rank['rank']}") if rank else "Unranked",
+        "p4p": f"#{p4p['rank']}" if p4p else "-",
+        "ko": stats["wins_by"].get("KO/TKO", 0),
+        "sub": stats["wins_by"].get("SUB", 0),
+        "dec": stats["wins_by"].get("DEC", 0),
+        "finish": f"{stats['finish_rate']}%" if stats["finish_rate"] is not None else "-",
+        "titles": stats["title_wins"],
+        "defences": defences,
+        "reigns": reigns,
+        "form": " ".join(form) if form else "-",
+    }
+
+
+FORM_ICONS = {"W": "🟢", "L": "🔴", "D": "⚪", "NC": "⚫"}
+
+
+def tape_cards(ta, tb):
+    """Two stat cards with the same lines, kept short so they line up side by side."""
+
+    show_p4p = ta["p4p"] != "-" or tb["p4p"] != "-"
+
+    def card(tape):
+
+        rank = tape["rank"]
+        rank_line = "👑 Champion" if rank == "Champ" else ("Unranked" if rank == "Unranked" else f"🏅 Ranked {rank}")
+        streak = tape["streak"]
+        streak_line = (
+            f"🔥 {streak} streak" if streak.startswith("W")
+            else f"❄️ {streak} streak" if streak.startswith("L")
+            else "No streak"
+        )
+        form = " ".join(FORM_ICONS.get(result, result) for result in tape["form"].split()) if tape["form"] != "-" else "No fights yet"
+
+        lines = [f"**{tape['record']}**", rank_line]
+
+        if show_p4p:
+            lines.append(f"P4P {tape['p4p']}" if tape["p4p"] != "-" else "P4P –")
+
+        lines += [
+            streak_line,
+            "",
+            f"💥 {tape['ko']} KO/TKO",
+            f"🔒 {tape['sub']} Sub",
+            f"📋 {tape['dec']} Dec",
+            f"⚡ {tape['finish']} finishes",
+            f"🏆 {tape['titles']} title wins",
+            "",
+            form,
+        ]
+
+        return "\n".join(lines)
+
+    return card(ta), card(tb)
+
+
+def tale_of_the_tape_embed(
+    guild: discord.Guild,
+    a,
+    b,
+    weight: str = None,
+    event: str = None,
+    notes: str = None
+):
+
+    weight = weight or auto_weight(guild.id, a.id, b.id)
+    ta = fighter_tape(guild.id, a.id, weight)
+    tb = fighter_tape(guild.id, b.id, weight)
+    name_a = name_without_record(a.display_name)
+    name_b = name_without_record(b.display_name)
+
+    header = [
+        f"🔴 **{name_a}**  vs  **{name_b}** 🔵",
+        " · ".join(part for part in (event, f"⚖️ {weight}" if weight else None) if part),
+    ]
+
+    description = "\n".join(line for line in header if line)
+
+    if notes:
+        description += "\n\n" + "\n".join(f"> {line}" for line in notes.split("\n") if line.strip())
+
+    embed = discord.Embed(
+        title="Tale of the Tape",
+        description=description[:4000],
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(embed, banner_file=TALE_BANNER, author_text="PFO • TALE OF THE TAPE")
+
+    # One stat card per fighter (side by side on desktop, stacked on phones)
+    card_a, card_b = tape_cards(ta, tb)
+    embed.add_field(name=f"🔴 {name_a}", value=card_a, inline=True)
+    embed.add_field(name=f"🔵 {name_b}", value=card_b, inline=True)
+
+    # Head to head
+    meetings = head_to_head(guild.id, a.id, b.id)
+
+    if meetings:
+        a_wins = sum(1 for fight in meetings if fight["winner_id"] == a.id and fight["method"] not in ("DRAW", "NC"))
+        b_wins = sum(1 for fight in meetings if fight["winner_id"] == b.id and fight["method"] not in ("DRAW", "NC"))
+        last = meetings[-1]
+        last_winner = name_a if last["winner_id"] == a.id else name_b
+
+        if a_wins == b_wins:
+            standing = f"Level at {a_wins}-{b_wins}"
+        else:
+            leader = name_a if a_wins > b_wins else name_b
+            standing = f"{leader} leads {max(a_wins, b_wins)}-{min(a_wins, b_wins)}"
+
+        last_text = (
+            "Draw" if last["method"] == "DRAW" else "No contest" if last["method"] == "NC"
+            else f"{last_winner} by {fight_method_text(last)}"
+        )
+
+        embed.add_field(
+            name="🤝 Head to head",
+            value=f"{standing}\nLast time: {last_text}"
+            + (f" ({last['event']})" if last["event"] else ""),
+            inline=False
+        )
+    else:
+        embed.add_field(name="🤝 Head to head", value="First meeting", inline=False)
+
+    # Betting split + odds from the sportsbook for this fight
+    for bout in discipline_query("""
+        SELECT bet_fights.* FROM bet_fights JOIN bet_markets ON bet_markets.id = bet_fights.market_id
+        WHERE bet_markets.guild_id = ? AND bet_markets.status IN ('open', 'locked') AND bet_fights.result IS NULL
+        ORDER BY bet_markets.id DESC
+    """, (guild.id,)):
+
+        if {bout["fighter_a"], bout["fighter_b"]} != {a.id, b.id}:
+            continue
+
+        backers = {"a": set(), "b": set()}
+
+        for row in discipline_query("""
+            SELECT bets.user_id, bet_legs.pick FROM bet_legs JOIN bets ON bets.id = bet_legs.bet_id
+            WHERE bets.market_id = ? AND bet_legs.position = ?
+        """, (bout["market_id"], bout["position"])):
+            backers[row["pick"]].add(row["user_id"])
+
+        # Line them up with this Tale of the Tape's red/blue corners.
+        side_a, side_b = ("a", "b") if bout["fighter_a"] == a.id else ("b", "a")
+        count_a, count_b = len(backers[side_a]), len(backers[side_b])
+        total = count_a + count_b
+        odds = live_odds(bout)
+
+        lines = []
+
+        if total:
+            pa = round(100 * count_a / total)
+            lines.append(f"{name_a} **{pa}%** {vote_bar(pa)} **{100 - pa}%** {name_b}")
+            lines.append(f"👥 {plural(total, 'bettor')}")
+        else:
+            lines.append("No bets yet")
+
+        lines.append(f"Odds: {name_a} `{odds[side_a]:.2f}` · {name_b} `{odds[side_b]:.2f}`")
+
+        embed.add_field(name="🪙 Who people are backing", value="\n".join(lines), inline=False)
+        break
+
+    embed.set_footer(
+        text="From PFO records • rank is for the weight class shown",
+        icon_url=asset_url(LOGO_FILE)
+    )
+
+    return embed
+
+
+class TapePostView(
+    discord.ui.View
+):
+
+    def __init__(self, author_id: int, embed: discord.Embed):
+        super().__init__(timeout=900)
+        self.author_id = author_id
+        self.tape = embed
+
+        post = discord.ui.Button(label="Post it", emoji="📢", style=discord.ButtonStyle.green)
+        post.callback = self.post
+        cancel = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey)
+        cancel.callback = self.cancel
+        self.add_item(post)
+        self.add_item(cancel)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.author_id
+
+    async def post(self, interaction):
+
+        self.stop()
+
+        try:
+            await interaction.channel.send(embed=self.tape)
+        except discord.Forbidden:
+            await interaction.response.edit_message(
+                content="❌ I can't post in this channel. Check my permissions here.", embed=None, view=None
+            )
+            return
+
+        await interaction.response.edit_message(content="📢 Posted!", embed=None, view=None)
+
+    async def cancel(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled. Nothing was posted.", embed=None, view=None)
+
+
+@bot.tree.command(
+    name="taleofthetape",
+    description="Post a side-by-side Tale of the Tape for two fighters (preview first)."
+)
+@app_commands.describe(
+    fighter_a="Red corner",
+    fighter_b="Blue corner",
+    event="Optional event name, e.g. PFO Fight Night 16 Main Event",
+    weight="Weight class for the ranks (default: worked out from the rankings)",
+    notes="Optional notes shown under the names. Use | for a new line"
+)
+@app_commands.choices(
+    weight=DIVISION_CHOICES
+)
+async def taleofthetape(
+    interaction: discord.Interaction,
+    fighter_a: discord.Member,
+    fighter_b: discord.Member,
+    event: str = None,
+    weight: app_commands.Choice[str] = None,
+    notes: str = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can post a Tale of the Tape.", ephemeral=True)
+        return
+
+    if fighter_a.id == fighter_b.id:
+        await interaction.response.send_message("❌ Pick two different fighters.", ephemeral=True)
+        return
+
+    notes = "\n".join(part.strip() for part in notes.split("|")) if notes and notes.strip() else None
+
+    embed = tale_of_the_tape_embed(
+        interaction.guild,
+        fighter_a,
+        fighter_b,
+        weight.value if weight else None,
+        event.strip() if event and event.strip() else None,
+        notes[:800] if notes else None
+    )
+
+    await interaction.response.send_message(
+        content="👁️ **Preview** (only you can see this). Press **Post it** to share it in this channel.",
+        embed=embed,
+        view=TapePostView(interaction.user.id, embed),
+        ephemeral=True
+    )
+
+
 _drafts_restored = False
 
 
@@ -15058,6 +16087,8 @@ async def setup_hook():
     setup_card_draft_tables()
     setup_signup_time_columns()
     setup_coin_tables()
+    setup_reminder_columns()
+    setup_interview_tables()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
@@ -15066,6 +16097,7 @@ async def setup_hook():
     restore_vote_buttons()
     restore_copy_buttons()
     restore_sportsbook_buttons()
+    restore_interview_buttons()
 
     if not vote_closer.is_running():
         vote_closer.start()
