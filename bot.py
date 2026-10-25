@@ -15223,6 +15223,66 @@ INTERVIEW_CHANNEL = os.getenv("INTERVIEW_CHANNEL", "interviews")
 INTERVIEW_NEXT_DELAY = 6          # seconds of quiet after their reply before the next question
 INVITE_DAYS = 3                   # invitations expire after this
 INTERVIEW_THANKS = "Thank you for taking part in the interview, good luck in your future fights"
+INTERVIEW_ROLE = os.getenv("INTERVIEW_ROLE", "Interview")   # given while the interview runs, so they can talk
+
+
+def find_interview_role(guild: discord.Guild):
+
+    wanted = role_key(INTERVIEW_ROLE)
+    roles = list(getattr(guild, "roles", []))
+
+    for role in roles:
+        if role_key(role.name) == wanted:
+            return role
+
+    for role in roles:
+        if "interview" in role_key(role.name):
+            return role
+
+    return None
+
+
+async def set_interview_role(guild: discord.Guild, member, give: bool):
+    """Gives or takes the Interview role. Returns a problem message, or None."""
+
+    if not member:
+        return None
+
+    role = find_interview_role(guild)
+
+    if not role:
+        return f"there's no **{INTERVIEW_ROLE}** role in the server, so they couldn't be given it"
+
+    has_it = any(getattr(current, "id", None) == role.id for current in getattr(member, "roles", []))
+
+    try:
+        if give and not has_it:
+            await member.add_roles(role, reason="PFO interview started")
+        elif not give and has_it:
+            await member.remove_roles(role, reason="PFO interview finished")
+    except discord.Forbidden:
+        return (
+            f"I couldn't {'give' if give else 'remove'} the **{role.name}** role: the bot needs "
+            f"**Manage Roles** and its role must be above {role.name}"
+        )
+    except Exception as error:
+        print(f"Interview role change failed: {error}")
+        return f"I couldn't {'give' if give else 'remove'} the **{role.name}** role (Discord error)"
+
+    return None
+
+
+async def end_interview_role(guild: discord.Guild, interview):
+    """Takes the role back and tells staff if that didn't work."""
+
+    member = guild.get_member(interview["member_id"]) if guild else None
+    problem = await set_interview_role(guild, member, False)
+
+    if problem:
+        await post_staff_log(guild, staff_log_embed(
+            "🎙️ Interview role",
+            [f"<@{interview['member_id']}>'s interview has ended, but {problem}. Please remove it by hand."]
+        ))
 
 _interview_timers = {}
 
@@ -15309,7 +15369,8 @@ def invitation_embed(guild: discord.Guild, interview, note: str = None):
         "",
         f"There {'is' if count == 1 else 'are'} **{count}** question{'s' if count != 1 else ''}. "
         f"They'll be asked one at a time in {channel.mention if channel else 'the interview channel'}. "
-        "Just reply in the channel after each one and the next will follow.",
+        "Just reply in the channel after each one and the next will follow. "
+        "You'll be able to talk there until the interview is finished.",
         "",
         "Press **Accept** when you're ready to start.",
     ]
@@ -15362,6 +15423,7 @@ async def ask_question(guild: discord.Guild, interview_id: int):
 
     if not channel or not member:
         update_interview(interview_id, status="cancelled")
+        await end_interview_role(guild, interview)
         return
 
     questions = interview_questions(interview)
@@ -15370,6 +15432,7 @@ async def ask_question(guild: discord.Guild, interview_id: int):
     if number > len(questions):
 
         update_interview(interview_id, status="done")
+        await end_interview_role(guild, interview)
 
         embed = discord.Embed(
             description=f"🎙️ **{INTERVIEW_THANKS}**, {member.mention}! 🥊",
@@ -15397,6 +15460,15 @@ async def start_interview(guild: discord.Guild, interview_id: int):
     member = guild.get_member(interview["member_id"])
 
     update_interview(interview_id, status="live", current=0, answered=0)
+
+    # The Interview role lets them talk in the channel while it runs.
+    problem = await set_interview_role(guild, member, True)
+
+    if problem:
+        await post_staff_log(guild, staff_log_embed(
+            "🎙️ Interview role",
+            [f"<@{interview['member_id']}>'s interview has started, but {problem}."]
+        ))
 
     record = ""
     try:
@@ -15573,8 +15645,11 @@ class CancelInterviewView(
         self.add_item(cancel)
 
     async def cancel(self, interaction):
+        old = get_interview(self.interview_id)
         update_interview(self.interview_id, status="cancelled")
         await interaction.response.send_modal(InterviewQuestionsModal(self.member, self.channel))
+        if old and old["status"] == "live":
+            await end_interview_role(interaction.guild, old)
 
 
 @bot.tree.command(
