@@ -46,7 +46,7 @@ except ImportError:  # only when testing without discord.py installed
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "3"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "5"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -115,7 +115,21 @@ def row_get(row, key, default=None):
 # Fighters
 # ------------------------------------------------------------
 
+TAG_IN_NAME = re.compile(r"\s*\[[^\[\]]*\]")
+
+
+def clean_name(ctx, name):
+    """'Oliveira [C] / Pico (4-0-0)' -> 'Oliveira / Pico'."""
+    name = ctx.name_without_record(name or "")
+    name = TAG_IN_NAME.sub("", name)
+    return " ".join(name.split()) or "Fighter"
+
+
 def fighter_name(ctx, user_id, saved=None):
+    return clean_name(ctx, _fighter_name(ctx, user_id, saved))
+
+
+def _fighter_name(ctx, user_id, saved=None):
     member = ctx.guild.get_member(user_id) if user_id else None
 
     if member:
@@ -162,7 +176,11 @@ def initials(name):
 
 
 def split_name(name):
-    """'Joshua Van' -> ('JOSHUA', 'VAN') for the big stacked names."""
+    """'Joshua Van' -> ('JOSHUA', 'VAN'); 'Oliveira / Pico' -> ('OLIVEIRA', '/ PICO')."""
+    if "/" in (name or ""):
+        left, right = name.split("/", 1)
+        if left.strip() and right.strip():
+            return left.strip().upper(), "/ " + right.strip().upper()
     parts = (name or "").upper().split()
     if len(parts) < 2:
         return (name or "").upper(), ""
@@ -857,14 +875,17 @@ def result_row(ctx, fight, i=0, show_weight=True):
 
 def render_rankings(ctx, selected=None):
     cache = {}
-    weights = [w for w in ctx.WEIGHTS if w != ctx.P4P_WEIGHT] + [ctx.P4P_WEIGHT]
+    weights = [ctx.P4P_WEIGHT] + [w for w in ctx.WEIGHTS if w != ctx.P4P_WEIGHT]
     names = {ctx.P4P_WEIGHT: "Pound for Pound"}
 
     # Default tab: the division asked for, else the first one with anyone ranked.
     by_weight = {w: ctx.get_division_rankings(ctx.gid, w) for w in weights}
     if selected not in by_weight:
         filled = [w for w in weights if w != ctx.P4P_WEIGHT and by_weight[w]]
-        selected = max(filled, key=lambda w: len(by_weight[w])) if filled else weights[0]
+        if by_weight[ctx.P4P_WEIGHT]:
+            selected = ctx.P4P_WEIGHT          # open on pound for pound
+        else:
+            selected = max(filled, key=lambda w: len(by_weight[w])) if filled else weights[0]
 
     settings = ctx.update_settings(ctx.gid)
     snapshot = ctx.saved_rankings(ctx.gid) if row_get(settings, "snapshot_at") else {}
@@ -877,7 +898,7 @@ def render_rankings(ctx, selected=None):
         rows = by_weight[weight]
         is_sel = weight == selected
         slug = quote(weight)
-        label = "P4P" if weight == ctx.P4P_WEIGHT else weight
+        label = "Pound for Pound" if weight == ctx.P4P_WEIGHT else weight
         tabs += (f'<a role="tab" class="tab" href="?d={slug}" data-tab="{esc(weight)}" '
                  f'aria-selected="{"true" if is_sel else "false"}">{esc(label.upper())}</a>')
 
@@ -1608,7 +1629,9 @@ img{max-width:100%}
 .phero-mark{position:absolute;right:-40px;top:-60px;font:800 420px/.8 var(--d);color:transparent;-webkit-text-stroke:1px rgba(201,162,74,.09);pointer-events:none;white-space:nowrap}
 .phero-in{position:relative;padding-top:90px;padding-bottom:44px;display:flex;flex-direction:column;gap:18px}
 .phero-title{margin:0;font-size:clamp(68px,12vw,160px);line-height:.8}
-.tabs{margin-top:26px;display:flex;gap:4px 26px;border-bottom:1px solid var(--line);overflow-x:auto;scrollbar-width:none}
+.tabs{margin-top:26px;display:flex;flex-wrap:wrap;gap:0 26px;border-bottom:1px solid var(--line)}
+.tab[data-tab=P4P]{color:var(--gold2)}
+.tab[data-tab=P4P][aria-selected=true]{color:var(--gold2)}
 .tabs::-webkit-scrollbar{display:none}
 .tab{background:none;border:0;padding:14px 0;min-height:44px;font:600 13px Inter,sans-serif;letter-spacing:.14em;color:var(--dim);white-space:nowrap;cursor:pointer;transition:color .2s,box-shadow .3s}
 .tab:hover{color:var(--text)}
@@ -1807,6 +1830,8 @@ img{max-width:100%}
 
 /* phones */
 @media (max-width:700px){
+  .tabs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;-webkit-mask:linear-gradient(90deg,#000 85%,transparent);mask:linear-gradient(90deg,#000 85%,transparent);padding-right:40px}
+  .tabs::-webkit-scrollbar{display:none}
   .wrap{padding-left:16px;padding-right:16px}
   .nav-in{gap:6px 18px;flex-wrap:wrap}
   .nav-links{order:3;flex-basis:100%;gap:2px 22px}
