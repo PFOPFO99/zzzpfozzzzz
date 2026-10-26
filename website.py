@@ -46,7 +46,7 @@ except ImportError:  # only when testing without discord.py installed
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "5"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "6"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -309,6 +309,7 @@ NAV = [
     ("rankings", "/rankings", "Rankings"),
     ("fighters", "/fighters", "Fighters"),
     ("results", "/results", "Results"),
+    ("leaderboards", "/leaderboards", "Leaderboards"),
     ("titles", "/titles", "Titles"),
 ]
 
@@ -1152,6 +1153,7 @@ def render_fighter(ctx, user_id):
       <h1 class="d fhero-name l-title">{esc(first)}{'<br>' + esc(last) if last else ''}</h1>
       {handle_html}
       <p class="muted l-up">{esc(' · '.join(meta))}</p>
+      {leaderboard_badges(ctx, user_id)}
     </div>
     <div class="fhero-rec l-up2">
       <span class="eyebrow-grey">PFO RECORD</span>
@@ -1422,6 +1424,153 @@ def render_titles(ctx):
 
     body = page_hero("A DRAW OR NO CONTEST KEEPS THE CHAMPION", "TITLES", "GOLD") + f'<div class="wrap">{blocks}</div>'
     return page(ctx, "Title history", "titles", body, "Every PFO champion in every division.")
+
+
+
+# ============================================================
+# LEADERBOARDS (the same boards as the bot's /leaderboard)
+# ============================================================
+
+BOARD_GROUPS = [
+    ("Record", [("wins", "Most wins"), ("streak", "Win streak"), ("titles", "Title fight wins")]),
+    ("Finishing", [("ko", "KO / TKO wins"), ("sub", "Submission wins"), ("finish", "Finish rate")]),
+    ("Fight stats", [("strikes", "Strikes landed"), ("sigstrikes", "Significant strikes"), ("sigacc", "Striking accuracy"),
+                     ("takedowns", "Takedowns"), ("tdacc", "Takedown accuracy"), ("control", "Control time"),
+                     ("knockdowns", "Knockdowns")]),
+    ("Odds", [("favwins", "Wins as favourite"), ("dogwins", "Wins as underdog")]),
+    ("Community", [("votes", "Correct picks"), ("coins", "Richest")]),
+]
+
+BOARD_NOTES = {
+    "finish": "KO/TKO and submission wins as a share of all wins. Minimum 3 logged wins.",
+    "votes": "Correct fight picks from the community vote, once results are logged.",
+    "coins": "PFO Coins. Points only, earned in the Discord.",
+    "sigacc": "Significant strikes landed out of thrown, from fight stats.",
+    "tdacc": "Takedowns landed out of attempted, from fight stats.",
+    "favwins": "Favourite = shorter betting odds when betting closed.",
+    "dogwins": "Underdog = longer betting odds when betting closed.",
+}
+
+BOARD_UNITS = {
+    "wins": "wins", "streak": "in a row", "titles": "title wins", "ko": "KO/TKO", "sub": "subs",
+    "finish": "", "strikes": "landed", "sigstrikes": "landed", "sigacc": "", "takedowns": "landed",
+    "tdacc": "", "control": "", "knockdowns": "knockdowns", "favwins": "wins", "dogwins": "wins",
+    "votes": "correct", "coins": "coins",
+}
+
+
+def board_value(category, value):
+    if category in ("finish", "sigacc", "tdacc"):
+        return f"{value}%"
+    if category == "control":
+        minutes, seconds = divmod(int(value), 60)
+        return f"{minutes}:{seconds:02d}"
+    return f"{value:,}" if isinstance(value, int) else str(value)
+
+
+def board_detail(category, text):
+    """The bot's line under each name, made web-friendly."""
+    if category == "coins":
+        return ""
+    text = text.replace("`", "")
+    return re.sub(r"<a?:\w+:\d+>", "", text).strip()
+
+
+def board_rows(ctx, category, cache):
+    try:
+        rows = ctx.leaderboard_rows(ctx.guild, category, cache)
+    except Exception:
+        traceback.print_exc()
+        return []
+    ranked, place, previous = [], 0, None
+    for index, (member, value, text) in enumerate(rows[:10], start=1):
+        if value != previous:
+            place, previous = index, value
+        ranked.append((place, member, value, text))
+    return ranked
+
+
+def render_leaderboards(ctx):
+    cache = {}
+    boards = []
+    for group, items in BOARD_GROUPS:
+        for key, label in items:
+            rows = board_rows(ctx, key, cache)
+            if rows:
+                boards.append((group, key, label, rows))
+
+    if not boards:
+        body = page_hero("TOP 10 IN EVERY CATEGORY", "LEADERBOARDS", "TOP") + \
+            '<div class="wrap"><section class="block"><p class="empty">The leaderboards fill up as fights are logged.</p></section></div>'
+        return page(ctx, "Leaderboards", "leaderboards", body)
+
+    tabs = ""
+    last_group = None
+    for group, key, label, rows in boards:
+        if group != last_group:
+            tabs += f'<span class="lb-group">{esc(group.upper())}</span>'
+            last_group = group
+        tabs += (f'<a role="tab" class="lb-tab" href="#board-{key}" data-tab="{key}" '
+                 f'aria-selected="{"true" if key == boards[0][1] else "false"}">{esc(label)}</a>')
+
+    panels = ""
+    for i, (group, key, label, rows) in enumerate(boards):
+        top = rows[0][2] or 1
+        unit = BOARD_UNITS.get(key, "")
+
+        podium = ""
+        for slot, (place, member, value, text) in enumerate(rows[:3]):
+            name = clean_name(ctx, member.display_name)
+            podium += f"""
+        <a href="{fighter_url(member.id)}" class="pod pod-{min(place, 3)} slot-{slot}">
+          <span class="pod-place d">{place}</span>
+          {avatar_html(ctx, member.id, name, 'av pod-av')}
+          <span class="d pod-name">{esc(name)}</span>
+          <span class="pod-val"><b class="d">{esc(board_value(key, value))}</b>{f' <span>{esc(unit)}</span>' if unit else ''}</span>
+          <span class="pod-detail">{esc(board_detail(key, text))}</span>
+        </a>"""
+
+        rest = ""
+        for j, (place, member, value, text) in enumerate(rows[3:]):
+            name = clean_name(ctx, member.display_name)
+            width = max(4, round(100 * (value / top))) if isinstance(value, (int, float)) and top else 0
+            rest += f"""
+          <li class="row lb-row {stagger(j, 3)}">
+            <span class="d lb-place">{place}</span>
+            {avatar_html(ctx, member.id, name, 'av av-sm')}
+            <span class="lb-who">{name_link(ctx, member.id, name, 'd lb-name')}<span class="lb-bar"><span class="bar bar-gold" style="width:{width}%"></span></span></span>
+            <span class="lb-val"><b class="d">{esc(board_value(key, value))}</b><span>{esc(board_detail(key, text))}</span></span>
+          </li>"""
+
+        note = BOARD_NOTES.get(key, "From the PFO fight records.")
+        panels += f"""
+    <div class="lb-panel" role="tabpanel" data-panel="{key}" id="board-{key}" aria-label="{esc(label)}"{'' if i == 0 else ' hidden'}>
+      <div class="head lb-head">
+        <div class="head-t"><span class="eyebrow">{esc(group.upper())}</span><h2 class="d h-l">{esc(label.upper())}</h2></div>
+        <p class="muted lb-note">{esc(note)}</p>
+      </div>
+      <div class="podium">{podium}</div>
+      {f'<ol class="list lb-list">{rest}</ol>' if rest else ''}
+    </div>"""
+
+    extra = f'<div class="lb-tabs l-up" role="tablist" aria-label="Leaderboards">{tabs}</div>'
+    body = page_hero("TOP 10 IN EVERY CATEGORY", "LEADERBOARDS", "TOP") + f'<div class="wrap lb-wrap">{panels}</div>'
+    body = body.replace("</h1>", "</h1>" + extra, 1).replace("phero-title l-title", "phero-title lb-title l-title", 1)
+    return page(ctx, "Leaderboards", "leaderboards", body, "PFO leaderboards: wins, finishes, fight stats, picks and more.")
+
+
+def leaderboard_badges(ctx, user_id):
+    """Top 3 spots for a fighter's profile."""
+    try:
+        places = ctx.leaderboard_places(ctx.guild, user_id)
+    except Exception:
+        return ""
+    labels = dict(item for _, items in BOARD_GROUPS for item in items)
+    chips = "".join(
+        f'<a class="lbchip lbchip-{place}" href="/leaderboards#board-{key}"><span class="d">{place}</span>{esc(labels.get(key, key))}</a>'
+        for place, key in places if key in labels
+    )
+    return f'<div class="lbchips l-up2">{chips}</div>' if chips else ""
 
 
 def render_404(ctx):
@@ -1902,6 +2051,64 @@ img{max-width:100%}
 .ticker .tick-m{animation:mGlow 2.4s ease-in-out infinite}
 @keyframes mGlow{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 12px -2px currentColor}}
 
+/* leaderboards */
+.lb-tabs{margin-top:26px;display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.lb-group{font-size:10px;font-weight:700;letter-spacing:.22em;color:var(--dim);margin:0 4px 0 12px}
+.lb-group:first-child{margin-left:0}
+.lb-tab{border:1px solid var(--line2);color:var(--muted);font:600 13px Inter,sans-serif;padding:9px 14px;border-radius:999px;min-height:40px;display:inline-flex;align-items:center;transition:all .2s}
+.lb-tab:hover{color:var(--text);border-color:#3A3A42}
+.lb-tab[aria-selected=true]{background:var(--gold);border-color:var(--gold);color:var(--bg)}
+.lb-wrap{padding-top:64px;padding-bottom:120px}
+.lb-panel{display:flex;flex-direction:column;gap:40px}
+.lb-panel[hidden]{display:none}
+.lb-title{font-size:clamp(46px,9vw,140px)}
+.lb-panel.show{animation:panelIn .6s var(--ease) both}
+.lb-note{margin:0;max-width:420px;font-size:14px}
+.podium{display:grid;grid-template-columns:1fr 1.15fr 1fr;align-items:end;gap:14px}
+.pod{position:relative;overflow:hidden;display:flex;flex-direction:column;align-items:center;text-align:center;gap:10px;padding:30px 20px 26px;border:1px solid var(--line2);border-radius:18px;background:var(--panel);color:var(--text);transition:border-color .3s,transform .35s var(--ease)}
+.pod:hover{color:var(--text);transform:translateY(-4px);border-color:#4A3D1E}
+.pod-1{padding-top:44px;background:radial-gradient(120% 90% at 50% 0%,rgba(201,162,74,.20),rgba(8,8,10,0) 60%),var(--panel);border-color:rgba(201,162,74,.45)}
+.slot-0{order:2}.slot-1{order:1}.slot-2{order:3}
+.pod-place{position:absolute;top:10px;left:16px;font-size:44px;line-height:1;color:#3A3A42}
+.pod-1 .pod-place{color:var(--gold)}.pod-2 .pod-place{color:#BFC3CA}.pod-3 .pod-place{color:#C08A5B}
+.pod-av{width:76px;height:76px;font-size:26px;border-width:2px}
+.pod-1 .pod-av{width:96px;height:96px;font-size:32px;border-color:var(--gold);animation:ringPulse 2.8s ease-out infinite}
+.pod-2 .pod-av{border-color:#BFC3CA}.pod-3 .pod-av{border-color:#C08A5B}
+.pod-name{font-size:26px;font-weight:700;line-height:1;max-width:100%;overflow-wrap:anywhere}
+.pod-1 .pod-name{font-size:32px}
+.pod-val{color:var(--muted);font-size:13px}
+.pod-val b{font-size:40px;color:var(--text);line-height:1}
+.pod-1 .pod-val b{font-size:52px;color:var(--gold2)}
+.pod-detail{font-size:12px;color:var(--dim)}
+.lb-row{display:flex;align-items:center;gap:16px;padding:14px 6px}
+.lb-place{font-size:28px;width:34px;color:#71717A;font-variant-numeric:tabular-nums}
+.lb-who{flex:1;min-width:0;display:flex;flex-direction:column;gap:8px}
+.lb-name{font-size:22px;font-weight:700;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lb-name:hover{color:var(--gold2)}
+.lb-bar{height:4px;border-radius:2px;background:#17171B;overflow:hidden;max-width:420px}
+.lb-val{display:flex;flex-direction:column;align-items:flex-end;text-align:right;gap:2px}
+.lb-val b{font-size:26px;font-variant-numeric:tabular-nums}
+.lb-val span{font-size:12px;color:var(--dim)}
+.lbchips{display:flex;flex-wrap:wrap;gap:8px}
+.lbchip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line2);background:var(--panel);color:var(--muted);font-size:12px;font-weight:600;padding:5px 12px 5px 6px;border-radius:999px}
+.lbchip:hover{color:var(--text);border-color:#4A3D1E}
+.lbchip span{display:inline-grid;place-items:center;width:22px;height:22px;border-radius:50%;font-size:14px;color:var(--bg);background:#71717A}
+.lbchip-1 span{background:var(--gold)}.lbchip-2 span{background:#BFC3CA}.lbchip-3 span{background:#C08A5B}
+@media (max-width:700px){
+  .podium{grid-template-columns:1fr}
+  .slot-0,.slot-1,.slot-2{order:0}
+  .pod{flex-direction:row;text-align:left;padding:18px 18px 18px 54px;gap:14px}
+  .pod-1{padding-top:18px}
+  .pod-place{top:50%;transform:translateY(-50%);left:16px;font-size:32px}
+  .pod-av,.pod-1 .pod-av{width:56px;height:56px;font-size:20px}
+  .pod-name,.pod-1 .pod-name{font-size:22px;flex:1;min-width:0}
+  .pod-val{display:flex;flex-direction:column;align-items:flex-end}
+  .pod-val b,.pod-1 .pod-val b{font-size:30px}
+  .pod-detail{display:none}
+  .lb-row .av{display:none}
+  .lb-val span{display:none}
+}
+
 /* main event: photos, pulsing VS */
 .corner-top{display:flex;align-items:center;gap:16px}
 .corner-b .corner-top{flex-direction:row-reverse}
@@ -2080,15 +2287,23 @@ SITE_JS = r"""
     tab.addEventListener('click', function (ev) {
       ev.preventDefault();
       var name = tab.getAttribute('data-tab');
-      tabs.forEach(function (t) { t.setAttribute('aria-selected', t === tab ? 'true' : 'false'); });
-      document.querySelectorAll('[data-panel]').forEach(function (p) {
+      var group = tab.closest('[role=tablist]');
+      var scope = tab.closest('.view') || document;
+      group.querySelectorAll('[data-tab]').forEach(function (t) { t.setAttribute('aria-selected', t === tab ? 'true' : 'false'); });
+      var kind = tab.classList.contains('lb-tab') ? '.lb-panel' : '.rank-panel';
+      scope.querySelectorAll(kind + '[data-panel]').forEach(function (p) {
         var on = p.getAttribute('data-panel') === name;
         p.hidden = !on;
         if (on) { p.classList.remove('show'); void p.offsetWidth; p.classList.add('show'); }
       });
-      history.replaceState(null, '', '?d=' + encodeURIComponent(name));
+      if (tab.classList.contains('lb-tab')) { history.replaceState(null, '', '#board-' + name); }
+      else { history.replaceState(null, '', '?d=' + encodeURIComponent(name)); }
     });
   });
+
+  // Open a leaderboard from a link like /leaderboards#board-ko
+  var want = location.hash.indexOf('#board-') === 0 ? location.hash.slice(7) : null;
+  if (want) { var t = document.querySelector('.lb-tab[data-tab="' + want + '"]'); if (t) t.click(); }
 
   // Fighter search + division filter
   var search = document.getElementById('fsearch');
@@ -2224,6 +2439,9 @@ def make_app(bot, g):
     async def titles(request):
         return await serve(request, "titles", render_titles)
 
+    async def leaderboards(request):
+        return await serve(request, "leaderboards", render_leaderboards)
+
     async def css(request):
         return web.Response(text=SITE_CSS, content_type="text/css", headers={"Cache-Control": "public, max-age=86400"})
 
@@ -2243,6 +2461,7 @@ def make_app(bot, g):
     app.router.add_get("/fighter/{user_id}", fighter)
     app.router.add_get("/results", results)
     app.router.add_get("/titles", titles)
+    app.router.add_get("/leaderboards", leaderboards)
     app.router.add_get("/assets/site.css", css)
     app.router.add_get("/assets/site.js", js)
     app.router.add_get("/health", health)
