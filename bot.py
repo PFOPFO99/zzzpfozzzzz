@@ -374,6 +374,7 @@ def setup_database():
     setup_coin_tables()
     setup_reminder_columns()
     setup_interview_tables()
+    setup_rankings_update_tables()
 
 
 # ============================================================
@@ -1352,12 +1353,27 @@ class WithdrawConfirmView(
 #
 # To use different role names without editing this file, set
 # STAFF_ROLES / FIGHTER_ROLES in Railway, comma-separated, e.g.
-#   STAFF_ROLES=Helper,Moderator,Vice President,Owner
+#   STAFF_ROLES=Helper,Moderator,Head Moderator,Vice President,Owner
 STAFF_ROLE_NAMES = [
     name.strip()
     for name in os.getenv(
         "STAFF_ROLES",
-        "Helper,Moderator,Vice President,Owner"
+        "Helper,Moderator,Head Moderator,Vice President,Owner"
+    ).split(",")
+    if name.strip()
+]
+
+# Head Moderator is always staff, even if STAFF_ROLES in Railway
+# was set before that role existed.
+if "headmoderator" not in {"".join(ch for ch in n.casefold() if ch.isalnum()) for n in STAFF_ROLE_NAMES}:
+    STAFF_ROLE_NAMES.insert(-1 if STAFF_ROLE_NAMES else 0, "Head Moderator")
+
+# Senior staff: the only roles that can see /betoverview.
+SENIOR_ROLE_NAMES = [
+    name.strip()
+    for name in os.getenv(
+        "SENIOR_ROLES",
+        "Head Moderator,Vice President,Owner"
     ).split(",")
     if name.strip()
 ]
@@ -1421,6 +1437,23 @@ def is_staff(
     return has_any_role(
         interaction.user,
         STAFF_ROLE_NAMES
+    )
+
+
+def is_senior_staff(
+    interaction: discord.Interaction
+):
+    """Head Moderator, Vice President, Owner (and the server owner)."""
+
+    if not interaction.guild:
+        return False
+
+    if interaction.user.id == interaction.guild.owner_id:
+        return True
+
+    return has_any_role(
+        interaction.user,
+        SENIOR_ROLE_NAMES
     )
 
 
@@ -8373,6 +8406,12 @@ async def vote_closer():
     except Exception as error:
         print(f"Sign-up closer error: {error}")
 
+    # Rankings update posts (Thursday / Sunday 8pm by default).
+    try:
+        await check_rankings_updates()
+    except Exception as error:
+        print(f"Rankings update error: {error}")
+
     # Suspensions ending.
     await run_discipline_checks()
 
@@ -8661,7 +8700,7 @@ async def leaderboard(
         ):
             member = interaction.guild.get_member(row["user_id"])
             if member:
-                rows.append((member, row["balance"], f"🪙 {row['balance']:,}"))
+                rows.append((member, row["balance"], f"{COIN} {row['balance']:,}"))
     elif category.value == "votes":
         rows = voting_leaderboard(interaction.guild)
     else:
@@ -13655,7 +13694,70 @@ async def recap(
 
 COINS_BANNER = "coins.gif"
 SPORTSBOOK_BANNER = "sportsbook.gif"
-COIN = "🪙"
+COIN = "🪙"                        # swapped for the animated PFO Coin emoji at startup
+COIN_EMOJI_NAME = "pfocoin"
+COIN_EMOJI_FILE = "pfo_coin.gif"
+_coin_emoji_checked = False
+
+
+async def load_coin_emoji():
+    """
+    Uses the animated PFO Coin everywhere coins are shown.
+
+    In order: PFO_COIN_EMOJI in Railway (paste the full <a:pfocoin:123...>),
+    a server emoji called pfocoin, the bot's own emoji called pfocoin
+    (uploaded from the assets folder the first time). If none of that
+    works the normal coin emoji is used, so nothing breaks.
+    """
+
+    global COIN, _coin_emoji_checked
+
+    if _coin_emoji_checked:
+        return
+
+    _coin_emoji_checked = True
+
+    setting = os.getenv("PFO_COIN_EMOJI", "").strip()
+
+    if setting:
+        COIN = setting
+        return
+
+    for emoji in getattr(bot, "emojis", []):
+        if emoji.name.lower() == COIN_EMOJI_NAME:
+            COIN = str(emoji)
+            return
+
+    if not hasattr(bot, "fetch_application_emojis"):
+        print("PFO Coin emoji: discord.py 2.5+ needed to upload it. Using 🪙 for now.")
+        return
+
+    try:
+        for emoji in await bot.fetch_application_emojis():
+            if emoji.name.lower() == COIN_EMOJI_NAME:
+                COIN = str(emoji)
+                return
+
+        url = asset_url(COIN_EMOJI_FILE)
+
+        if not url:
+            return
+
+        import aiohttp
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    print(f"PFO Coin emoji: couldn't download {COIN_EMOJI_FILE} ({response.status}). Using 🪙.")
+                    return
+                image = await response.read()
+
+        emoji = await bot.create_application_emoji(name=COIN_EMOJI_NAME, image=image)
+        COIN = str(emoji)
+        print(f"PFO Coin emoji uploaded: {COIN}")
+
+    except Exception as error:
+        print(f"PFO Coin emoji: {error}. Using 🪙.")
 
 START_BALANCE = int(os.getenv("COINS_START", "1000"))
 DAILY_BONUS = int(os.getenv("COINS_DAILY", "100"))
@@ -14031,6 +14133,21 @@ def arrow(now: float, opening: float):
     return ""
 
 
+def bout_slot(position: int, total: int):
+    """Last fight = Main Event, the one before = Co-Main, like the recaps."""
+
+    if position == total:
+        return "Main Event"
+    if position == total - 1:
+        return "Co-Main"
+    return f"Fight {position}"
+
+
+def short_tag(tag: str):
+    """'[C]' -> 'C', '[#3]' -> '#3'."""
+    return tag.strip("[]") if tag else ""
+
+
 def sportsbook_embeds(market):
 
     is_open = market_is_open(market)
@@ -14040,77 +14157,87 @@ def sportsbook_embeds(market):
         (market["id"],)
     )[0]
 
-    if is_open:
-        header = [
-            f"{COIN} **Bet PFO Coins on the fights.** Odds move as bets come in.",
-            f"⏰ Betting closes <t:{market['closes_at']}:F> (<t:{market['closes_at']}:R>)",
-        ]
-    elif market["status"] == "settled":
-        header = ["✅ **All fights settled.** Winnings have been paid out."]
-    else:
-        header = ["🔒 **Betting is closed.** Bets are paid out as results are logged."]
+    staked = (
+        f"{COIN} **{coins_text(bettors['total'])}** staked by **{bettors['n']}** "
+        f"{'bettor' if bettors['n'] == 1 else 'bettors'}"
+    )
 
-    blocks = []
+    if is_open:
+        header = [f"Betting closes <t:{market['closes_at']}:f> · <t:{market['closes_at']}:R>", staked]
+    elif market["status"] == "settled":
+        header = ["✅ **All fights settled.** Winnings have been paid out.", staked]
+    else:
+        header = ["🔒 **Betting is closed.** Bets are paid out as results are logged.", staked]
+
+    fields = []
+    total = len(bouts)
 
     for bout in bouts:
 
-        odds = live_odds(bout)
-        number = f"`{bout['position']:>2}`"
-        tag_a = ranking_tag(market["guild_id"], bout["fighter_a"], bout["weight"])
-        tag_b = ranking_tag(market["guild_id"], bout["fighter_b"], bout["weight"])
-        tag_a = f" {tag_a}" if tag_a else ""
-        tag_b = f" {tag_b}" if tag_b else ""
+        name = bout_slot(bout["position"], total) + (f" · {bout['weight']}" if bout["weight"] else "")
 
         if bout["result"]:
             if bout["result"] == "void":
-                outcome = "🤝 Draw / no contest: bets refunded"
+                value = "🤝 Draw / no contest · bets refunded"
             else:
                 winner = bout["name_a"] if bout["result"] == "a" else bout["name_b"]
                 how = METHOD_NAMES.get(bout["method"], bout["method"] or "")
-                outcome = f"✅ **{winner}** won" + (f" by {how}" if how else "")
-            blocks.append(
-                f"**Fight {bout['position']}** · {bout['name_a']} vs {bout['name_b']}\n{outcome}"
-            )
+                value = f"✅ **{winner}** won" + (f" by {how}" if how else "")
+            fields.append((name, f"{value}\n-# {bout['name_a']} vs {bout['name_b']}"))
             continue
 
-        weight = f" · {bout['weight']}" if bout["weight"] else ""
-        blocks.append(
-            f"**Fight {bout['position']}**{weight} · {COIN} {coins_text(odds['pool'])} bet\n"
-            f"🔴 **{bout['name_a']}**{tag_a}  `{odds['a']:.2f}`{arrow(odds['a'], odds['open_a'])}\n"
-            f"🔵 **{bout['name_b']}**{tag_b}  `{odds['b']:.2f}`{arrow(odds['b'], odds['open_b'])}"
-        )
+        odds = live_odds(bout)
+        tag_a = short_tag(ranking_tag(market["guild_id"], bout["fighter_a"], bout["weight"]))
+        tag_b = short_tag(ranking_tag(market["guild_id"], bout["fighter_b"], bout["weight"]))
+        pools = fight_pools(bout["market_id"], bout["position"])
 
-    footer = (
-        f"👥 **{bettors['n']}** {'bettor' if bettors['n'] == 1 else 'bettors'} · "
-        f"{COIN} **{coins_text(bettors['total'])}** coins staked"
-    )
+        lines = [
+            f"`{odds['a']:.2f}`  **{bout['name_a']}**" + (f" {tag_a}" if tag_a else "") + arrow(odds["a"], odds["open_a"]),
+            f"`{odds['b']:.2f}`  **{bout['name_b']}**" + (f" {tag_b}" if tag_b else "") + arrow(odds["b"], odds["open_b"]),
+        ]
 
-    pages = [header + [""]]
+        if odds["pool"]:
+            favourite = "a" if pools["a"] >= pools["b"] else "b"
+            share = round(100 * pools[favourite] / odds["pool"])
+            surname = (bout["name_a"] if favourite == "a" else bout["name_b"]).split()[-1]
+            lines.append(f"-# {COIN} {coins_text(odds['pool'])} bet · {share}% on {surname}")
+        else:
+            lines.append("-# No bets yet")
 
-    for block in blocks:
-        if len("\n".join(pages[-1])) + len(block) > 3800:
+        fields.append((name, "\n".join(lines)))
+
+    # Discord allows 25 sections per post and 6,000 characters overall.
+    pages = [[]]
+    size = len("\n".join(header)) + len(market["event"])
+
+    for field in fields:
+        if len(pages[-1]) >= 25 or size + len(field[0]) + len(field[1]) > 5600:
             pages.append([])
-        pages[-1] += [block, ""]
+            size = 0
+        pages[-1].append(field)
+        size += len(field[0]) + len(field[1])
 
-    pages[-1].append(footer)
     embeds = []
 
     for index, page in enumerate(pages):
 
         embed = discord.Embed(
             title=market["event"] if index == 0 else None,
-            description="\n".join(page),
+            description="\n".join(header) if index == 0 else None,
             color=PFO_GOLD
         )
 
         if index == 0:
             apply_branding(embed, author_text="PFO • SPORTSBOOK")
 
+        for name, value in page:
+            embed.add_field(name=name, value=value, inline=False)
+
         if index == len(pages) - 1:
             embed.set_image(url=asset_url(SPORTSBOOK_BANNER))
             embed.timestamp = discord.utils.utcnow()
             embed.set_footer(
-                text="Odds update every minute • ▼ shortening ▲ drifting • coins are points only, no real money",
+                text="▼ odds shortening  ▲ drifting • updates every minute • points only, no real money",
                 icon_url=asset_url(LOGO_FILE)
             )
 
@@ -14994,6 +15121,387 @@ async def lockbets(
         await refresh_sportsbook(market["id"])
 
 
+# ------------------------------------------------------------
+# /betoverview  (Head Moderator, Vice President and Owner only)
+#
+# Every live and finished bet, how much is riding on open bets,
+# and exactly how much each person has won or lost. Can be narrowed
+# to one event and/or one member. Only the person who ran it sees it.
+# ------------------------------------------------------------
+
+OVERVIEW_PAGE_SIZE = 12
+SENIOR_ONLY_TEXT = "Only " + ", ".join(SENIOR_ROLE_NAMES[:-1]) + (" or " if len(SENIOR_ROLE_NAMES) > 1 else "") + SENIOR_ROLE_NAMES[-1]
+
+
+def overview_filter(guild_id: int, market_id: int = None, user_id: int = None):
+
+    where = ["bets.guild_id = ?"]
+    params = [guild_id]
+
+    if market_id:
+        where.append("bets.market_id = ?")
+        params.append(market_id)
+
+    if user_id:
+        where.append("bets.user_id = ?")
+        params.append(user_id)
+
+    return " AND ".join(where), params
+
+
+def bet_profit(bet):
+    """What the bettor is up or down on a finished bet."""
+
+    if bet["status"] == "won":
+        return bet["payout"] - bet["stake"]
+    if bet["status"] == "lost":
+        return -bet["stake"]
+    return 0
+
+
+def signed(amount: int):
+    return f"+{coins_text(amount)}" if amount > 0 else ("0" if amount == 0 else f"-{coins_text(-amount)}")
+
+
+def overview_name(guild: discord.Guild, user_id: int):
+    member = guild.get_member(user_id)
+    return name_without_record(member.display_name) if member else DEPARTED_NAME_CACHE.get(user_id, f"User {user_id}")
+
+
+def overview_bet_line(guild: discord.Guild, bet):
+
+    legs = discipline_query("""
+        SELECT bet_legs.*, bet_fights.name_a, bet_fights.name_b FROM bet_legs
+        JOIN bet_fights ON bet_fights.market_id = ? AND bet_fights.position = bet_legs.position
+        WHERE bet_legs.bet_id = ? ORDER BY bet_legs.position
+    """, (bet["market_id"], bet["id"]))
+
+    status = {"open": "🟡", "won": "🟢", "lost": "🔴", "void": "⚪"}[bet["status"]]
+    returns = round(bet["stake"] * bet["odds"])
+
+    if len(legs) == 1:
+        pick = pick_label(legs[0], legs[0]["pick"], legs[0]["method"])
+    else:
+        leg_icons = {"pending": "⏳", "won": "✅", "lost": "❌", "void": "🤝"}
+        pick = f"Acca ({len(legs)}): " + ", ".join(
+            f"{leg_icons[leg['status']]}{pick_label(leg, leg['pick'], leg['method'])}" for leg in legs
+        )
+
+    if bet["status"] == "open":
+        money = f"to return {COIN} **{coins_text(returns)}**"
+    elif bet["status"] == "won":
+        money = f"won {COIN} **{coins_text(bet['payout'])}** (`{signed(bet_profit(bet))}`)"
+    elif bet["status"] == "lost":
+        money = f"lost (`{signed(-bet['stake'])}`)"
+    else:
+        money = "refunded"
+
+    line = (
+        f"{status} **{overview_name(guild, bet['user_id'])}** · {coins_text(bet['stake'])} @ `{bet['odds']:.2f}` · {money}\n"
+        f"-# {pick[:150]} · {bet['event']}"
+    )
+
+    return line
+
+
+def bet_overview_summary(guild: discord.Guild, market_id: int = None, user_id: int = None):
+
+    where, params = overview_filter(guild.id, market_id, user_id)
+    bets = discipline_query(
+        f"SELECT bets.*, bet_markets.event FROM bets JOIN bet_markets ON bet_markets.id = bets.market_id WHERE {where}",
+        tuple(params)
+    )
+
+    open_bets = [bet for bet in bets if bet["status"] == "open"]
+    settled = [bet for bet in bets if bet["status"] != "open"]
+
+    staked = sum(bet["stake"] for bet in bets)
+    paid = sum(bet["payout"] for bet in settled if bet["status"] in ("won", "void"))
+    settled_staked = sum(bet["stake"] for bet in settled)
+    house = settled_staked - paid
+    riding = sum(bet["stake"] for bet in open_bets)
+    exposure = sum(round(bet["stake"] * bet["odds"]) for bet in open_bets)
+    won = [bet for bet in settled if bet["status"] == "won"]
+    lost = [bet for bet in settled if bet["status"] == "lost"]
+
+    lines = []
+
+    if market_id:
+        market = get_market(market_id)
+        state = {"open": "🟢 open", "locked": "🔒 locked", "settled": "✅ settled"}.get(market["status"], market["status"])
+        lines.append(f"-# {market['event']} · {state}")
+    if user_id:
+        lines.append(f"-# Bets by {overview_name(guild, user_id)}")
+    if lines:
+        lines.append("")
+
+    lines += [
+        f"🧾 **{len(bets)}** {'bet' if len(bets) == 1 else 'bets'} by **{len({bet['user_id'] for bet in bets})}** "
+        f"{'person' if len({bet['user_id'] for bet in bets}) == 1 else 'people'} · {COIN} **{coins_text(staked)}** staked",
+        "",
+        "**🟡 Live**",
+        f"**{len(open_bets)}** open · {COIN} **{coins_text(riding)}** riding",
+        f"Would pay out up to {COIN} **{coins_text(exposure)}** if every one wins",
+        "",
+        "**✅ Finished**",
+        f"🟢 **{len(won)}** won · 🔴 **{len(lost)}** lost · ⚪ **{sum(1 for bet in settled if bet['status'] == 'void')}** refunded",
+        f"Paid out {COIN} **{coins_text(paid)}** from {COIN} **{coins_text(settled_staked)}** staked",
+        (f"Bettors are **up** `{signed(-house)}` overall" if house < 0 else
+         f"Bettors are **down** `{signed(-house)}` overall" if house > 0 else "Bettors are level overall"),
+    ]
+
+    if won:
+        best = max(won, key=bet_profit)
+        lines += ["", f"💰 Biggest win: **{overview_name(guild, best['user_id'])}** `{signed(bet_profit(best))}` ({best['event']})"]
+
+    if lost:
+        worst = max(lost, key=lambda bet: bet["stake"])
+        lines.append(f"💸 Biggest loss: **{overview_name(guild, worst['user_id'])}** `{signed(-worst['stake'])}` ({worst['event']})")
+
+    # Where coins come from (whole server, or this member)
+    ledger_where = "guild_id = ?" + (" AND user_id = ?" if user_id else "")
+    ledger_params = (guild.id, user_id) if user_id else (guild.id,)
+    sources = {"Daily bonus": 0, "Fighting": 0, "Vote picks": 0, "Bets (net)": 0, "Staff": 0}
+
+    if not market_id:
+        for row in discipline_query(
+            f"SELECT reason, SUM(amount) AS total FROM coin_ledger WHERE {ledger_where} GROUP BY reason", ledger_params
+        ):
+            reason = row["reason"]
+            key = (
+                "Daily bonus" if reason == "daily" else
+                "Fighting" if reason.startswith("fight") else
+                "Vote picks" if reason.startswith("votepick") else
+                "Bets (net)" if reason.startswith(("bet:", "stake:")) else
+                "Staff" if reason.startswith("staff") else None
+            )
+            if key:
+                sources[key] += row["total"]
+
+        lines += ["", "**Where coins came from**"]
+        lines += [f"{name}: `{signed(total)}`" for name, total in sources.items() if total]
+
+    embed = discord.Embed(
+        title="Bet overview",
+        description="\n".join(lines)[:4000],
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_author(name="PFO • SPORTSBOOK", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text="Only you can see this • 🟡 open 🟢 won 🔴 lost ⚪ refunded")
+
+    return embed
+
+
+def bet_overview_list(guild: discord.Guild, kind: str, page: int, market_id: int = None, user_id: int = None):
+    """kind: 'live' or 'settled'. Returns (embed, page count)."""
+
+    where, params = overview_filter(guild.id, market_id, user_id)
+    status = "bets.status = 'open'" if kind == "live" else "bets.status != 'open'"
+    bets = discipline_query(
+        f"SELECT bets.*, bet_markets.event FROM bets JOIN bet_markets ON bet_markets.id = bets.market_id "
+        f"WHERE {where} AND {status} ORDER BY bets.id DESC",
+        tuple(params)
+    )
+
+    pages = max(1, -(-len(bets) // OVERVIEW_PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+    chunk = bets[page * OVERVIEW_PAGE_SIZE:(page + 1) * OVERVIEW_PAGE_SIZE]
+
+    if kind == "live":
+        title = "Live bets"
+        total = sum(bet["stake"] for bet in bets)
+        head = f"**{len(bets)}** open · {COIN} **{coins_text(total)}** riding"
+    else:
+        title = "Finished bets"
+        head = f"**{len(bets)}** settled · bettors overall `{signed(sum(bet_profit(bet) for bet in bets))}`"
+
+    lines = [head, ""] + [overview_bet_line(guild, bet) for bet in chunk] if bets else ["Nothing here yet."]
+
+    text = ""
+    for line in lines:
+        if len(text) + len(line) > 3900:
+            text += "…"
+            break
+        text += line + "\n"
+
+    embed = discord.Embed(title=title, description=text, color=PFO_GOLD)
+    embed.set_author(name="PFO • SPORTSBOOK", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text=f"Page {page + 1} of {pages} • newest first • only you can see this")
+
+    return embed, pages
+
+
+def bet_overview_people(guild: discord.Guild, page: int, market_id: int = None, user_id: int = None):
+    """Everyone's betting: staked, won, lost, profit, open. Biggest winners first."""
+
+    where, params = overview_filter(guild.id, market_id, user_id)
+    people = {}
+
+    for bet in discipline_query(f"SELECT bets.* FROM bets WHERE {where}", tuple(params)):
+        person = people.setdefault(bet["user_id"], {"bets": 0, "staked": 0, "won": 0, "lost": 0, "profit": 0, "open": 0})
+        person["bets"] += 1
+        person["staked"] += bet["stake"]
+        person["profit"] += bet_profit(bet)
+        person["won"] += bet["status"] == "won"
+        person["lost"] += bet["status"] == "lost"
+        if bet["status"] == "open":
+            person["open"] += bet["stake"]
+
+    ranked = sorted(people.items(), key=lambda item: (-item[1]["profit"], -item[1]["staked"]))
+    pages = max(1, -(-len(ranked) // OVERVIEW_PAGE_SIZE))
+    page = min(max(page, 0), pages - 1)
+
+    lines = []
+
+    for position, (person_id, person) in enumerate(ranked[page * OVERVIEW_PAGE_SIZE:(page + 1) * OVERVIEW_PAGE_SIZE],
+                                                   start=page * OVERVIEW_PAGE_SIZE + 1):
+        balance = get_wallet(guild.id, person_id)["balance"]
+        icon = "📈" if person["profit"] > 0 else ("📉" if person["profit"] < 0 else "➖")
+        lines.append(
+            f"`{position:>2}` {icon} **{overview_name(guild, person_id)}** `{signed(person['profit'])}`\n"
+            f"-# {plural(person['bets'], 'bet')} · {person['won']}W {person['lost']}L · {coins_text(person['staked'])} staked"
+            + (f" · {coins_text(person['open'])} open" if person["open"] else "")
+            + f" · balance {coins_text(balance)}"
+        )
+
+    embed = discord.Embed(
+        title="Winners and losers",
+        description="\n".join(lines) if lines else "Nobody has bet yet.",
+        color=PFO_GOLD
+    )
+    embed.set_author(name="PFO • SPORTSBOOK", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text=f"Page {page + 1} of {pages} • profit on finished bets • only you can see this")
+
+    return embed, pages
+
+
+class BetOverviewView(
+    discord.ui.View
+):
+
+    TABS = [("summary", "Overview", "📊"), ("live", "Live", "🟡"), ("settled", "Finished", "✅"), ("people", "People", "👥")]
+
+    def __init__(self, guild: discord.Guild, owner_id: int, market_id: int = None, user_id: int = None):
+        super().__init__(timeout=900)
+        self.guild = guild
+        self.owner_id = owner_id
+        self.market_id = market_id
+        self.user_id = user_id
+        self.tab = "summary"
+        self.page = 0
+        self.pages = 1
+        self.build()
+
+    def render(self):
+
+        if self.tab == "summary":
+            self.pages = 1
+            return bet_overview_summary(self.guild, self.market_id, self.user_id)
+
+        if self.tab == "people":
+            embed, self.pages = bet_overview_people(self.guild, self.page, self.market_id, self.user_id)
+            return embed
+
+        embed, self.pages = bet_overview_list(self.guild, self.tab, self.page, self.market_id, self.user_id)
+        return embed
+
+    def build(self):
+
+        embed = self.render()
+        self.clear_items()
+
+        for key, label, emoji in self.TABS:
+            button = discord.ui.Button(
+                label=label, emoji=emoji, row=0,
+                style=discord.ButtonStyle.blurple if key == self.tab else discord.ButtonStyle.grey
+            )
+            button.callback = self.make_tab(key)
+            self.add_item(button)
+
+        if self.pages > 1:
+            back = discord.ui.Button(label="◀", style=discord.ButtonStyle.grey, row=1, disabled=self.page == 0)
+            back.callback = self.make_page(-1)
+            forward = discord.ui.Button(label="▶", style=discord.ButtonStyle.grey, row=1, disabled=self.page >= self.pages - 1)
+            forward.callback = self.make_page(1)
+            self.add_item(back)
+            self.add_item(forward)
+
+        return embed
+
+    def make_tab(self, key):
+        async def callback(interaction):
+            self.tab = key
+            self.page = 0
+            await interaction.response.edit_message(embed=self.build(), view=self)
+        return callback
+
+    def make_page(self, step):
+        async def callback(interaction):
+            self.page += step
+            await interaction.response.edit_message(embed=self.build(), view=self)
+        return callback
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.owner_id
+
+
+async def market_autocomplete(interaction: discord.Interaction, current: str):
+
+    rows = discipline_query(
+        "SELECT id, event, status FROM bet_markets WHERE guild_id = ? ORDER BY id DESC LIMIT 50",
+        (interaction.guild.id,)
+    )
+    state = {"open": "open", "locked": "locked", "settled": "settled"}
+
+    return [
+        app_commands.Choice(name=f"{row['event']} ({state.get(row['status'], row['status'])})"[:100], value=str(row["id"]))
+        for row in rows if current.lower() in row["event"].lower()
+    ][:25]
+
+
+@bot.tree.command(
+    name="betoverview",
+    description="Every live and finished bet and how much people are winning (senior staff)."
+)
+@app_commands.describe(
+    event="Only this betting event (default: all)",
+    member="Only this member's bets (default: everyone)"
+)
+@app_commands.autocomplete(event=market_autocomplete)
+async def betoverview(
+    interaction: discord.Interaction,
+    event: str = None,
+    member: discord.Member = None
+):
+
+    if not is_senior_staff(interaction):
+        await interaction.response.send_message(f"❌ {SENIOR_ONLY_TEXT} can see the bet overview.", ephemeral=True)
+        return
+
+    market_id = None
+
+    if event:
+        market = get_market(int(event)) if event.isdigit() else None
+
+        if not market:
+            rows = discipline_query(
+                "SELECT * FROM bet_markets WHERE guild_id = ? AND event LIKE ? ORDER BY id DESC LIMIT 1",
+                (interaction.guild.id, f"%{event.strip()}%")
+            )
+            market = rows[0] if rows else None
+
+        if not market or market["guild_id"] != interaction.guild.id:
+            await interaction.response.send_message("❌ I couldn't find that betting event.", ephemeral=True)
+            return
+
+        market_id = market["id"]
+
+    view = BetOverviewView(interaction.guild, interaction.user.id, market_id, member.id if member else None)
+
+    await interaction.response.send_message(embed=view.render(), view=view, ephemeral=True)
+
+
 async def sportsbook_tick():
     """Every minute: lock betting at its closing time, refresh odds on posts with new bets."""
 
@@ -15208,11 +15716,21 @@ async def check_card_reminders():
 # INTERVIEWS
 #
 # /interview @member   staff type up to 5 questions; the member gets
-#                      a DM invitation (Accept / Decline). Once they
-#                      accept, the questions are asked one by one in
-#                      the interview channel. Each one waits for their
-#                      reply, then the next is asked. At the end the
-#                      bot thanks them.
+#                      a DM invitation (Accept / Decline). When they
+#                      accept, a notice goes to the staff bot channel
+#                      (pfo-bot) with Start / Cancel. Nothing happens in
+#                      the interview channel (and no Interview role is
+#                      given) until staff press Start. Then the questions
+#                      are asked one by one, each waiting for their reply.
+#                      At the end the bot thanks them.
+#
+#                      Several invites can be out at once. If one is
+#                      already running in the channel, Start queues the
+#                      next and it begins when the current one ends.
+#
+# /interviews          every interview that's invited, waiting, queued
+#                      or live, with a menu to cancel any of them
+#                      (e.g. someone who has stopped replying).
 #
 # The interview channel is any channel with "interview" in its name,
 # or set INTERVIEW_CHANNEL in Railway (name or ID).
@@ -15305,6 +15823,15 @@ def setup_interview_tables():
             created_at INTEGER NOT NULL
         )
     """)
+
+    # Added later: the staff notice in pfo-bot, and who started it.
+    for column, kind in (("notice_channel_id", "INTEGER"), ("notice_message_id", "INTEGER"),
+                         ("accepted_at", "INTEGER"), ("started_by", "INTEGER"), ("started_at", "INTEGER")):
+        try:
+            db.execute(f"ALTER TABLE interviews ADD COLUMN {column} {kind}")
+        except sqlite3.OperationalError:
+            pass
+
     db.commit()
     db.close()
 
@@ -15348,7 +15875,7 @@ def interview_questions(interview):
 
 def open_interview_for(guild_id: int, member_id: int):
     rows = discipline_query(
-        "SELECT * FROM interviews WHERE guild_id = ? AND member_id = ? AND status IN ('invited', 'live') "
+        "SELECT * FROM interviews WHERE guild_id = ? AND member_id = ? AND status IN ('invited', 'accepted', 'queued', 'live') "
         "ORDER BY id DESC LIMIT 1",
         (guild_id, member_id)
     )
@@ -15372,7 +15899,7 @@ def invitation_embed(guild: discord.Guild, interview, note: str = None):
         "Just reply in the channel after each one and the next will follow. "
         "You'll be able to talk there until the interview is finished.",
         "",
-        "Press **Accept** when you're ready to start.",
+        "Press **Accept** and staff will start it shortly. You'll be pinged in the channel when it begins.",
     ]
 
     if note:
@@ -15424,6 +15951,8 @@ async def ask_question(guild: discord.Guild, interview_id: int):
     if not channel or not member:
         update_interview(interview_id, status="cancelled")
         await end_interview_role(guild, interview)
+        await refresh_interview_notice(guild, interview_id, "The member or channel is gone, so it was cancelled.")
+        await start_next_interview(guild, interview["channel_id"])
         return
 
     questions = interview_questions(interview)
@@ -15433,6 +15962,7 @@ async def ask_question(guild: discord.Guild, interview_id: int):
 
         update_interview(interview_id, status="done")
         await end_interview_role(guild, interview)
+        await refresh_interview_notice(guild, interview_id)
 
         embed = discord.Embed(
             description=f"🎙️ **{INTERVIEW_THANKS}**, {member.mention}! 🥊",
@@ -15443,6 +15973,7 @@ async def ask_question(guild: discord.Guild, interview_id: int):
         embed.set_footer(text="Prestige Fighting Organisation", icon_url=asset_url(LOGO_FILE))
 
         await channel.send(embed=embed)
+        await start_next_interview(guild, interview["channel_id"])
         return
 
     update_interview(interview_id, current=number, answered=0)
@@ -15452,6 +15983,8 @@ async def ask_question(guild: discord.Guild, interview_id: int):
         embed=question_embed(interview, number, member)
     )
 
+    await refresh_interview_notice(guild, interview_id)
+
 
 async def start_interview(guild: discord.Guild, interview_id: int):
 
@@ -15459,7 +15992,13 @@ async def start_interview(guild: discord.Guild, interview_id: int):
     channel = guild.get_channel(interview["channel_id"])
     member = guild.get_member(interview["member_id"])
 
-    update_interview(interview_id, status="live", current=0, answered=0)
+    if not channel or not member:
+        update_interview(interview_id, status="cancelled")
+        await refresh_interview_notice(guild, interview_id, "The member or channel is gone, so it was cancelled.")
+        return
+
+    update_interview(interview_id, status="live", current=0, answered=0,
+                     started_at=int(time.time()), last_reply_at=int(time.time()))
 
     # The Interview role lets them talk in the channel while it runs.
     problem = await set_interview_role(guild, member, True)
@@ -15492,6 +16031,7 @@ async def start_interview(guild: discord.Guild, interview_id: int):
         embed.set_thumbnail(url=avatar.url)
 
     await channel.send(embed=embed)
+    await refresh_interview_notice(guild, interview_id)
     await ask_question(guild, interview_id)
 
 
@@ -15552,16 +16092,18 @@ class InterviewInviteView(
 
         channel = guild.get_channel(interview["channel_id"])
 
+        update_interview(self.interview_id, status="accepted", accepted_at=int(time.time()))
+
         await interaction.response.edit_message(
             content=(
-                f"✅ **Let's go!** Head to {channel.mention if channel else 'the interview channel'}: "
-                "the first question is waiting for you."
+                "✅ **Thanks, you're in!** Staff will start your interview shortly. "
+                f"You'll be pinged in {channel.mention if channel else 'the interview channel'} when the first question is up."
             ),
             embed=None,
             view=None
         )
 
-        await start_interview(guild, self.interview_id)
+        await post_interview_notice(guild, self.interview_id)
 
     async def accept(self, interaction):
         await self.answer(interaction, True)
@@ -15624,8 +16166,9 @@ class InterviewQuestionsModal(
         listed = "\n".join(f"`{number}.` {question}" for number, question in enumerate(questions, start=1))
 
         await interaction.response.send_message(
-            f"📨 **Invitation sent to {self.member.display_name}.** Once they accept, the questions will be "
-            f"asked one by one in {self.channel.mention}:\n\n{listed}",
+            f"📨 **Invitation sent to {self.member.display_name}.** When they accept, a notice will appear in the "
+            f"staff bot channel so you can start it. The questions will then be asked one by one in "
+            f"{self.channel.mention}:\n\n{listed}",
             ephemeral=True
         )
 
@@ -15645,11 +16188,8 @@ class CancelInterviewView(
         self.add_item(cancel)
 
     async def cancel(self, interaction):
-        old = get_interview(self.interview_id)
-        update_interview(self.interview_id, status="cancelled")
         await interaction.response.send_modal(InterviewQuestionsModal(self.member, self.channel))
-        if old and old["status"] == "live":
-            await end_interview_role(interaction.guild, old)
+        await cancel_interview(interaction.guild, self.interview_id, interaction.user.id)
 
 
 @bot.tree.command(
@@ -15687,7 +16227,11 @@ async def interview(
     existing = open_interview_for(interaction.guild.id, member.id)
 
     if existing:
-        state = "is waiting for them to accept" if existing["status"] == "invited" else "is in progress"
+        state = {
+            "invited": "is waiting for them to accept",
+            "accepted": "is waiting for staff to start it",
+            "queued": "is queued to start",
+        }.get(existing["status"], "is in progress")
         await interaction.response.send_message(
             f"⚠️ An interview with **{member.display_name}** {state}.",
             view=CancelInterviewView(existing["id"], member, channel),
@@ -15766,11 +16310,367 @@ async def check_interviews():
             await ask_question(guild, interview["id"])
 
 
+# ------------------------------------------------------------
+# Staff approval, queue and cancelling
+# ------------------------------------------------------------
+
+INTERVIEW_STATES = {
+    "invited": ("📨", "Invited, waiting for them to accept"),
+    "accepted": ("🙋", "Accepted, waiting for staff to start"),
+    "queued": ("⏳", "Queued, starts when the current one ends"),
+    "live": ("🔴", "Live"),
+    "done": ("✅", "Finished"),
+    "cancelled": ("🚫", "Cancelled"),
+    "declined": ("👎", "Declined"),
+    "expired": ("⌛", "Expired"),
+}
+
+
+def live_interview_in(channel_id: int, not_id: int = None):
+    rows = discipline_query(
+        "SELECT * FROM interviews WHERE channel_id = ? AND status = 'live' AND id != ? ORDER BY id LIMIT 1",
+        (channel_id, not_id or 0)
+    )
+    return rows[0] if rows else None
+
+
+def interview_progress(interview):
+
+    total = len(interview_questions(interview))
+
+    if interview["status"] != "live":
+        return None
+
+    text = f"Question **{max(interview['current'], 1)}** of **{total}**"
+
+    if interview["last_reply_at"]:
+        text += f" · last activity <t:{interview['last_reply_at']}:R>"
+
+    return text
+
+
+def interview_notice_embed(guild: discord.Guild, interview, note: str = None):
+
+    icon, state = INTERVIEW_STATES.get(interview["status"], ("🎙️", interview["status"]))
+    questions = interview_questions(interview)
+    channel = guild.get_channel(interview["channel_id"]) if guild else None
+
+    lines = [
+        f"<@{interview['member_id']}> accepted their interview.",
+        f"-# Set up by <@{interview['staff_id']}> · in {channel.mention if channel else 'the interview channel'}",
+        "",
+        f"{icon} **{state}**",
+    ]
+
+    if interview["status"] == "live":
+        lines.append(interview_progress(interview))
+        if interview["started_by"]:
+            lines.append(f"-# Started by <@{interview['started_by']}>")
+
+    if interview["status"] == "queued":
+        current = live_interview_in(interview["channel_id"], interview["id"])
+        if current:
+            lines.append(f"-# Waiting for <@{current['member_id']}>'s interview to finish")
+
+    if note:
+        lines += ["", note]
+
+    lines += ["", "**Questions**"] + [f"`{number}.` {question}" for number, question in enumerate(questions, start=1)]
+
+    embed = discord.Embed(
+        title="🎙️ Interview",
+        description="\n".join(line for line in lines if line is not None)[:4000],
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_author(name="PFO • INTERVIEW", icon_url=asset_url(LOGO_FILE))
+
+    return embed
+
+
+class InterviewStaffView(
+    discord.ui.View
+):
+    """Start / Cancel on the staff notice. Works after restarts."""
+
+    def __init__(self, interview_id: int):
+
+        super().__init__(timeout=None)
+
+        self.interview_id = interview_id
+        interview = get_interview(interview_id)
+        status = interview["status"] if interview else "done"
+
+        if status == "accepted":
+            start = discord.ui.Button(label="Start interview", emoji="🎙️", style=discord.ButtonStyle.green,
+                                      custom_id=f"pfo_ivstaff_{interview_id}_start")
+            start.callback = self.start
+            self.add_item(start)
+
+        if status in ("accepted", "queued", "live"):
+            cancel = discord.ui.Button(
+                label="End interview" if status == "live" else "Cancel",
+                style=discord.ButtonStyle.red,
+                custom_id=f"pfo_ivstaff_{interview_id}_cancel"
+            )
+            cancel.callback = self.cancel
+            self.add_item(cancel)
+
+    async def interaction_check(self, interaction):
+
+        if is_staff(interaction):
+            return True
+
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can run interviews.", ephemeral=True)
+        return False
+
+    async def start(self, interaction):
+
+        interview = get_interview(self.interview_id)
+
+        if not interview or interview["status"] != "accepted":
+            await interaction.response.send_message("This interview can't be started any more.", ephemeral=True)
+            return
+
+        guild = interaction.guild
+        update_interview(self.interview_id, started_by=interaction.user.id)
+        current = live_interview_in(interview["channel_id"], self.interview_id)
+
+        if current:
+            update_interview(self.interview_id, status="queued")
+            await interaction.response.edit_message(
+                embed=interview_notice_embed(guild, get_interview(self.interview_id)),
+                view=InterviewStaffView(self.interview_id)
+            )
+            return
+
+        await interaction.response.edit_message(
+            embed=interview_notice_embed(guild, get_interview(self.interview_id)),
+            view=None
+        )
+        await start_interview(guild, self.interview_id)
+
+    async def cancel(self, interaction):
+
+        interview = get_interview(self.interview_id)
+
+        if not interview or interview["status"] not in ("accepted", "queued", "live"):
+            await interaction.response.send_message("This interview has already finished.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        await cancel_interview(interaction.guild, self.interview_id, interaction.user.id)
+
+
+async def post_interview_notice(guild: discord.Guild, interview_id: int):
+    """The 'ready to start' notice in the staff bot channel."""
+
+    channel = find_suggestions_channel(guild)
+    interview = get_interview(interview_id)
+
+    if not channel:
+        # No staff channel: don't leave them waiting forever.
+        print("No staff bot channel for interview notice; starting straight away")
+        await start_interview(guild, interview_id)
+        return
+
+    try:
+        message = await channel.send(
+            embed=interview_notice_embed(guild, interview),
+            view=InterviewStaffView(interview_id)
+        )
+        update_interview(interview_id, notice_channel_id=message.channel.id, notice_message_id=message.id)
+    except Exception as error:
+        print(f"Could not post interview notice: {error}")
+
+
+async def refresh_interview_notice(guild: discord.Guild, interview_id: int, note: str = None):
+
+    interview = get_interview(interview_id)
+
+    if not interview or not interview["notice_message_id"]:
+        return
+
+    try:
+        channel = guild.get_channel(interview["notice_channel_id"]) or await bot.fetch_channel(interview["notice_channel_id"])
+        message = await channel.fetch_message(interview["notice_message_id"])
+        open_state = interview["status"] in ("accepted", "queued", "live")
+        await message.edit(
+            embed=interview_notice_embed(guild, interview, note),
+            view=InterviewStaffView(interview_id) if open_state else None
+        )
+    except Exception as error:
+        print(f"Could not update interview notice {interview_id}: {error}")
+
+
+async def start_next_interview(guild: discord.Guild, channel_id: int):
+    """Starts the oldest queued interview in this channel, if nothing else is live there."""
+
+    if live_interview_in(channel_id):
+        return
+
+    rows = discipline_query(
+        "SELECT id FROM interviews WHERE guild_id = ? AND channel_id = ? AND status = 'queued' ORDER BY id LIMIT 1",
+        (guild.id, channel_id)
+    )
+
+    if rows:
+        await start_interview(guild, rows[0]["id"])
+
+
+async def cancel_interview(guild: discord.Guild, interview_id: int, staff_id: int = None):
+    """Cancels at any stage. A live one gets a short note in the channel and the role taken back."""
+
+    interview = get_interview(interview_id)
+
+    if not interview or interview["status"] not in ("invited", "accepted", "queued", "live"):
+        return False
+
+    was_live = interview["status"] == "live"
+    update_interview(interview_id, status="cancelled")
+
+    timer = _interview_timers.pop(interview_id, None)
+    if timer:
+        timer.cancel()
+
+    if was_live:
+        await end_interview_role(guild, interview)
+
+        channel = guild.get_channel(interview["channel_id"])
+        if channel:
+            try:
+                await channel.send(embed=discord.Embed(
+                    description=f"🎙️ <@{interview['member_id']}>'s interview has been ended.",
+                    color=PFO_GOLD
+                ))
+            except Exception as error:
+                print(f"Could not post interview end note: {error}")
+
+    await refresh_interview_notice(
+        guild, interview_id, f"Cancelled by <@{staff_id}>." if staff_id else "Cancelled."
+    )
+
+    if was_live:
+        await start_next_interview(guild, interview["channel_id"])
+
+    return True
+
+
+def open_interviews(guild_id: int):
+    return discipline_query(
+        "SELECT * FROM interviews WHERE guild_id = ? AND status IN ('invited', 'accepted', 'queued', 'live') "
+        "ORDER BY CASE status WHEN 'live' THEN 0 WHEN 'queued' THEN 1 WHEN 'accepted' THEN 2 ELSE 3 END, id",
+        (guild_id,)
+    )
+
+
+def interviews_embed(guild: discord.Guild):
+
+    rows = open_interviews(guild.id)
+    lines = []
+
+    for interview in rows:
+        icon, state = INTERVIEW_STATES[interview["status"]]
+        detail = interview_progress(interview) if interview["status"] == "live" else state
+
+        if interview["status"] == "invited":
+            detail += f" · sent <t:{interview['created_at']}:R>"
+        elif interview["status"] == "accepted" and interview["accepted_at"]:
+            detail += f" · accepted <t:{interview['accepted_at']}:R>"
+
+        lines.append(
+            f"{icon} <@{interview['member_id']}> · {plural(len(interview_questions(interview)), 'question')}\n"
+            f"-# {detail} · by <@{interview['staff_id']}>"
+        )
+
+    embed = discord.Embed(
+        title="🎙️ Interviews",
+        description="\n".join(lines)[:4000] if lines else "No interviews are open right now.",
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_author(name="PFO • INTERVIEW", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text="Pick one below to cancel it • only you can see this")
+
+    return embed
+
+
+class InterviewsListView(
+    discord.ui.View
+):
+
+    def __init__(self, guild: discord.Guild, owner_id: int):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.owner_id = owner_id
+        self.build()
+
+    def build(self):
+
+        self.clear_items()
+        rows = open_interviews(self.guild.id)[:25]
+
+        if not rows:
+            return
+
+        options = []
+
+        for interview in rows:
+            member = self.guild.get_member(interview["member_id"])
+            name = name_without_record(member.display_name) if member else f"User {interview['member_id']}"
+            icon, state = INTERVIEW_STATES[interview["status"]]
+            options.append(discord.SelectOption(
+                label=f"Cancel: {name}"[:100], value=str(interview["id"]), emoji=icon, description=state[:100]
+            ))
+
+        menu = discord.ui.Select(placeholder="Cancel an interview…", options=options)
+        menu.callback = self.picked
+        self.add_item(menu)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.owner_id
+
+    async def picked(self, interaction):
+
+        interview_id = int(interaction.data["values"][0])
+        interview = get_interview(interview_id)
+        await interaction.response.defer()
+        cancelled = await cancel_interview(self.guild, interview_id, interaction.user.id)
+        self.build()
+
+        note = (
+            f"🚫 Cancelled the interview with <@{interview['member_id']}>."
+            if cancelled else "That interview had already finished."
+        )
+        await interaction.edit_original_response(content=note, embed=interviews_embed(self.guild), view=self)
+
+
+@bot.tree.command(
+    name="interviews",
+    description="See every open interview (invited, waiting, live) and cancel any of them."
+)
+async def interviews(
+    interaction: discord.Interaction
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can manage interviews.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        embed=interviews_embed(interaction.guild),
+        view=InterviewsListView(interaction.guild, interaction.user.id),
+        ephemeral=True
+    )
+
+
 def restore_interview_buttons():
 
     try:
         for interview in discipline_query("SELECT id FROM interviews WHERE status = 'invited'"):
             bot.add_view(InterviewInviteView(interview["id"]))
+        for interview in discipline_query("SELECT id FROM interviews WHERE status IN ('accepted', 'queued', 'live')"):
+            bot.add_view(InterviewStaffView(interview["id"]))
     except Exception as error:
         print(f"Could not restore interview buttons: {error}")
 
@@ -15900,6 +16800,79 @@ def tape_cards(ta, tb):
     return card(ta), card(tb)
 
 
+TAPE_LABEL_WIDTH = 11
+
+
+def record_score(record: str):
+    """Win rate from '8-5-0' (draws count half), or None with no fights."""
+
+    try:
+        wins, losses, draws = (int(part) for part in record.split("-")[:3])
+    except Exception:
+        return None
+
+    fights = wins + losses + draws
+    return (wins + draws / 2) / fights if fights else None
+
+
+def rank_score(rank: str):
+    """Lower is better: Champion 0, #3 = 3, unranked last."""
+
+    if rank in ("Champ", "Champion"):
+        return 0
+    if rank.startswith("#") and rank[1:].isdigit():
+        return int(rank[1:])
+    return None
+
+
+def streak_score(streak: str):
+    if streak and streak[0] in "WL" and streak[1:].isdigit():
+        return int(streak[1:]) * (1 if streak[0] == "W" else -1)
+    return 0
+
+
+def tape_rows(ta, tb):
+    """(label, red value, blue value, which is better: 'a', 'b' or None)."""
+
+    def better(x, y, lower=False):
+        if x is None and y is None:
+            return None
+        if y is None:
+            return "a"
+        if x is None:
+            return "b"
+        if x == y:
+            return None
+        return ("a" if x < y else "b") if lower else ("a" if x > y else "b")
+
+    def percent(text):
+        return int(text.rstrip("%")) if text and text.rstrip("%").isdigit() else None
+
+    def rank_text_short(rank):
+        return "Champion" if rank == "Champ" else rank
+
+    rows = [
+        ("Record", ta["record"], tb["record"], better(record_score(ta["record"]), record_score(tb["record"]))),
+        ("Rank", rank_text_short(ta["rank"]), rank_text_short(tb["rank"]),
+         better(rank_score(ta["rank"]), rank_score(tb["rank"]), lower=True)),
+    ]
+
+    if ta["p4p"] != "-" or tb["p4p"] != "-":
+        rows.append(("P4P", ta["p4p"], tb["p4p"], better(rank_score(ta["p4p"]), rank_score(tb["p4p"]), lower=True)))
+
+    rows += [
+        ("Streak", ta["streak"], tb["streak"], better(streak_score(ta["streak"]), streak_score(tb["streak"]))),
+        ("KO/TKO", str(ta["ko"]), str(tb["ko"]), better(ta["ko"], tb["ko"])),
+        ("Submissions", str(ta["sub"]), str(tb["sub"]), better(ta["sub"], tb["sub"])),
+        ("Decisions", str(ta["dec"]), str(tb["dec"]), better(ta["dec"], tb["dec"])),
+        ("Finish rate", ta["finish"], tb["finish"], better(percent(ta["finish"]), percent(tb["finish"]))),
+        ("Title wins", str(ta["titles"]), str(tb["titles"]), better(ta["titles"], tb["titles"])),
+        ("Last 3", ta["form"], tb["form"], better(ta["form"].split().count("W"), tb["form"].split().count("W"))),
+    ]
+
+    return rows
+
+
 def tale_of_the_tape_embed(
     guild: discord.Guild,
     a,
@@ -15915,29 +16888,30 @@ def tale_of_the_tape_embed(
     name_a = name_without_record(a.display_name)
     name_b = name_without_record(b.display_name)
 
-    header = [
-        f"🔴 **{name_a}**  vs  **{name_b}** 🔵",
-        " · ".join(part for part in (event, f"⚖️ {weight}" if weight else None) if part),
-    ]
+    lines = [f"🔴 **{name_a}**  vs  **{name_b}** 🔵"]
 
-    description = "\n".join(line for line in header if line)
+    details = " · ".join(part for part in (event, weight) if part)
+    if details:
+        lines.append(f"-# {details}")
 
     if notes:
-        description += "\n\n" + "\n".join(f"> {line}" for line in notes.split("\n") if line.strip())
+        lines += [""] + [f"> {line}" for line in notes.split("\n") if line.strip()]
+
+    lines.append("")
+
+    for label, left, right, best in tape_rows(ta, tb):
+        left = f"**{left}**" if best == "a" else left
+        right = f"**{right}**" if best == "b" else right
+        lines.append(f"`{label:<{TAPE_LABEL_WIDTH}}` {left}  vs  {right}")
 
     embed = discord.Embed(
-        title="Tale of the Tape",
-        description=description[:4000],
+        title=f"{name_a} vs {name_b}",
+        description="\n".join(lines)[:4000],
         color=PFO_GOLD,
         timestamp=discord.utils.utcnow()
     )
 
     apply_branding(embed, banner_file=TALE_BANNER, author_text="PFO • TALE OF THE TAPE")
-
-    # One stat card per fighter (side by side on desktop, stacked on phones)
-    card_a, card_b = tape_cards(ta, tb)
-    embed.add_field(name=f"🔴 {name_a}", value=card_a, inline=True)
-    embed.add_field(name=f"🔵 {name_b}", value=card_b, inline=True)
 
     # Head to head
     meetings = head_to_head(guild.id, a.id, b.id)
@@ -15948,25 +16922,18 @@ def tale_of_the_tape_embed(
         last = meetings[-1]
         last_winner = name_a if last["winner_id"] == a.id else name_b
 
-        if a_wins == b_wins:
-            standing = f"Level at {a_wins}-{b_wins}"
-        else:
-            leader = name_a if a_wins > b_wins else name_b
-            standing = f"{leader} leads {max(a_wins, b_wins)}-{min(a_wins, b_wins)}"
-
         last_text = (
-            "Draw" if last["method"] == "DRAW" else "No contest" if last["method"] == "NC"
+            "draw" if last["method"] == "DRAW" else "no contest" if last["method"] == "NC"
             else f"{last_winner} by {fight_method_text(last)}"
         )
 
         embed.add_field(
-            name="🤝 Head to head",
-            value=f"{standing}\nLast time: {last_text}"
-            + (f" ({last['event']})" if last["event"] else ""),
+            name="Head to head",
+            value=f"**{a_wins}-{b_wins}** · last fight: {last_text}" + (f" ({last['event']})" if last["event"] else ""),
             inline=False
         )
     else:
-        embed.add_field(name="🤝 Head to head", value="First meeting", inline=False)
+        embed.add_field(name="Head to head", value="First meeting", inline=False)
 
     # Betting split + odds from the sportsbook for this fight
     for bout in discipline_query("""
@@ -15991,23 +16958,23 @@ def tale_of_the_tape_embed(
         count_a, count_b = len(backers[side_a]), len(backers[side_b])
         total = count_a + count_b
         odds = live_odds(bout)
-
-        lines = []
+        surname_a, surname_b = name_a.split()[-1], name_b.split()[-1]
 
         if total:
             pa = round(100 * count_a / total)
-            lines.append(f"{name_a} **{pa}%** {vote_bar(pa)} **{100 - pa}%** {name_b}")
-            lines.append(f"👥 {plural(total, 'bettor')}")
+            split = f"**{pa}%** {surname_a} · **{100 - pa}%** {surname_b} · {plural(total, 'bettor')}"
         else:
-            lines.append("No bets yet")
+            split = "No bets yet"
 
-        lines.append(f"Odds: {name_a} `{odds[side_a]:.2f}` · {name_b} `{odds[side_b]:.2f}`")
-
-        embed.add_field(name="🪙 Who people are backing", value="\n".join(lines), inline=False)
+        embed.add_field(
+            name="Backing",
+            value=f"{split}\n{COIN} Odds `{odds[side_a]:.2f}` / `{odds[side_b]:.2f}`",
+            inline=False
+        )
         break
 
     embed.set_footer(
-        text="From PFO records • rank is for the weight class shown",
+        text="Red corner first • bold = better stat • from PFO records",
         icon_url=asset_url(LOGO_FILE)
     )
 
@@ -16102,6 +17069,609 @@ async def taleofthetape(
     )
 
 
+# ============================================================
+# RANKINGS UPDATES
+#
+# Posted by itself in the fighter news channel (any channel with
+# "fighter-news" in its name, or set RANKINGS_UPDATE_CHANNEL in
+# Railway). By default every Thursday and Sunday at 8pm UK time.
+#
+# It compares the rankings with how they were at the last update and
+# only lists what changed: new champions, who climbed or dropped,
+# newcomers and who fell out. Divisions with no changes are grouped
+# into one line. If nothing changed at all, nothing is posted.
+#
+# /rankingsupdate   preview, post now, change the days/time,
+#                   or turn the automatic posts off and on.
+# ============================================================
+
+RANKINGS_UPDATE_CHANNEL = os.getenv("RANKINGS_UPDATE_CHANNEL", "fighter-news").strip()
+RANKINGS_UPDATE_BANNER = "rankings_update.gif"
+DEFAULT_UPDATE_DAYS = "thu,sun"
+DEFAULT_UPDATE_TIME = "20:00"
+UPDATE_CATCH_UP_HOURS = 3          # if the bot was offline at post time, still post within this
+DAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+DIVISION_ICONS = {P4P_WEIGHT: "🌍"}
+
+
+def setup_rankings_update_tables():
+
+    db = get_db()
+    cursor = db.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ranking_snapshots (
+            guild_id INTEGER NOT NULL,
+            weight TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            rank INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, weight, user_id)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS rankings_update_settings (
+            guild_id INTEGER PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            days TEXT NOT NULL DEFAULT 'thu,sun',
+            post_time TEXT NOT NULL DEFAULT '20:00',
+            snapshot_at INTEGER,
+            last_slot TEXT
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+def uk_now():
+    """The time now in UK time (no timezone attached)."""
+
+    now = datetime.now(timezone.utc)
+
+    try:
+        from zoneinfo import ZoneInfo
+        return now.astimezone(ZoneInfo(EVENT_TIMEZONE)).replace(tzinfo=None)
+    except Exception:
+        naive = now.replace(tzinfo=None)
+        offset = uk_offset_hours(naive) if EVENT_TIMEZONE == "Europe/London" else 0
+        return naive + timedelta(hours=offset)
+
+
+def update_settings(guild_id: int):
+
+    rows = discipline_query("SELECT * FROM rankings_update_settings WHERE guild_id = ?", (guild_id,))
+
+    if rows:
+        return rows[0]
+
+    discipline_query(
+        "INSERT OR IGNORE INTO rankings_update_settings (guild_id, enabled, days, post_time) VALUES (?, 1, ?, ?)",
+        (guild_id, DEFAULT_UPDATE_DAYS, DEFAULT_UPDATE_TIME), write=True
+    )
+
+    return discipline_query("SELECT * FROM rankings_update_settings WHERE guild_id = ?", (guild_id,))[0]
+
+
+def change_update_settings(guild_id: int, **changes):
+
+    update_settings(guild_id)
+    columns = ", ".join(f"{column} = ?" for column in changes)
+    discipline_query(
+        f"UPDATE rankings_update_settings SET {columns} WHERE guild_id = ?",
+        (*changes.values(), guild_id), write=True
+    )
+
+
+def parse_update_days(text: str):
+    """'thu,sun', 'Thursday and Sunday', 'mon wed fri' -> 'mon,wed,fri' (or None)."""
+
+    found = []
+
+    for word in re.findall(r"[a-zA-Z]+", text or ""):
+        key = word[:3].lower()
+        if key in DAY_KEYS and key not in found:
+            found.append(key)
+        elif word.lower() in ("and", "every", "on"):
+            continue
+        elif word.lower() in ("daily", "everyday"):
+            found = list(DAY_KEYS)
+        else:
+            return None
+
+    if not found:
+        return None
+
+    return ",".join(sorted(found, key=DAY_KEYS.index))
+
+
+def parse_update_time(text: str):
+    """'20:00', '8pm', '8:30pm', '2000' -> '20:00' (or None)."""
+
+    match = re.fullmatch(r"\s*(\d{1,2})(?:[:.]?(\d{2}))?\s*(am|pm)?\s*", (text or "").lower())
+
+    if not match:
+        return None
+
+    hour, minute, half = int(match.group(1)), int(match.group(2) or 0), match.group(3)
+
+    if half:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if half == "pm" else 0)
+
+    if hour > 23 or minute > 59:
+        return None
+
+    return f"{hour:02d}:{minute:02d}"
+
+
+def schedule_text(settings):
+
+    days = [DAY_NAMES[DAY_KEYS.index(key)] for key in settings["days"].split(",") if key in DAY_KEYS]
+    hour, minute = (int(part) for part in settings["post_time"].split(":"))
+    clock = datetime(2000, 1, 1, hour, minute).strftime("%I:%M%p").lstrip("0").lower().replace(":00", "")
+
+    if len(days) == 7:
+        when = "Every day"
+    elif len(days) > 1:
+        when = "Every " + ", ".join(days[:-1]) + " and " + days[-1]
+    else:
+        when = "Every " + days[0]
+
+    return f"{when} at {clock} (UK time)"
+
+
+def find_rankings_update_channel(guild: discord.Guild):
+
+    setting = RANKINGS_UPDATE_CHANNEL
+
+    if setting.isdigit():
+        return guild.get_channel(int(setting))
+
+    wanted = role_key(setting)
+    channels = list(getattr(guild, "text_channels", []))
+
+    for channel in channels:
+        if role_key(channel.name) == wanted:
+            return channel
+
+    for channel in channels:
+        if wanted in role_key(channel.name):
+            return channel
+
+    return None
+
+
+def current_rankings(guild_id: int):
+
+    board = {}
+
+    for row in discipline_query("SELECT weight, discord_user_id, rank FROM rankings WHERE guild_id = ?", (guild_id,)):
+        board.setdefault(row["weight"], {})[row["discord_user_id"]] = row["rank"]
+
+    return board
+
+
+def saved_rankings(guild_id: int):
+
+    board = {}
+
+    for row in discipline_query("SELECT weight, user_id, rank FROM ranking_snapshots WHERE guild_id = ?", (guild_id,)):
+        board.setdefault(row["weight"], {})[row["user_id"]] = row["rank"]
+
+    return board
+
+
+def save_rankings_snapshot(guild_id: int, board: dict = None):
+
+    board = current_rankings(guild_id) if board is None else board
+
+    db = get_db()
+    db.execute("DELETE FROM ranking_snapshots WHERE guild_id = ?", (guild_id,))
+    db.executemany(
+        "INSERT INTO ranking_snapshots (guild_id, weight, user_id, rank) VALUES (?, ?, ?, ?)",
+        [(guild_id, weight, user_id, rank) for weight, fighters in board.items() for user_id, rank in fighters.items()]
+    )
+    db.commit()
+    db.close()
+
+    change_update_settings(guild_id, snapshot_at=int(time.time()))
+
+
+def has_rankings_snapshot(guild_id: int):
+    return bool(update_settings(guild_id)["snapshot_at"])
+
+
+def ranking_changes(before: dict, after: dict):
+    """What changed in each division between two snapshots."""
+
+    changes = {}
+
+    for weight in WEIGHTS:
+
+        old = before.get(weight, {})
+        new = after.get(weight, {})
+
+        if old == new:
+            continue
+
+        old_champ = next((user for user, rank in old.items() if rank == 0), None)
+        new_champ = next((user for user, rank in new.items() if rank == 0), None)
+
+        result = {"champion": None, "vacated": None, "up": [], "down": [], "new": [], "out": []}
+
+        if new_champ and new_champ != old_champ:
+            result["champion"] = (new_champ, old.get(new_champ))
+        elif old_champ and not new_champ:
+            result["vacated"] = old_champ
+
+        champion_id = result["champion"][0] if result["champion"] else None
+
+        for user, rank in new.items():
+
+            if user == champion_id:
+                continue
+
+            if user not in old:
+                result["new"].append((user, rank))
+            elif rank < old[user]:
+                result["up"].append((user, old[user], rank))
+            elif rank > old[user]:
+                result["down"].append((user, old[user], rank))
+
+        for user, rank in old.items():
+            if user not in new and user != result["vacated"]:
+                result["out"].append((user, rank))
+
+        result["up"].sort(key=lambda item: (item[2] - item[1], item[2]))
+        result["down"].sort(key=lambda item: (item[1] - item[2], item[2]))
+        result["new"].sort(key=lambda item: item[1])
+        result["out"].sort(key=lambda item: item[1])
+
+        if any(result.values()):
+            changes[weight] = result
+
+    return changes
+
+
+def short_rank(rank):
+    return "C" if rank == 0 else f"#{rank}"
+
+
+def update_name(guild: discord.Guild, user_id: int):
+
+    member = guild.get_member(user_id)
+
+    if member:
+        return f"**{name_without_record(member.display_name)}**"
+
+    if user_id in DEPARTED_NAME_CACHE:
+        return f"**{DEPARTED_NAME_CACHE[user_id]}**"
+
+    return f"<@{user_id}>"
+
+
+def division_change_lines(guild: discord.Guild, weight: str, change: dict):
+
+    lines = []
+
+    if change["champion"]:
+        user, was = change["champion"]
+        lines.append(f"👑 {update_name(guild, user)} is the new champion")
+
+    if change["vacated"]:
+        lines.append(f"🏳️ Title vacated · {update_name(guild, change['vacated'])} is no longer champion")
+
+    for user, was, now in change["up"]:
+        lines.append(f"🔼 `+{was - now}` {update_name(guild, user)}  {short_rank(was)} → **{short_rank(now)}**")
+
+    for user, was, now in change["down"]:
+        lines.append(f"🔽 `-{now - was}` {update_name(guild, user)}  {short_rank(was)} → **{short_rank(now)}**")
+
+    for user, now in change["new"]:
+        lines.append(f"🆕 {update_name(guild, user)} enters at **{short_rank(now)}**")
+
+    for user, was in change["out"]:
+        lines.append(f"❌ {update_name(guild, user)} drops out (was {short_rank(was)})")
+
+    text = ""
+    for index, line in enumerate(lines):
+        rest = len(lines) - index
+        if len(text) + len(line) + 40 > 1024:
+            text += f"…and {rest} more"
+            break
+        text += line + "\n"
+
+    return text.strip()
+
+
+def rankings_update_embed(guild: discord.Guild, before: dict, after: dict, since: int = None, settings=None):
+    """The update post, or None when nothing changed."""
+
+    changes = ranking_changes(before, after)
+
+    if not changes:
+        return None
+
+    champions = sum(1 for change in changes.values() if change["champion"])
+    climbers = sum(len(change["up"]) for change in changes.values())
+    fallers = sum(len(change["down"]) for change in changes.values())
+    newcomers = sum(len(change["new"]) for change in changes.values())
+
+    summary = []
+    if champions:
+        summary.append(f"👑 **{champions}** new champion{'s' if champions != 1 else ''}")
+    if climbers:
+        summary.append(f"🔼 **{climbers}** climber{'s' if climbers != 1 else ''}")
+    if fallers:
+        summary.append(f"🔽 **{fallers}** dropped")
+    if newcomers:
+        summary.append(f"🆕 **{newcomers}** newcomer{'s' if newcomers != 1 else ''}")
+
+    lines = []
+
+    if since:
+        lines.append(f"-# 📅 Changes since the last update on <t:{since}:D>")
+
+    if summary:
+        lines += ["", " · ".join(summary)]
+
+    board = get_ranking_message(guild.id, P4P_WEIGHT) or next(
+        (get_ranking_message(guild.id, weight) for weight in WEIGHTS if get_ranking_message(guild.id, weight)), None
+    )
+
+    if board:
+        lines += ["", f"📊 Full rankings in <#{board['channel_id']}>"]
+
+    embed = discord.Embed(
+        title="📈 Rankings Update",
+        description="\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+
+    apply_branding(embed, banner_file=RANKINGS_UPDATE_BANNER, author_text="PFO • RANKINGS")
+
+    # Divisions first, P4P last.
+    order = [weight for weight in WEIGHTS if weight != P4P_WEIGHT] + [P4P_WEIGHT]
+
+    for weight in order:
+        if weight in changes:
+            icon = DIVISION_ICONS.get(weight, "🥊")
+            label = "Pound for Pound" if weight == P4P_WEIGHT else weight
+            embed.add_field(name=f"{icon} {label}", value=division_change_lines(guild, weight, changes[weight]), inline=False)
+
+    quiet = [
+        ("P4P" if weight == P4P_WEIGHT else weight) for weight in order
+        if weight not in changes and (before.get(weight) or after.get(weight))
+    ]
+
+    if quiet:
+        embed.add_field(name="😴 No changes", value="-# " + " · ".join(quiet), inline=False)
+
+    footer = schedule_text(settings) if settings and settings["enabled"] else "Prestige Fighting Organisation"
+    embed.set_footer(text=footer, icon_url=asset_url(LOGO_FILE))
+
+    return embed
+
+
+async def post_rankings_update(guild: discord.Guild):
+    """Posts the update. Returns (posted, message for staff)."""
+
+    settings = update_settings(guild.id)
+    after = current_rankings(guild.id)
+
+    if not settings["snapshot_at"]:
+        save_rankings_snapshot(guild.id, after)
+        return False, "There was nothing to compare with yet, so I've saved the rankings as they are now. The next update will show changes from this point."
+
+    for user_id in {user for board in (saved_rankings(guild.id), after) for fighters in board.values() for user in fighters}:
+        if not guild.get_member(user_id) and user_id not in DEPARTED_NAME_CACHE:
+            try:
+                await departed_name(user_id)
+            except Exception:
+                pass
+
+    embed = rankings_update_embed(guild, saved_rankings(guild.id), after, settings["snapshot_at"], settings)
+
+    if not embed:
+        return False, f"No ranking changes since <t:{settings['snapshot_at']}:f>, so there was nothing to post."
+
+    channel = find_rankings_update_channel(guild)
+
+    if not channel:
+        return False, (
+            "I couldn't find the fighter news channel. Make a channel with **fighter-news** in its name, "
+            "or set RANKINGS_UPDATE_CHANNEL in Railway."
+        )
+
+    try:
+        await channel.send(embed=embed)
+    except Exception as error:
+        print(f"Could not post rankings update: {error}")
+        return False, f"I couldn't post in {channel.mention}. Check I can send messages and embeds there."
+
+    save_rankings_snapshot(guild.id, after)
+
+    return True, f"Posted in {channel.mention}."
+
+
+def due_update_slot(settings, now: datetime = None):
+    """The post time that's due right now (e.g. '2026-10-29 20:00'), or None."""
+
+    now = now or uk_now()
+    hour, minute = (int(part) for part in settings["post_time"].split(":"))
+    days = [DAY_KEYS.index(key) for key in settings["days"].split(",") if key in DAY_KEYS]
+
+    for back in (0, 1):
+        day = now - timedelta(days=back)
+        slot = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+        if slot.weekday() in days and slot <= now < slot + timedelta(hours=UPDATE_CATCH_UP_HOURS):
+            return slot.strftime("%Y-%m-%d %H:%M")
+
+    return None
+
+
+async def check_rankings_updates():
+    """Every minute: takes the first snapshot, and posts on the scheduled days."""
+
+    for guild in list(getattr(bot, "guilds", [])):
+
+        settings = update_settings(guild.id)
+
+        if not settings["snapshot_at"]:
+            save_rankings_snapshot(guild.id)
+            continue
+
+        if not settings["enabled"]:
+            continue
+
+        slot = due_update_slot(settings)
+
+        if not slot or settings["last_slot"] == slot:
+            continue
+
+        # Marked first, so a slow post can't happen twice.
+        change_update_settings(guild.id, last_slot=slot)
+
+        posted, message = await post_rankings_update(guild)
+
+        if not posted and "nothing to post" not in message and "saved the rankings" not in message:
+            await post_staff_log(guild, staff_log_embed("📈 Rankings update", [f"⚠️ {message}"]))
+
+
+UPDATE_ACTIONS = [
+    app_commands.Choice(name="👁️ Preview (only you see it)", value="preview"),
+    app_commands.Choice(name="📢 Post now", value="post"),
+    app_commands.Choice(name="🗓️ Change days / time", value="schedule"),
+    app_commands.Choice(name="⏸️ Turn automatic posts off", value="off"),
+    app_commands.Choice(name="▶️ Turn automatic posts on", value="on"),
+    app_commands.Choice(name="⚙️ Show settings", value="settings"),
+]
+
+
+def update_settings_text(guild: discord.Guild):
+
+    settings = update_settings(guild.id)
+    channel = find_rankings_update_channel(guild)
+
+    return "\n".join([
+        f"**Automatic posts:** {'▶️ on' if settings['enabled'] else '⏸️ off (post with **Post now** when you want)'}",
+        f"**When:** {schedule_text(settings)}",
+        f"**Where:** {channel.mention if channel else '❌ no fighter-news channel found'}",
+        f"**Comparing with:** the rankings on <t:{settings['snapshot_at']}:f>" if settings["snapshot_at"] else "**Comparing with:** nothing saved yet",
+    ])
+
+
+@bot.tree.command(
+    name="rankingsupdate",
+    description="Rankings update post: preview, post now, change the days/time or turn it off/on."
+)
+@app_commands.describe(
+    action="What to do",
+    days="For 'Change days / time': e.g. thu,sun or Monday Friday",
+    post_time="For 'Change days / time': UK time, e.g. 20:00 or 8pm"
+)
+@app_commands.choices(action=UPDATE_ACTIONS)
+async def rankingsupdate(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    days: str = None,
+    post_time: str = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can manage rankings updates.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    choice = action.value
+
+    if choice == "preview":
+
+        settings = update_settings(guild.id)
+
+        if not settings["snapshot_at"]:
+            save_rankings_snapshot(guild.id)
+            await interaction.response.send_message(
+                "📸 There was nothing to compare with yet, so I've saved the rankings as they are now. "
+                "Changes from here will show in the next update.",
+                ephemeral=True
+            )
+            return
+
+        embed = rankings_update_embed(guild, saved_rankings(guild.id), current_rankings(guild.id), settings["snapshot_at"], settings)
+
+        if not embed:
+            await interaction.response.send_message(
+                f"😴 No ranking changes since <t:{settings['snapshot_at']}:f>. Nothing would be posted.",
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message(
+            content="👁️ **Preview** (only you can see this). Use **Post now** to send it.",
+            embed=embed,
+            ephemeral=True
+        )
+        return
+
+    if choice == "post":
+        await interaction.response.defer(ephemeral=True)
+        posted, message = await post_rankings_update(guild)
+        await interaction.followup.send(("📢 " if posted else "ℹ️ ") + message, ephemeral=True)
+        return
+
+    if choice == "schedule":
+
+        if not days and not post_time:
+            await interaction.response.send_message(
+                "❌ Fill in **days** (e.g. `thu,sun`) and/or **post_time** (e.g. `20:00`).", ephemeral=True
+            )
+            return
+
+        changes = {}
+
+        if days:
+            parsed = parse_update_days(days)
+            if not parsed:
+                await interaction.response.send_message(
+                    "❌ I couldn't read those days. Try `thu,sun` or `Monday Wednesday Friday`.", ephemeral=True
+                )
+                return
+            changes["days"] = parsed
+
+        if post_time:
+            parsed = parse_update_time(post_time)
+            if not parsed:
+                await interaction.response.send_message(
+                    "❌ I couldn't read that time. Try `20:00` or `8pm` (UK time).", ephemeral=True
+                )
+                return
+            changes["post_time"] = parsed
+
+        change_update_settings(guild.id, **changes)
+
+        await interaction.response.send_message(
+            "✅ **Schedule updated.**\n\n" + update_settings_text(guild), ephemeral=True
+        )
+        return
+
+    if choice in ("off", "on"):
+        change_update_settings(guild.id, enabled=1 if choice == "on" else 0)
+        note = (
+            "▶️ **Automatic posts are on.**" if choice == "on"
+            else "⏸️ **Automatic posts are off.** Changes keep building up until you use **Post now**."
+        )
+        await interaction.response.send_message(note + "\n\n" + update_settings_text(guild), ephemeral=True)
+        return
+
+    await interaction.response.send_message(update_settings_text(guild), ephemeral=True)
+
+
 _drafts_restored = False
 
 
@@ -16164,6 +17734,7 @@ async def setup_hook():
     setup_coin_tables()
     setup_reminder_columns()
     setup_interview_tables()
+    setup_rankings_update_tables()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
@@ -16187,6 +17758,11 @@ bot.setup_hook = setup_hook
 async def on_ready():
 
     restore_card_drafts()
+
+    try:
+        await load_coin_emoji()
+    except Exception as error:
+        print(f"Coin emoji error: {error}")
 
     print(
         f"Logged in as {bot.user}"
