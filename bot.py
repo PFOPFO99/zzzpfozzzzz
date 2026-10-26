@@ -375,6 +375,7 @@ def setup_database():
     setup_reminder_columns()
     setup_interview_tables()
     setup_rankings_update_tables()
+    setup_fight_stats_tables()
 
 
 # ============================================================
@@ -17070,6 +17071,544 @@ async def taleofthetape(
 
 
 # ============================================================
+# FIGHT STATS FROM A SCREENSHOT
+#
+# /addstrikes left:@A right:@B screenshot:[image]
+#
+# The bot sends the end-of-fight stats screenshot to Claude (AI image
+# reading), then shows staff what it read for BOTH fighters:
+# total strikes, significant strikes, takedowns, control time and
+# knockdowns. Nothing is saved until staff press Confirm, and either
+# side can be edited first (or the sides swapped).
+#
+# Needs ANTHROPIC_API_KEY in Railway's Variables. Without it (or if
+# the reading fails) the numbers can still be typed in by hand.
+# Optional: STATS_AI_MODEL to use a different Claude model.
+# ============================================================
+
+STATS_AI_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+STATS_AI_MODEL = os.getenv("STATS_AI_MODEL", "claude-sonnet-5-5").strip()
+STATS_AI_URL = "https://api.anthropic.com/v1/messages"
+STATS_IMAGE_LIMIT = 4_500_000       # bytes; bigger screenshots are shrunk by Discord first
+STAT_KEYS = ["total_landed", "total_thrown", "sig_landed", "sig_thrown",
+             "td_landed", "td_attempted", "control", "knockdowns"]
+
+STATS_PROMPT = """This is an end-of-fight statistics screen from the video game EA Sports UFC.
+There are two fighters. The LEFT column of numbers belongs to the fighter on the left (red corner),
+the RIGHT column belongs to the fighter on the right (blue corner). Each row has a label in the middle.
+
+Read these rows for BOTH sides:
+- "Total Strikes": shown as "landed / thrown"
+- "Significant Strikes": shown as "landed / thrown"
+- "Takedowns": shown as "landed / attempted"
+- "Control": a time like 02:01 (minutes:seconds)
+- "Knockdowns": one number
+
+Also read the two fighter names shown at the bottom (character names and the player/PSN names under them),
+and which tab is selected at the top (e.g. "ROUND 2", or "OVERALL"/"TOTAL"; null if none).
+
+Reply with ONLY this JSON, no other text:
+{"left": {"total_landed": 0, "total_thrown": 0, "sig_landed": 0, "sig_thrown": 0, "td_landed": 0, "td_attempted": 0, "control": "00:00", "knockdowns": 0, "character": "", "player": ""},
+ "right": {same keys},
+ "tab": "...",
+ "unsure": ["anything you could not read clearly"]}
+If this is not a UFC fight stats screen, reply {"error": "short reason"}."""
+
+
+def setup_fight_stats_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS fight_stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            fight_id INTEGER,
+            user_id INTEGER NOT NULL,
+            opponent_id INTEGER NOT NULL,
+            total_landed INTEGER NOT NULL,
+            total_thrown INTEGER NOT NULL,
+            sig_landed INTEGER NOT NULL,
+            sig_thrown INTEGER NOT NULL,
+            td_landed INTEGER NOT NULL,
+            td_attempted INTEGER NOT NULL,
+            control_seconds INTEGER NOT NULL,
+            knockdowns INTEGER NOT NULL,
+            added_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def control_to_seconds(text) -> int:
+    """'02:01' -> 121, '0:40' -> 40, '95' -> 95. Raises ValueError if unreadable."""
+
+    text = str(text).strip()
+    match = re.fullmatch(r"(?:(\d{1,2}):)?(\d{1,2}):(\d{2})|(\d+)", text)
+
+    if not match:
+        raise ValueError(text)
+
+    if match.group(4):
+        return int(match.group(4))
+
+    hours = int(match.group(1) or 0)
+    return hours * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+
+
+def seconds_to_control(seconds: int):
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def blank_side():
+    return {key: 0 for key in STAT_KEYS}
+
+
+def clean_side(raw: dict):
+    """Turns the AI's answer for one fighter into whole numbers."""
+
+    side = blank_side()
+
+    for key in STAT_KEYS:
+        value = raw.get(key, 0)
+        if key == "control":
+            side["control"] = control_to_seconds(value or "0")
+        else:
+            side[key] = max(0, int(str(value).strip() or 0))
+
+    side["character"] = str(raw.get("character") or "").strip()
+    side["player"] = str(raw.get("player") or "").strip()
+
+    return side
+
+
+async def download_screenshot(attachment):
+    """Image bytes and type, shrunk by Discord's image proxy if it's too big for the AI."""
+
+    import aiohttp
+
+    content_type = (attachment.content_type or "").split(";")[0]
+
+    if content_type not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+        raise ValueError("That file isn't a PNG/JPG screenshot.")
+
+    urls = [attachment.url]
+
+    if (attachment.size or 0) > STATS_IMAGE_LIMIT:
+        joiner = "&" if "?" in attachment.proxy_url else "?"
+        urls = [f"{attachment.proxy_url}{joiner}format=jpeg&width=1920&height=1080"]
+
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    raise ValueError(f"Couldn't download the screenshot ({response.status}).")
+                data = await response.read()
+                kind = (response.headers.get("Content-Type") or content_type).split(";")[0]
+
+    if len(data) > STATS_IMAGE_LIMIT * 1.1:
+        raise ValueError("That screenshot is too big. Send a smaller one (under about 4MB).")
+
+    if kind not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+        kind = content_type
+
+    return data, kind
+
+
+async def read_stats_screenshot(attachment):
+    """Asks Claude to read the stats. Returns (left, right, tab, unsure) or raises ValueError."""
+
+    import base64
+    import aiohttp
+
+    if not STATS_AI_KEY:
+        raise ValueError("AI reading isn't set up yet (ANTHROPIC_API_KEY is missing in Railway).")
+
+    data, kind = await download_screenshot(attachment)
+
+    body = {
+        "model": STATS_AI_MODEL,
+        "max_tokens": 600,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": kind,
+                                             "data": base64.b64encode(data).decode()}},
+                {"type": "text", "text": STATS_PROMPT},
+            ],
+        }],
+    }
+    headers = {
+        "x-api-key": STATS_AI_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(STATS_AI_URL, json=body, headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=60)) as response:
+            reply = await response.json(content_type=None)
+
+            if response.status != 200:
+                message = (reply.get("error") or {}).get("message", "") if isinstance(reply, dict) else ""
+                print(f"Stats AI error {response.status}: {message}")
+                raise ValueError(f"The AI reader returned an error ({response.status}). {message[:150]}".strip())
+
+    text = "".join(part.get("text", "") for part in reply.get("content", []) if part.get("type") == "text")
+    match = re.search(r"\{.*\}", text, re.S)
+
+    if not match:
+        raise ValueError("The AI reader didn't send back any numbers.")
+
+    try:
+        found = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        raise ValueError("The AI reader's answer couldn't be understood.")
+
+    if found.get("error"):
+        raise ValueError(f"That doesn't look like a fight stats screen ({found['error']}).")
+
+    try:
+        left = clean_side(found.get("left") or {})
+        right = clean_side(found.get("right") or {})
+    except (ValueError, TypeError):
+        raise ValueError("Some numbers couldn't be read.")
+
+    return left, right, found.get("tab"), [str(item) for item in (found.get("unsure") or [])][:5]
+
+
+def side_problems(side: dict):
+    """Numbers that can't be right (landed more than thrown etc.)."""
+
+    problems = []
+
+    if side["total_landed"] > side["total_thrown"]:
+        problems.append("total strikes landed is more than thrown")
+    if side["sig_landed"] > side["sig_thrown"]:
+        problems.append("significant strikes landed is more than thrown")
+    if side["sig_landed"] > side["total_landed"]:
+        problems.append("more significant strikes than total strikes landed")
+    if side["td_landed"] > side["td_attempted"]:
+        problems.append("more takedowns landed than attempted")
+
+    return problems
+
+
+def accuracy(landed: int, thrown: int):
+    return f"{round(100 * landed / thrown)}%" if thrown else "-"
+
+
+def latest_fight_between(guild_id: int, a: int, b: int):
+    meetings = head_to_head(guild_id, a, b)
+    return meetings[-1] if meetings else None
+
+
+class FightStatsDraft:
+    """What's been read (or typed) so far, before it's saved."""
+
+    def __init__(self, guild: discord.Guild, left, right, staff_id: int):
+        self.guild = guild
+        self.left_member = left
+        self.right_member = right
+        self.staff_id = staff_id
+        self.sides = {"left": blank_side(), "right": blank_side()}
+        self.tab = None
+        self.unsure = []
+        self.source = "typed"
+        self.saved = False
+
+    def fight(self):
+        return latest_fight_between(self.guild.id, self.left_member.id, self.right_member.id)
+
+
+def stats_preview_embed(draft: FightStatsDraft, note: str = None):
+
+    left, right = draft.sides["left"], draft.sides["right"]
+    name_l = name_without_record(draft.left_member.display_name)
+    name_r = name_without_record(draft.right_member.display_name)
+
+    def row(label, a, b):
+        return f"`{label:<11}` {a}  vs  {b}"
+
+    lines = [f"🔴 **{name_l}**  vs  **{name_r}** 🔵"]
+
+    game = [side.get("character") or side.get("player") for side in (left, right)]
+    if any(game):
+        lines.append(f"-# On screen: {game[0] or '?'} (left) vs {game[1] or '?'} (right)")
+
+    lines += [
+        "",
+        row("Total", f"{left['total_landed']}/{left['total_thrown']}", f"{right['total_landed']}/{right['total_thrown']}"),
+        row("Significant", f"{left['sig_landed']}/{left['sig_thrown']}", f"{right['sig_landed']}/{right['sig_thrown']}"),
+        row("Sig. acc.", accuracy(left["sig_landed"], left["sig_thrown"]), accuracy(right["sig_landed"], right["sig_thrown"])),
+        row("Takedowns", f"{left['td_landed']}/{left['td_attempted']}", f"{right['td_landed']}/{right['td_attempted']}"),
+        row("Control", seconds_to_control(left["control"]), seconds_to_control(right["control"])),
+        row("Knockdowns", left["knockdowns"], right["knockdowns"]),
+        "-# landed / thrown",
+    ]
+
+    warnings = [f"{name_l}: {problem}" for problem in side_problems(left)]
+    warnings += [f"{name_r}: {problem}" for problem in side_problems(right)]
+
+    warnings += [f"the AI wasn't sure about: {item}" for item in draft.unsure]
+
+    if warnings:
+        lines += ["", "**⚠️ Check these**"] + [f"• {warning}" for warning in warnings]
+
+    fight = draft.fight()
+
+    if fight:
+        winner = name_l if fight["winner_id"] == draft.left_member.id else name_r
+        result = (
+            "Draw" if fight["method"] == "DRAW" else "No contest" if fight["method"] == "NC"
+            else f"{winner} by {fight_method_text(fight)}"
+        )
+        lines += ["", f"🔗 Saved to their last fight: {result}" + (f" ({fight['event']})" if fight["event"] else "")]
+    else:
+        lines += ["", "🔗 No logged fight between them yet, so it's saved on its own."]
+
+    if note:
+        lines = [note, ""] + lines
+
+    embed = discord.Embed(
+        title="Fight stats: check before saving",
+        description="\n".join(lines)[:4000],
+        color=PFO_GOLD
+    )
+    embed.set_author(name="PFO • FIGHT STATS", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(
+        text=("Read by AI from the screenshot" if draft.source == "ai" else "Typed in by staff")
+        + " • nothing is saved until you press Confirm"
+    )
+
+    return embed
+
+
+class StatsEditModal(
+    discord.ui.Modal,
+    title="Edit fight stats"
+):
+
+    total = discord.ui.TextInput(label="Total strikes (landed / thrown)", max_length=15, placeholder="12/35")
+    sig = discord.ui.TextInput(label="Significant strikes (landed / thrown)", max_length=15, placeholder="4/19")
+    takedowns = discord.ui.TextInput(label="Takedowns (landed / attempted)", max_length=15, placeholder="1/2")
+    control = discord.ui.TextInput(label="Control time (minutes:seconds)", max_length=8, placeholder="0:40")
+    knockdowns = discord.ui.TextInput(label="Knockdowns", max_length=3, placeholder="0")
+
+    def __init__(self, view, side: str):
+
+        member = view.draft.left_member if side == "left" else view.draft.right_member
+        super().__init__(title=f"Stats: {name_without_record(member.display_name)}"[:45])
+        self.stats_view = view
+        self.side = side
+
+        values = view.draft.sides[side]
+        self.total.default = f"{values['total_landed']}/{values['total_thrown']}"
+        self.sig.default = f"{values['sig_landed']}/{values['sig_thrown']}"
+        self.takedowns.default = f"{values['td_landed']}/{values['td_attempted']}"
+        self.control.default = seconds_to_control(values["control"])
+        self.knockdowns.default = str(values["knockdowns"])
+
+    async def on_submit(self, interaction):
+
+        def pair(field, name):
+            match = re.fullmatch(r"\s*(\d+)\s*(?:/|of|-)\s*(\d+)\s*", field.value or "")
+            if not match:
+                raise ValueError(f"**{name}** should look like `12/35`")
+            return int(match.group(1)), int(match.group(2))
+
+        try:
+            total = pair(self.total, "Total strikes")
+            sig = pair(self.sig, "Significant strikes")
+            takedowns = pair(self.takedowns, "Takedowns")
+            try:
+                control = control_to_seconds(self.control.value)
+            except ValueError:
+                raise ValueError("**Control time** should look like `2:01`")
+            if not (self.knockdowns.value or "").strip().isdigit():
+                raise ValueError("**Knockdowns** should be a number")
+            knockdowns = int(self.knockdowns.value.strip())
+        except ValueError as problem:
+            await interaction.response.send_message(f"❌ {problem}. Nothing was changed.", ephemeral=True)
+            return
+
+        side = self.stats_view.draft.sides[self.side]
+        side.update({
+            "total_landed": total[0], "total_thrown": total[1],
+            "sig_landed": sig[0], "sig_thrown": sig[1],
+            "td_landed": takedowns[0], "td_attempted": takedowns[1],
+            "control": control, "knockdowns": knockdowns,
+        })
+
+        await interaction.response.edit_message(
+            embed=stats_preview_embed(self.stats_view.draft, "✏️ Updated."), view=self.stats_view
+        )
+
+
+class FightStatsView(
+    discord.ui.View
+):
+
+    def __init__(self, draft: FightStatsDraft):
+
+        super().__init__(timeout=1800)
+        self.draft = draft
+
+        name_l = name_without_record(draft.left_member.display_name)[:30]
+        name_r = name_without_record(draft.right_member.display_name)[:30]
+
+        buttons = [
+            ("Confirm", "✅", discord.ButtonStyle.green, self.confirm, 0),
+            (f"Edit {name_l}", "✏️", discord.ButtonStyle.grey, self.edit_left, 0),
+            (f"Edit {name_r}", "✏️", discord.ButtonStyle.grey, self.edit_right, 0),
+            ("Swap sides", "🔁", discord.ButtonStyle.grey, self.swap, 1),
+            ("Cancel", None, discord.ButtonStyle.red, self.cancel, 1),
+        ]
+
+        for label, emoji, style, callback, row in buttons:
+            button = discord.ui.Button(label=label, emoji=emoji, style=style, row=row)
+            button.callback = callback
+            self.add_item(button)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.draft.staff_id
+
+    async def edit_left(self, interaction):
+        await interaction.response.send_modal(StatsEditModal(self, "left"))
+
+    async def edit_right(self, interaction):
+        await interaction.response.send_modal(StatsEditModal(self, "right"))
+
+    async def swap(self, interaction):
+        sides = self.draft.sides
+        sides["left"], sides["right"] = sides["right"], sides["left"]
+        await interaction.response.edit_message(
+            embed=stats_preview_embed(self.draft, "🔁 Swapped: the numbers now belong to the other fighter."),
+            view=self
+        )
+
+    async def cancel(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled. Nothing was saved.", embed=None, view=None)
+
+    async def confirm(self, interaction):
+
+        if self.draft.saved:
+            await interaction.response.send_message("Already saved.", ephemeral=True)
+            return
+
+        self.draft.saved = True
+        self.stop()
+        replaced = save_fight_stats(self.draft)
+
+        embed = stats_preview_embed(self.draft)
+        embed.title = "Fight stats saved"
+        embed.set_footer(text="Saved • replaced the stats already stored for this fight" if replaced else "Saved")
+
+        await interaction.response.edit_message(content="✅ **Saved.**", embed=embed, view=None)
+
+
+def save_fight_stats(draft: FightStatsDraft):
+    """Saves both fighters. Returns True if it replaced stats already saved for that fight."""
+
+    fight = draft.fight()
+    fight_id = fight["id"] if fight else None
+    replaced = False
+
+    pairs = [
+        (draft.left_member.id, draft.right_member.id, draft.sides["left"]),
+        (draft.right_member.id, draft.left_member.id, draft.sides["right"]),
+    ]
+
+    for user_id, opponent_id, side in pairs:
+
+        if fight_id:
+            existing = discipline_query(
+                "SELECT id FROM fight_stats WHERE guild_id = ? AND fight_id = ? AND user_id = ?",
+                (draft.guild.id, fight_id, user_id)
+            )
+            if existing:
+                replaced = True
+                discipline_query("DELETE FROM fight_stats WHERE id = ?", (existing[0]["id"],), write=True)
+
+        discipline_query("""
+            INSERT INTO fight_stats (guild_id, fight_id, user_id, opponent_id, total_landed, total_thrown,
+                                     sig_landed, sig_thrown, td_landed, td_attempted, control_seconds,
+                                     knockdowns, added_by, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (draft.guild.id, fight_id, user_id, opponent_id, side["total_landed"], side["total_thrown"],
+              side["sig_landed"], side["sig_thrown"], side["td_landed"], side["td_attempted"], side["control"],
+              side["knockdowns"], draft.staff_id, now_utc()), write=True)
+
+    return replaced
+
+
+@bot.tree.command(
+    name="addstrikes",
+    description="Add fight stats for both fighters from the end-of-fight stats screenshot."
+)
+@app_commands.describe(
+    left="The fighter on the LEFT of the screenshot (red corner)",
+    right="The fighter on the RIGHT of the screenshot (blue corner)",
+    screenshot="The fight stats screenshot (leave empty to type the numbers in)"
+)
+async def addstrikes(
+    interaction: discord.Interaction,
+    left: discord.Member,
+    right: discord.Member,
+    screenshot: discord.Attachment = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can add fight stats.", ephemeral=True)
+        return
+
+    if left.id == right.id:
+        await interaction.response.send_message("❌ Pick two different fighters.", ephemeral=True)
+        return
+
+    draft = FightStatsDraft(interaction.guild, left, right, interaction.user.id)
+    view = FightStatsView(draft)
+
+    if not screenshot:
+        await interaction.response.send_message(
+            embed=stats_preview_embed(draft, "✏️ No screenshot, so type the numbers in with the **Edit** buttons."),
+            view=view,
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    try:
+        left_side, right_side, tab, unsure = await read_stats_screenshot(screenshot)
+    except Exception as error:
+        message = str(error) if isinstance(error, ValueError) else "Something went wrong reading the screenshot."
+        if not isinstance(error, ValueError):
+            print(f"Stats reading failed: {error!r}")
+        await interaction.followup.send(
+            content=f"⚠️ {message}\nYou can still type the numbers in with the **Edit** buttons.",
+            embed=stats_preview_embed(draft),
+            view=view,
+            ephemeral=True
+        )
+        return
+
+    draft.sides = {"left": left_side, "right": right_side}
+    draft.tab = tab
+    draft.unsure = unsure
+    draft.source = "ai"
+
+    await interaction.followup.send(
+        content="🤖 **Here's what I read.** Check it, edit anything that's wrong, then press **Confirm**.",
+        embed=stats_preview_embed(draft),
+        view=view,
+        ephemeral=True
+    )
+
+
+# ============================================================
 # RANKINGS UPDATES
 #
 # Posted by itself in the fighter news channel (any channel with
@@ -17735,6 +18274,7 @@ async def setup_hook():
     setup_reminder_columns()
     setup_interview_tables()
     setup_rankings_update_tables()
+    setup_fight_stats_tables()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
