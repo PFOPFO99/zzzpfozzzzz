@@ -45,7 +45,7 @@ except ImportError:  # only when testing without discord.py installed
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "2"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "3"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 20            # pages are rebuilt at most every 20 seconds
 RESULTS_PER_PAGE = 6          # events per page on /results
 
@@ -296,7 +296,7 @@ def discord_button(label="Join Discord", extra=""):
 
 def page(ctx, title, active, body, description=None, solid_nav=True):
     full_title = "PFO · Prestige Fighting Organisation" if active == "home" else f"{title} · PFO"
-    description = description or "Rankings, fighters, results and champions of the Prestige Fighting Organisation."
+    description = description or "Rankings, fighters, results and champions of the Prestige Fighting Organisation, a UFC 6 league on Discord."
     logo = ctx.asset_url(ctx.LOGO_FILE)
 
     links = "".join(
@@ -488,7 +488,7 @@ def latest_event_results(ctx):
         by_id = {f["id"]: f for f in fights}
         ordered = [by_id[fid] for section in ctx.RECAP_SECTIONS for fid in grouped.get(section, [])]
         when = fight_day(fights[-1]) if fights else ""
-        return (title or name), when, ordered[:8]
+        return (title or name), when, ordered[:15]
 
     fights = ctx.q("SELECT * FROM fights WHERE guild_id = ? ORDER BY COALESCE(fight_date, substr(created_at,1,10)) DESC, id DESC LIMIT 6",
                    (ctx.gid,))
@@ -559,31 +559,53 @@ def render_home(ctx):
   </div>
 </section>"""
 
-    # ---------- ticker ----------
-    items = []
+    # ---------- ticker: latest card's results, then pound for pound ----------
+    parts = []
+
+    def head(text, cls=""):
+        return f'<span class="tick tick-head {cls}"><span class="tick-chip">{esc(text)}</span></span>'
+
     if event:
-        items.append(("NEXT", event["name"] + (f", {event_when(event['when'])}" if event["when"] else "")))
-    for fight in results[:6]:
-        w = fighter_name(ctx, fight["winner_id"], fight["winner_name"])
-        l = fighter_name(ctx, fight["loser_id"], fight["loser_name"])
-        if fight["method"] in ("DRAW", "NC"):
-            items.append(("RESULT", f"{w} vs {l}, {method_short(ctx, fight).title()}"))
-        else:
-            items.append(("RESULT", f"{w} def. {l}, {method_short(ctx, fight).replace(' · ', ' ')}"))
-    for day, _, weight, outcome, fight in title_moments(ctx, 3):
-        if outcome in ("new", "first"):
-            items.append(("NEW CHAMPION", f"{fighter_name(ctx, fight['winner_id'], fight['winner_name'])}, {weight}"))
+        parts.append(f'<span class="tick"><span class="tick-tag">NEXT</span>{esc(event["name"])}'
+                     + (f'<span class="tick-dim">{esc(event_when(event["when"]))}</span>' if event["when"] else "")
+                     + '</span>')
+
+    if results:
+        parts.append(head(f"{results_title} results"))
+        for fight in results:
+            w = fighter_name(ctx, fight["winner_id"], fight["winner_name"])
+            l = fighter_name(ctx, fight["loser_id"], fight["loser_name"])
+            joiner = "vs" if fight["method"] in ("DRAW", "NC") else "def."
+            belt = '<span class="tick-belt">TITLE</span>' if fight["title_fight"] else ""
+            parts.append(
+                f'<span class="tick">{belt}<b>{esc(w)}</b><span class="tick-dim">{joiner}</span>{esc(l)}'
+                f'<span class="tick-m {method_class(fight["method"])}">{esc(method_short(ctx, fight))}</span></span>'
+            )
+
+    p4p = ctx.get_division_rankings(ctx.gid, ctx.P4P_WEIGHT)[:10]
+    if p4p:
+        parts.append(head("Pound for pound", "tick-head-alt"))
+        for row in p4p:
+            uid = row["discord_user_id"]
+            stats = stats_for(ctx, uid, cache)
+            parts.append(
+                f'<span class="tick"><span class="tick-rank{" gold" if row["rank"] == 1 else ""}">#{row["rank"]}</span>'
+                f'<b>{esc(fighter_name(ctx, uid))}</b>'
+                + (f'<span class="tick-dim">{esc(ctx.stats_record(stats))}</span>' if stats else "")
+                + '</span>'
+            )
+
     for title, closes in signups:
-        items.append(("SIGN-UPS OPEN", title))
+        parts.append(f'<span class="tick"><span class="tick-tag">SIGN-UPS OPEN</span>{esc(title)}</span>')
 
     ticker = ""
-    if items:
-        spans = "".join(
-            f'<span class="tick"><span class="tick-tag">{esc(tag)}</span>{esc(text)}<span class="tick-sep" aria-hidden="true"></span></span>'
-            for tag, text in items
-        )
-        ticker = (f'<div class="ticker" aria-label="Latest from PFO"><span class="tick-live"><span class="dot dot-red" aria-hidden="true"></span>LATEST</span>'
-                  f'<div class="tick-win"><div class="track">{spans}<span aria-hidden="true" class="track-copy">{spans}</span></div></div></div>')
+    if parts:
+        spans = "".join(parts)
+        seconds = max(30, len(parts) * 4)   # same speed however long the card is
+        ticker = (f'<div class="ticker" aria-label="Latest results and pound for pound rankings">'
+                  f'<span class="tick-live"><span class="dot dot-red" aria-hidden="true"></span>LIVE</span>'
+                  f'<div class="tick-win"><div class="track" style="animation-duration:{seconds}s">{spans}'
+                  f'<span aria-hidden="true" class="track-copy">{spans}</span></div></div></div>')
 
     # ---------- numbers ----------
     total = ctx.q("SELECT COUNT(*) AS n FROM fights WHERE guild_id = ?", (ctx.gid,))[0]["n"]
@@ -1824,6 +1846,21 @@ img{max-width:100%}
 .tick-live{flex:none;display:flex;align-items:center;gap:10px;padding:0 20px 0 max(16px,env(safe-area-inset-left,0px));font:700 13px var(--d);letter-spacing:.2em;color:var(--bg);background:var(--gold);position:relative;z-index:1}
 .tick-live .dot{background:var(--bg)}
 .tick-win{flex:1;min-width:0;overflow:hidden;-webkit-mask:linear-gradient(90deg,transparent,#000 40px);mask:linear-gradient(90deg,transparent,#000 40px)}
+
+.tick{gap:10px;padding:14px 22px}
+.tick b{font:700 17px var(--d);letter-spacing:.02em;color:var(--text)}
+.tick-dim{color:var(--dim);font-size:12px;letter-spacing:.06em}
+.tick-m{font-size:11px;font-weight:700;letter-spacing:.14em;padding:3px 8px;border-radius:999px;border:1px solid currentColor;opacity:.95}
+.tick-belt{font-size:10px;font-weight:700;letter-spacing:.16em;color:var(--bg);background:var(--gold);padding:3px 7px;border-radius:4px}
+.tick-rank{font:800 18px var(--d);color:var(--muted);font-variant-numeric:tabular-nums}
+.tick-head{padding-left:34px}
+.tick-chip{font:700 12px var(--d);letter-spacing:.2em;text-transform:uppercase;color:var(--gold2);border:1px solid rgba(201,162,74,.45);background:rgba(201,162,74,.08);padding:5px 12px;border-radius:999px}
+.tick-head-alt .tick-chip{color:var(--bg);background:var(--gold);border-color:var(--gold)}
+.tick:not(.tick-head)+.tick:not(.tick-head)::before{content:"";width:4px;height:4px;border-radius:50%;background:#3A3A42;margin-right:12px}
+@keyframes tickIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.tick-win .track{animation-name:ticker}
+.ticker .tick-m{animation:mGlow 2.4s ease-in-out infinite}
+@keyframes mGlow{0%,100%{box-shadow:0 0 0 0 transparent}50%{box-shadow:0 0 12px -2px currentColor}}
 
 /* main event: photos, pulsing VS */
 .corner-top{display:flex;align-items:center;gap:16px}
