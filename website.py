@@ -28,6 +28,7 @@ In Railway: open the bot's service → Settings → Networking →
 Generate Domain. That's the website's address.
 """
 
+import asyncio
 import html
 import os
 import re
@@ -46,7 +47,8 @@ DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
 SITE_VERSION = "3"            # bump if the styles change and browsers keep the old ones
-CACHE_SECONDS = 20            # pages are rebuilt at most every 20 seconds
+CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
+MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
 
 
@@ -66,11 +68,24 @@ class Ctx:
         self.guild = guild
         self.gid = guild.id
 
+    MEMO = ("title_lineage", "all_title_outcomes", "get_fighter_stats", "recent_events",
+            "get_division_rankings", "get_user_rankings", "fight_stat_totals")
+
     def __getattr__(self, name):
         try:
-            return self.g[name]
+            fn = self.g[name]
         except KeyError:
             raise AttributeError(name)
+        if name in self.MEMO and callable(fn):
+            memo = self.__dict__.setdefault("_memo", {})
+            def remembered(*args):
+                key = (name, args)
+                if key not in memo:
+                    memo[key] = fn(*args)
+                return memo[key]
+            self.__dict__[name] = remembered
+            return remembered
+        return fn
 
     def q(self, sql, params=()):
         return self.g["discipline_query"](sql, params)
@@ -1271,6 +1286,7 @@ def render_results(ctx, page_no=1):
     shown = events[(page_no - 1) * RESULTS_PER_PAGE: page_no * RESULTS_PER_PAGE]
 
     blocks = ""
+    outcomes = ctx.all_title_outcomes(ctx.gid)
     for event in shown:
         fights = ctx.event_fights(ctx.gid, event)
         if not fights:
@@ -1278,7 +1294,6 @@ def render_results(ctx, page_no=1):
         layout, title, notes = ctx.load_recap_layout(ctx.gid, event, fights)
         grouped = ctx.ordered_sections(layout)
         by_id = {f["id"]: f for f in fights}
-        outcomes = ctx.all_title_outcomes(ctx.gid)
 
         sections = ""
         count = 0
@@ -2088,45 +2103,76 @@ SITE_JS += EXTRA_JS
 _cache = {}
 
 
-def build(bot, g, key, maker):
-    """Builds a page (or uses the copy from the last few seconds)."""
+_locks = {}
+_build_slots = None
+
+
+def _store(key, result):
+    _cache[key] = (time.time(), result)
+    if len(_cache) > 400:
+        for old in sorted(_cache, key=lambda k: _cache[k][0])[:200]:
+            _cache.pop(old, None)
+            _locks.pop(old, None)
+
+
+async def build(bot, g, key, maker):
+    """
+    Returns a page. Busy moments are handled like this:
+      - a page built in the last minute is reused for everyone;
+      - if lots of people ask for the same page at once, it's built ONCE
+        and they all get that copy;
+      - while a page is being refreshed, visitors get the previous copy
+        straight away instead of waiting;
+      - pages are built away from the bot's own work, so the Discord bot
+        never freezes, however many people visit.
+    """
+
+    global _build_slots
+    if _build_slots is None:
+        _build_slots = asyncio.Semaphore(MAX_BUILDS_AT_ONCE)
 
     hit = _cache.get(key)
     if hit and time.time() - hit[0] < CACHE_SECONDS:
         return hit[1]
 
-    guild = pick_guild(bot, g)
-    if guild is None:
-        return None
+    lock = _locks.setdefault(key, asyncio.Lock())
 
-    ctx = Ctx(g, guild)
-    result = maker(ctx)
-    _cache[key] = (time.time(), result)
+    if hit and lock.locked():
+        return hit[1]
 
-    if len(_cache) > 400:
-        for old in sorted(_cache, key=lambda k: _cache[k][0])[:200]:
-            _cache.pop(old, None)
+    async with lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < CACHE_SECONDS:
+            return hit[1]
 
-    return result
+        guild = pick_guild(bot, g)
+        if guild is None:
+            return None
+
+        async with _build_slots:
+            result = await asyncio.to_thread(maker, Ctx(g, guild))
+
+        _store(key, result)
+        return result
 
 
 def make_app(bot, g):
 
     def html_response(text, status=200):
         return web.Response(text=text, status=status, content_type="text/html", charset="utf-8",
-                            headers={"Cache-Control": "public, max-age=15"})
+                            headers={"Cache-Control": "public, max-age=30, stale-while-revalidate=120"})
 
     async def serve(request, key, maker, status=200):
         if not bot.is_ready():
             return html_response(render_starting(), 503)
         try:
-            text = build(bot, g, key, maker)
+            text = await build(bot, g, key, maker)
         except Exception:
             traceback.print_exc()
             return html_response("<!doctype html><meta charset=utf-8><body style='background:#08080A;color:#eee;font:16px system-ui;padding:40px'>"
                                  "<p>Something went wrong loading this page. Try again in a moment.</p><p><a style='color:#E2C27A' href='/'>Home</a></p>", 500)
         if text is None:
-            return html_response(build(bot, g, "404", render_404), 404)
+            return html_response(await build(bot, g, "404", render_404), 404)
         return html_response(text, status)
 
     async def home(request):
