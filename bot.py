@@ -4133,6 +4133,51 @@ async def create_profile_embed(
         inline=True
     )
 
+    # Fight stats from /addstrikes, and record as favourite / underdog
+    if member.id:
+        try:
+            total = fight_stat_totals(guild.id).get(member.id)
+            stat_lines = []
+
+            if total:
+                stat_lines += [
+                    f"Strikes **{total['total_landed']:,}**/{total['total_thrown']:,}"
+                    f" · Sig. **{total['sig_landed']:,}**/{total['sig_thrown']:,}"
+                    + (f" ({round(100 * total['sig_landed'] / total['sig_thrown'])}%)" if total["sig_thrown"] else ""),
+                    f"Takedowns **{total['td_landed']}**/{total['td_attempted']}"
+                    f" · Control **{total['control'] // 60}:{total['control'] % 60:02d}**"
+                    f" · Knockdowns **{total['knockdowns']}**",
+                    f"-# landed / thrown over {total['fights']} fight{'s' if total['fights'] != 1 else ''} with stats",
+                ]
+
+            odds_record = favourite_records(guild.id).get(member.id)
+
+            if odds_record and (sum(odds_record["fav"]) or sum(odds_record["dog"])):
+                fav, dog = odds_record["fav"], odds_record["dog"]
+                stat_lines.append(
+                    f"⭐ Favourite **{fav[0]}-{fav[1]}** · 🐶 Underdog **{dog[0]}-{dog[1]}**"
+                )
+
+            if stat_lines:
+                embed.add_field(name="📊 Fight Stats", value="\n".join(stat_lines)[:1024], inline=False)
+        except Exception as error:
+            print(f"Profile stats lookup failed: {error}")
+
+        # Top 3 spots on any leaderboard
+        try:
+            places = leaderboard_places(guild, member.id)
+
+            if places:
+                medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+                lines = []
+                for place in (1, 2, 3):
+                    names = [LEADERBOARD_SHORT[category] for spot, category in places if spot == place]
+                    if names:
+                        lines.append(f"{medals[place]} " + " · ".join(names))
+                embed.add_field(name="🏅 Leaderboards", value="\n".join(lines)[:1024], inline=False)
+        except Exception as error:
+            print(f"Profile leaderboard lookup failed: {error}")
+
     # Last 5 fights, newest first
     recent = list(reversed(stats["fights"]))[:5]
 
@@ -8546,6 +8591,15 @@ LEADERBOARD_CHOICES = [
     app_commands.Choice(name="Voting: correct picks", value="votes"),
     app_commands.Choice(name="Suspended fighters (countdown)", value="suspended"),
     app_commands.Choice(name="PFO Coins: richest", value="coins"),
+    app_commands.Choice(name="Stats: strikes landed", value="strikes"),
+    app_commands.Choice(name="Stats: significant strikes landed", value="sigstrikes"),
+    app_commands.Choice(name="Stats: striking accuracy", value="sigacc"),
+    app_commands.Choice(name="Stats: takedowns landed", value="takedowns"),
+    app_commands.Choice(name="Stats: takedown accuracy", value="tdacc"),
+    app_commands.Choice(name="Stats: control time", value="control"),
+    app_commands.Choice(name="Stats: knockdowns", value="knockdowns"),
+    app_commands.Choice(name="Wins as favourite", value="favwins"),
+    app_commands.Choice(name="Wins as underdog", value="dogwins"),
 ]
 
 LEADERBOARD_TITLES = {
@@ -8558,23 +8612,53 @@ LEADERBOARD_TITLES = {
     "votes": "🗳️ Voting: Correct Picks",
     "suspended": "⛔ Suspended Fighters",
     "coins": "🪙 Richest in PFO",
+    "strikes": "👊 Most Strikes Landed",
+    "sigstrikes": "🎯 Most Significant Strikes",
+    "sigacc": "📐 Best Striking Accuracy",
+    "takedowns": "🤼 Most Takedowns",
+    "tdacc": "📐 Best Takedown Accuracy",
+    "control": "⏱️ Most Control Time",
+    "knockdowns": "💫 Most Knockdowns",
+    "favwins": "⭐ Wins as Favourite",
+    "dogwins": "🐶 Wins as Underdog",
 }
+
+# Short names used on /profile for top 3 spots.
+LEADERBOARD_SHORT = {
+    "wins": "Most wins", "streak": "Win streak", "ko": "KO/TKO wins", "sub": "Submission wins",
+    "finish": "Finish rate", "titles": "Title fight wins", "votes": "Voting picks", "coins": "Richest",
+    "strikes": "Strikes landed", "sigstrikes": "Significant strikes", "sigacc": "Striking accuracy",
+    "takedowns": "Takedowns", "tdacc": "Takedown accuracy", "control": "Control time",
+    "knockdowns": "Knockdowns", "favwins": "Wins as favourite", "dogwins": "Wins as underdog",
+}
+
+STATS_MIN_FIGHTS = 3       # fights with stats needed for the accuracy boards
+TD_MIN_ATTEMPTS = 5        # takedown attempts needed for takedown accuracy
 
 
 def fighter_leaderboard(
     guild: discord.Guild,
-    category: str
+    category: str,
+    cache: dict = None
 ):
-    """[(member, value, display_text)] best first."""
+    """[(member, value, display_text)] best first. cache saves re-reading records for several boards."""
 
     rows = []
 
     for member in guild.members:
 
-        if member.bot or not has_record_data(guild.id, member.id):
+        if member.bot:
             continue
 
-        stats = get_fighter_stats(guild.id, member.id)
+        if cache is not None and member.id in cache:
+            stats = cache[member.id]
+        else:
+            stats = get_fighter_stats(guild.id, member.id) if has_record_data(guild.id, member.id) else None
+            if cache is not None:
+                cache[member.id] = stats
+
+        if not stats:
+            continue
 
         if category == "wins":
             value = stats["wins"]
@@ -8644,6 +8728,201 @@ def voting_leaderboard(
     return [(member, value, text) for member, value, _, text in rows]
 
 
+def fight_stat_totals(guild_id: int):
+    """Career totals from /addstrikes for everyone: {user_id: {...}}."""
+
+    totals = {}
+
+    for row in discipline_query("""
+        SELECT user_id, COUNT(*) AS fights, SUM(total_landed) AS total_landed, SUM(total_thrown) AS total_thrown,
+               SUM(sig_landed) AS sig_landed, SUM(sig_thrown) AS sig_thrown, SUM(td_landed) AS td_landed,
+               SUM(td_attempted) AS td_attempted, SUM(control_seconds) AS control, SUM(knockdowns) AS knockdowns
+        FROM fight_stats WHERE guild_id = ? GROUP BY user_id
+    """, (guild_id,)):
+        totals[row["user_id"]] = dict(row)
+
+    return totals
+
+
+def stats_leaderboard(guild: discord.Guild, category: str):
+
+    rows = []
+
+    for user_id, total in fight_stat_totals(guild.id).items():
+
+        member = guild.get_member(user_id)
+
+        if not member:
+            continue
+
+        fights = total["fights"]
+        per = f"{fights} fight{'s' if fights != 1 else ''}"
+
+        if category == "strikes":
+            value, extra = total["total_landed"], total["total_thrown"]
+            text = f"{value:,} landed of {extra:,} · {per}"
+        elif category == "sigstrikes":
+            value, extra = total["sig_landed"], total["sig_thrown"]
+            text = f"{value:,} landed of {extra:,} · {per}"
+        elif category == "sigacc":
+            if fights < STATS_MIN_FIGHTS or not total["sig_thrown"]:
+                continue
+            value = round(100 * total["sig_landed"] / total["sig_thrown"])
+            extra = total["sig_landed"]
+            text = f"{value}% ({total['sig_landed']:,}/{total['sig_thrown']:,}) · {per}"
+        elif category == "takedowns":
+            value, extra = total["td_landed"], -total["td_attempted"]
+            text = f"{value} of {total['td_attempted']} attempts · {per}"
+        elif category == "tdacc":
+            if fights < STATS_MIN_FIGHTS or total["td_attempted"] < TD_MIN_ATTEMPTS:
+                continue
+            value = round(100 * total["td_landed"] / total["td_attempted"])
+            extra = total["td_landed"]
+            text = f"{value}% ({total['td_landed']}/{total['td_attempted']}) · {per}"
+        elif category == "control":
+            value, extra = total["control"], 0
+            minutes, seconds = divmod(value, 60)
+            text = f"{minutes}:{seconds:02d} · {per}"
+        else:
+            value, extra = total["knockdowns"], 0
+            text = f"{value} knockdown{'s' if value != 1 else ''} · {per}"
+
+        if value <= 0:
+            continue
+
+        rows.append((member, value, extra, text))
+
+    rows.sort(key=lambda row: (row[1], row[2]), reverse=True)
+
+    return [(member, value, text) for member, value, _, text in rows]
+
+
+def favourite_records(guild_id: int):
+    """
+    Wins and losses as the betting favourite / underdog, from the
+    sportsbook odds once betting closed. Only fights that had betting.
+    {user_id: {"fav": [w, l], "dog": [w, l], "best_upset": odds}}
+    """
+
+    records = {}
+    seen = set()
+
+    for bout in discipline_query("""
+        SELECT bet_fights.* FROM bet_fights JOIN bet_markets ON bet_markets.id = bet_fights.market_id
+        WHERE bet_markets.guild_id = ? AND bet_fights.result IN ('a', 'b') AND bet_fights.fight_id IS NOT NULL
+        ORDER BY bet_fights.market_id DESC
+    """, (guild_id,)):
+
+        if bout["fight_id"] in seen:
+            continue
+        seen.add(bout["fight_id"])
+
+        odds = live_odds(bout)
+
+        if abs(odds["a"] - odds["b"]) < 0.005:
+            continue
+
+        favourite = "a" if odds["a"] < odds["b"] else "b"
+
+        for side in ("a", "b"):
+            user_id = bout["fighter_a"] if side == "a" else bout["fighter_b"]
+            record = records.setdefault(user_id, {"fav": [0, 0], "dog": [0, 0], "best_upset": 0})
+            role = "fav" if side == favourite else "dog"
+            won = bout["result"] == side
+            record[role][0 if won else 1] += 1
+
+            if won and role == "dog":
+                record["best_upset"] = max(record["best_upset"], odds[side])
+
+    return records
+
+
+def odds_leaderboard(guild: discord.Guild, category: str):
+
+    role = "fav" if category == "favwins" else "dog"
+    rows = []
+
+    for user_id, record in favourite_records(guild.id).items():
+
+        member = guild.get_member(user_id)
+        wins, losses = record[role]
+
+        if not member or not wins:
+            continue
+
+        text = f"{wins} win{'s' if wins != 1 else ''} ({wins}-{losses} as {'favourite' if role == 'fav' else 'underdog'})"
+
+        if role == "dog" and record["best_upset"]:
+            text += f" · biggest upset `{record['best_upset']:.2f}`"
+
+        rows.append((member, wins, wins / (wins + losses), text))
+
+    rows.sort(key=lambda row: (row[1], row[2]), reverse=True)
+
+    return [(member, value, text) for member, value, _, text in rows]
+
+
+def coins_leaderboard(guild: discord.Guild):
+
+    rows = []
+
+    for row in discipline_query(
+        "SELECT user_id, balance FROM coin_wallets WHERE guild_id = ? ORDER BY balance DESC LIMIT 25",
+        (guild.id,)
+    ):
+        member = guild.get_member(row["user_id"])
+        if member:
+            rows.append((member, row["balance"], f"{COIN} {row['balance']:,}"))
+
+    return rows
+
+
+def leaderboard_rows(guild: discord.Guild, category: str, cache: dict = None):
+    """Every leaderboard (except suspensions): [(member, value, text)] best first."""
+
+    if category == "coins":
+        return coins_leaderboard(guild)
+    if category == "votes":
+        return voting_leaderboard(guild)
+    if category in ("strikes", "sigstrikes", "sigacc", "takedowns", "tdacc", "control", "knockdowns"):
+        return stats_leaderboard(guild, category)
+    if category in ("favwins", "dogwins"):
+        return odds_leaderboard(guild, category)
+    return fighter_leaderboard(guild, category, cache)
+
+
+def leaderboard_places(guild: discord.Guild, user_id: int, top: int = 3):
+    """[(place, category)] for every leaderboard this person is top 3 on (ties share a place)."""
+
+    places = []
+    cache = {}
+
+    for category in LEADERBOARD_SHORT:
+
+        try:
+            rows = leaderboard_rows(guild, category, cache)
+        except Exception as error:
+            print(f"Leaderboard place check failed ({category}): {error}")
+            continue
+
+        place = 0
+        previous = None
+
+        for index, (member, value, _) in enumerate(rows, start=1):
+            if value != previous:
+                place = index
+                previous = value
+            if place > top:
+                break
+            if member.id == user_id:
+                places.append((place, category))
+                break
+
+    places.sort(key=lambda item: item[0])
+
+    return places
+
+
 @bot.tree.command(
     name="leaderboard",
     description="Post a top 10 leaderboard for fights or voting."
@@ -8693,19 +8972,7 @@ async def leaderboard(
         await interaction.followup.send(embed=embed)
         return
 
-    if category.value == "coins":
-        rows = []
-        for row in discipline_query(
-            "SELECT user_id, balance FROM coin_wallets WHERE guild_id = ? ORDER BY balance DESC LIMIT 25",
-            (interaction.guild.id,)
-        ):
-            member = interaction.guild.get_member(row["user_id"])
-            if member:
-                rows.append((member, row["balance"], f"{COIN} {row['balance']:,}"))
-    elif category.value == "votes":
-        rows = voting_leaderboard(interaction.guild)
-    else:
-        rows = fighter_leaderboard(interaction.guild, category.value)
+    rows = leaderboard_rows(interaction.guild, category.value)
 
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     lines = []
@@ -8739,6 +9006,15 @@ async def leaderboard(
         "coins": "PFO Coins are points only • /coins to see yours",
         "finish": "Finish rate = KO/TKO + submission wins • minimum 3 logged wins",
         "votes": "Correct picks from /mainvote once results are logged",
+        "strikes": "From /addstrikes fight stats",
+        "sigstrikes": "From /addstrikes fight stats",
+        "sigacc": f"Significant strikes landed ÷ thrown • minimum {STATS_MIN_FIGHTS} fights with stats",
+        "takedowns": "From /addstrikes fight stats",
+        "tdacc": f"Takedowns landed ÷ attempted • minimum {STATS_MIN_FIGHTS} fights and {TD_MIN_ATTEMPTS} attempts",
+        "control": "Total control time from /addstrikes fight stats",
+        "knockdowns": "From /addstrikes fight stats",
+        "favwins": "Favourite = shorter betting odds when betting closed • fights with betting only",
+        "dogwins": "Underdog = longer betting odds when betting closed • fights with betting only",
     }
 
     embed.set_footer(
