@@ -18564,6 +18564,15 @@ async def setup_hook():
     if not vote_closer.is_running():
         vote_closer.start()
 
+    # The PFO website (website.py, next to this file). It reads this
+    # bot's database, so it's always up to date. A problem here never
+    # stops the bot itself.
+    try:
+        import website
+        await website.start(bot, globals())
+    except Exception as error:
+        print(f"Website could not start: {error}")
+
     await sync_commands_if_changed()
 
 
