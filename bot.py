@@ -8632,8 +8632,8 @@ LEADERBOARD_SHORT = {
     "knockdowns": "Knockdowns", "favwins": "Wins as favourite", "dogwins": "Wins as underdog",
 }
 
-STATS_MIN_FIGHTS = 3       # fights with stats needed for the accuracy boards
-TD_MIN_ATTEMPTS = 5        # takedown attempts needed for takedown accuracy
+STATS_MIN_FIGHTS = 1       # fights with stats needed for the accuracy boards (1 = show straight away)
+TD_MIN_ATTEMPTS = 1        # takedown attempts needed for takedown accuracy
 
 
 def fighter_leaderboard(
@@ -9008,9 +9008,9 @@ async def leaderboard(
         "votes": "Correct picks from /mainvote once results are logged",
         "strikes": "From /addstrikes fight stats",
         "sigstrikes": "From /addstrikes fight stats",
-        "sigacc": f"Significant strikes landed ÷ thrown • minimum {STATS_MIN_FIGHTS} fights with stats",
+        "sigacc": "Significant strikes landed ÷ thrown • from /addstrikes fight stats",
         "takedowns": "From /addstrikes fight stats",
-        "tdacc": f"Takedowns landed ÷ attempted • minimum {STATS_MIN_FIGHTS} fights and {TD_MIN_ATTEMPTS} attempts",
+        "tdacc": "Takedowns landed ÷ attempted • from /addstrikes fight stats",
         "control": "Total control time from /addstrikes fight stats",
         "knockdowns": "From /addstrikes fight stats",
         "favwins": "Favourite = shorter betting odds when betting closed • fights with betting only",
