@@ -46,7 +46,7 @@ except ImportError:  # only when testing without discord.py installed
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "6"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "7"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -974,6 +974,54 @@ def render_rankings(ctx, selected=None):
         if not list_rows:
             list_rows = '<li class="empty">Nobody ranked here yet.</li>'
 
+        # Interim champion, BMF and WMF (set with /belt in Discord).
+        belts_html = ""
+        unranked_html = ""
+
+        if weight != ctx.P4P_WEIGHT:
+            belt_fn = getattr(ctx, "get_division_belts", None)
+            belts = belt_fn(ctx.gid, weight) if belt_fn else {}
+            labels = [("interim", "INTERIM CHAMPION"), ("bmf", "BMF · BADDEST MOTHERF*CKER"), ("wmf", "WMF · WORST MOTHERF*CKER")]
+
+            for i, (key, label) in enumerate(labels):
+                if key not in belts:
+                    continue
+                uid = belts[key]
+                name = fighter_name(ctx, uid)
+                stats = stats_for(ctx, uid, cache)
+                belts_html += f"""
+        <a href="{fighter_url(uid)}" class="belt belt-{key} {stagger(i, 3)}">
+          {avatar_html(ctx, uid, name, 'av av-sm')}
+          <span class="belt-text"><span class="belt-label">{esc(label)}</span><span class="d belt-name">{esc(name)}</span></span>
+          <span class="muted">{esc(ctx.stats_record(stats) if stats else '')}</span>
+        </a>"""
+
+            # Fighters with the division's role who aren't on the board.
+            unranked_fn = getattr(ctx, "unranked_in_division", None)
+            unranked = unranked_fn(ctx.guild, weight) if unranked_fn else []
+            unranked_rows = ""
+
+            for i, uid in enumerate(unranked):
+                name = fighter_name(ctx, uid)
+                stats = stats_for(ctx, uid, cache)
+                unranked_rows += f"""
+          <li class="row rank-row {stagger(i, 3)}">
+            <span class="d rank-n" aria-hidden="true">–</span>
+            {avatar_html(ctx, uid, name, 'av av-sm')}
+            {name_link(ctx, uid, name, 'd rank-name')}
+            <span class="muted tab">{esc(ctx.stats_record(stats) if stats else '')}</span>
+          </li>"""
+
+            if unranked_rows:
+                unranked_html = f"""
+        <div class="unranked">
+          <div class="list-head rv"><span>UNRANKED</span><span>RECORD</span></div>
+          <ol class="list">{unranked_rows}</ol>
+        </div>"""
+
+        if belts_html:
+            champ_html = f'<div class="champ-col">{champ_html}<div class="belts">{belts_html}</div></div>'
+
         note = (f"Movement since the last rankings update on {uk_time(since).day} {uk_time(since):%B}."
                 if since else "Arrows show the latest move.")
 
@@ -983,7 +1031,7 @@ def render_rankings(ctx, selected=None):
       <section class="rank-list" aria-label="{esc(names.get(weight, weight))} contenders">
         <div class="list-head rv"><span>{'RANKED' if weight == ctx.P4P_WEIGHT else 'CONTENDER'}</span><span>RECORD · MOVE</span></div>
         <ol class="list">{list_rows}</ol>
-        <p class="note rv">{esc(note)}</p>
+        <p class="note rv">{esc(note)}</p>{unranked_html}
       </section>
     </div>"""
 
@@ -1794,6 +1842,17 @@ img{max-width:100%}
 .feature:hover{border-color:#4A3D1E;color:var(--text);transform:translateY(-3px)}
 .feature::after{content:"";position:absolute;inset:0;background:linear-gradient(115deg,transparent 35%,rgba(226,194,122,.09) 50%,transparent 65%);transform:translateX(-100%);animation:shine 5s var(--ease) 1.5s infinite}
 .feature-vacant{background:var(--panel)}
+.champ-col{flex:1 1 340px;align-self:flex-start;display:flex;flex-direction:column;gap:14px;min-width:0}
+.champ-col .feature{flex:none;align-self:stretch}
+.belts{display:flex;flex-direction:column;gap:10px}
+.belt{display:flex;align-items:center;gap:14px;padding:14px 18px;border:1px solid var(--line2);border-radius:14px;background:var(--panel);color:var(--text);transition:border-color .3s,transform .3s var(--ease)}
+.belt:hover{border-color:#4A3D1E;color:var(--text);transform:translateX(3px)}
+.belt-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.belt-label{font-size:11px;font-weight:700;letter-spacing:.2em;color:var(--gold)}
+.belt-wmf .belt-label{color:var(--muted)}
+.belt-name{font-size:22px;line-height:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.unranked{margin-top:48px}
+.unranked .rank-n{color:#4A4A52}
 .feature-vacant::after{display:none}
 .feature-name{font-size:64px;line-height:.85}
 .feature-stats{display:flex;gap:28px;font-size:12px;font-weight:600;letter-spacing:.16em;color:var(--muted);border-top:1px solid var(--line);padding-top:22px}
