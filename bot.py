@@ -376,6 +376,8 @@ def setup_database():
     setup_interview_tables()
     setup_rankings_update_tables()
     setup_fight_stats_tables()
+    setup_belt_tables()
+    setup_auto_rank_tables()
 
 
 # ============================================================
@@ -2247,6 +2249,8 @@ async def create_ranking_embed(
             + "\n".join(lines)
         )
 
+        extras = (None, [], [])
+
     # ========================================================
     # WEIGHT CLASS (champion + #1-#15)
     # ========================================================
@@ -2268,13 +2272,28 @@ async def create_ranking_embed(
         else:
             champion_text = "🏆 *Vacant*"
 
+        # Interim / BMF / WMF and the Unranked box (only shown when used).
+        try:
+            extras = await ranking_board_extras(guild, weight)
+        except Exception as error:
+            print(f"Ranking board extras failed: {error}")
+            extras = (None, [], [])
+
+        interim_line, belt_lines, unranked_lines = extras
+
         description = (
             "**👑 CHAMPION**\n"
             f"{champion_text}\n"
-            "\n"
+            + (f"{interim_line}\n" if interim_line else "")
+            + ("\n**🎖️ BELTS**\n" + "\n".join(belt_lines) + "\n" if belt_lines else "")
+            + "\n"
             "**🥊 RANKINGS**\n"
             + "\n".join(lines)
+            + ("\n\n**📋 UNRANKED**\n" + "\n".join(unranked_lines) if unranked_lines else "")
         )
+
+        if len(description) > 4096:
+            description = description[:4090] + "…"
 
     # The whole board sits in one block (limit 4096 characters),
     # so it never splits into separate chunks with gaps.
@@ -4033,6 +4052,14 @@ async def create_profile_embed(
             f"🏆 {stats['title_wins']} title fight "
             f"win{'s' if stats['title_wins'] != 1 else ''}"
         )
+
+    # Interim / BMF / WMF belts
+    if member.id:
+        try:
+            for belt_weight, belt_key in get_member_belts(guild.id, member.id):
+                description.append(f"**{belt_title(belt_weight, belt_key)}**")
+        except Exception as error:
+            print(f"Profile belt lookup failed: {error}")
 
     # Title reigns (from title fights)
     try:
@@ -8457,6 +8484,12 @@ async def vote_closer():
         await check_rankings_updates()
     except Exception as error:
         print(f"Rankings update error: {error}")
+
+    # Weight-class roles vs the rankings (suggestions in pfo-bot).
+    try:
+        await check_auto_rankings()
+    except Exception as error:
+        print(f"Auto-rank error: {error}")
 
     # Suspensions ending.
     await run_discipline_checks()
@@ -14454,7 +14487,9 @@ def sportsbook_embeds(market):
         name = bout_slot(bout["position"], total) + (f" · {bout['weight']}" if bout["weight"] else "")
 
         if bout["result"]:
-            if bout["result"] == "void":
+            if bout["result"] == "void" and bout["method"] == "CANCELLED":
+                value = "🚫 Fight cancelled · bets refunded"
+            elif bout["result"] == "void":
                 value = "🤝 Draw / no contest · bets refunded"
             else:
                 winner = bout["name_a"] if bout["result"] == "a" else bout["name_b"]
@@ -15777,6 +15812,261 @@ async def betoverview(
     view = BetOverviewView(interaction.guild, interaction.user.id, market_id, member.id if member else None)
 
     await interaction.response.send_message(embed=view.render(), view=view, ephemeral=True)
+
+
+# ------------------------------------------------------------
+# /cancelfight  call off a fight that has bets on it
+#
+# Single bets on it are refunded. In accumulators the fight is taken
+# out (the leg is voided) and the acca's odds are worked out again
+# from the fights left in it. The sportsbook post shows it as
+# cancelled and nobody can bet on it any more. Asks to confirm first,
+# and there's an Undo button straight after.
+# ------------------------------------------------------------
+
+def bet_odds_without_void(bet_id: int):
+    """An accumulator's odds from the legs that still count."""
+
+    legs = discipline_query("SELECT odds, status FROM bet_legs WHERE bet_id = ?", (bet_id,))
+    live = [leg["odds"] for leg in legs if leg["status"] != "void"]
+
+    if not live:
+        return None
+
+    total = 1.0
+    for odds in live:
+        total *= odds
+
+    return round(total, 2)
+
+
+def bets_on_bout(market_id: int, position: int):
+    return discipline_query("""
+        SELECT bets.*, (SELECT COUNT(*) FROM bet_legs l WHERE l.bet_id = bets.id) AS leg_count
+        FROM bets JOIN bet_legs ON bet_legs.bet_id = bets.id
+        WHERE bets.market_id = ? AND bet_legs.position = ?
+    """, (market_id, position))
+
+
+def cancel_bet_fight(guild_id: int, market_id: int, position: int):
+    """Voids the fight for betting. Returns a summary dict."""
+
+    bets = bets_on_bout(market_id, position)
+
+    discipline_query(
+        "UPDATE bet_fights SET result = 'void', method = 'CANCELLED' WHERE market_id = ? AND position = ?",
+        (market_id, position), write=True
+    )
+
+    summary = {"singles": 0, "refunded": 0, "accas": 0}
+
+    for bet in bets:
+
+        discipline_query(
+            "UPDATE bet_legs SET status = 'void' WHERE bet_id = ? AND position = ?", (bet["id"], position), write=True
+        )
+
+        if bet["leg_count"] > 1:
+            new_odds = bet_odds_without_void(bet["id"])
+            if new_odds:
+                discipline_query("UPDATE bets SET odds = ? WHERE id = ?", (new_odds, bet["id"]), write=True)
+            summary["accas"] += 1
+        else:
+            summary["singles"] += 1
+            summary["refunded"] += bet["stake"]
+
+        evaluate_bet(guild_id, bet["id"])
+
+    if not discipline_query("SELECT 1 FROM bet_fights WHERE market_id = ? AND result IS NULL", (market_id,)):
+        discipline_query("UPDATE bet_markets SET status = 'settled' WHERE id = ?", (market_id,), write=True)
+
+    _markets_to_refresh.add(market_id)
+
+    return summary
+
+
+def uncancel_bet_fight(guild_id: int, market_id: int, position: int):
+    """Undo: the fight is back on, bets on it count again (refunds are taken back)."""
+
+    bout = discipline_query("SELECT * FROM bet_fights WHERE market_id = ? AND position = ?", (market_id, position))
+
+    if not bout or bout[0]["method"] != "CANCELLED":
+        return False
+
+    discipline_query(
+        "UPDATE bet_fights SET result = NULL, method = NULL WHERE market_id = ? AND position = ?",
+        (market_id, position), write=True
+    )
+
+    for bet in bets_on_bout(market_id, position):
+        discipline_query(
+            "UPDATE bet_legs SET status = 'pending' WHERE bet_id = ? AND position = ?", (bet["id"], position), write=True
+        )
+        new_odds = bet_odds_without_void(bet["id"])
+        if new_odds:
+            discipline_query("UPDATE bets SET odds = ? WHERE id = ?", (new_odds, bet["id"]), write=True)
+        evaluate_bet(guild_id, bet["id"])
+
+    market = get_market(market_id)
+
+    if market and market["status"] == "settled":
+        discipline_query(
+            "UPDATE bet_markets SET status = ? WHERE id = ?",
+            ("open" if time.time() < market["closes_at"] else "locked", market_id), write=True
+        )
+
+    _markets_to_refresh.add(market_id)
+
+    return True
+
+
+async def cancellable_fight_autocomplete(interaction: discord.Interaction, current: str):
+
+    rows = discipline_query("""
+        SELECT bet_fights.*, bet_markets.event FROM bet_fights
+        JOIN bet_markets ON bet_markets.id = bet_fights.market_id
+        WHERE bet_markets.guild_id = ? AND bet_fights.result IS NULL
+        ORDER BY bet_markets.id DESC, bet_fights.position
+        LIMIT 100
+    """, (interaction.guild.id,))
+
+    choices = []
+
+    for row in rows:
+        label = f"{row['name_a']} vs {row['name_b']} · {row['event']}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=f"{row['market_id']}:{row['position']}"))
+
+    return choices[:25]
+
+
+class CancelFightView(
+    discord.ui.View
+):
+
+    def __init__(self, staff_id: int, market_id: int, position: int):
+        super().__init__(timeout=900)
+        self.staff_id = staff_id
+        self.market_id = market_id
+        self.position = position
+        self.cancelled = False
+        self.show_confirm()
+
+    def show_confirm(self):
+        self.clear_items()
+        yes = discord.ui.Button(label="Cancel the fight and refund", style=discord.ButtonStyle.red)
+        yes.callback = self.confirm
+        no = discord.ui.Button(label="Keep it", style=discord.ButtonStyle.grey)
+        no.callback = self.keep
+        self.add_item(yes)
+        self.add_item(no)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.staff_id
+
+    async def confirm(self, interaction):
+
+        bout = discipline_query(
+            "SELECT * FROM bet_fights WHERE market_id = ? AND position = ?", (self.market_id, self.position)
+        )[0]
+
+        if bout["result"]:
+            await interaction.response.edit_message(content="That fight is already settled or cancelled.", embed=None, view=None)
+            return
+
+        summary = cancel_bet_fight(interaction.guild.id, self.market_id, self.position)
+        self.cancelled = True
+
+        self.clear_items()
+        undo = discord.ui.Button(label="Undo", style=discord.ButtonStyle.grey)
+        undo.callback = self.undo
+        self.add_item(undo)
+
+        await interaction.response.edit_message(
+            content=(
+                f"🚫 **{bout['name_a']} vs {bout['name_b']} is cancelled.**\n"
+                f"{plural(summary['singles'], 'single bet')} refunded ({COIN} {coins_text(summary['refunded'])}) · "
+                f"taken out of {plural(summary['accas'], 'accumulator')} (odds worked out again)."
+            ),
+            embed=None,
+            view=self
+        )
+        await refresh_sportsbook(self.market_id)
+
+    async def undo(self, interaction):
+
+        if not uncancel_bet_fight(interaction.guild.id, self.market_id, self.position):
+            await interaction.response.edit_message(content="Couldn't undo: the fight has changed since.", view=None)
+            return
+
+        self.stop()
+        await interaction.response.edit_message(
+            content="↩️ **Undone.** The fight is back on and its bets count again (refunds taken back).", view=None
+        )
+        await refresh_sportsbook(self.market_id)
+
+    async def keep(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(content="Nothing changed.", embed=None, view=None)
+
+
+@bot.tree.command(
+    name="cancelfight",
+    description="Cancel a fight that has bets on it: refunds singles, takes it out of accumulators."
+)
+@app_commands.describe(
+    fight="The fight to cancel (start typing a name)"
+)
+@app_commands.autocomplete(fight=cancellable_fight_autocomplete)
+async def cancelfight(
+    interaction: discord.Interaction,
+    fight: str
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can cancel fights.", ephemeral=True)
+        return
+
+    match = re.fullmatch(r"(\d+):(\d+)", fight.strip())
+    bout = None
+
+    if match:
+        rows = discipline_query("""
+            SELECT bet_fights.*, bet_markets.event, bet_markets.guild_id FROM bet_fights
+            JOIN bet_markets ON bet_markets.id = bet_fights.market_id
+            WHERE bet_fights.market_id = ? AND bet_fights.position = ?
+        """, (int(match.group(1)), int(match.group(2))))
+        bout = rows[0] if rows and rows[0]["guild_id"] == interaction.guild.id else None
+
+    if not bout:
+        await interaction.response.send_message("❌ Pick the fight from the list that pops up.", ephemeral=True)
+        return
+
+    if bout["result"]:
+        await interaction.response.send_message("ℹ️ That fight is already settled or cancelled.", ephemeral=True)
+        return
+
+    bets = bets_on_bout(bout["market_id"], bout["position"])
+    singles = [bet for bet in bets if bet["leg_count"] == 1]
+    accas = [bet for bet in bets if bet["leg_count"] > 1]
+
+    lines = [
+        f"**{bout['name_a']} vs {bout['name_b']}** · {bout['event']}",
+        "",
+        f"• {plural(len(singles), 'single bet')} refunded: {COIN} **{coins_text(sum(bet['stake'] for bet in singles))}**",
+        (f"• {plural(len(accas), 'accumulator')} {'loses' if len(accas) == 1 else 'lose'} this fight and "
+         f"{'gets' if len(accas) == 1 else 'get'} new odds from the fights left in {'it' if len(accas) == 1 else 'them'}"),
+        "• Nobody can bet on it any more, and the sportsbook post shows it as cancelled",
+    ]
+
+    embed = discord.Embed(title="Cancel this fight?", description="\n".join(lines), color=PFO_GOLD)
+    embed.set_author(name="PFO • SPORTSBOOK", icon_url=asset_url(LOGO_FILE))
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=CancelFightView(interaction.user.id, bout["market_id"], bout["position"]),
+        ephemeral=True
+    )
 
 
 async def sportsbook_tick():
@@ -17347,6 +17637,717 @@ async def taleofthetape(
 
 
 # ============================================================
+# EXTRA BELTS: INTERIM CHAMPION, BMF AND WMF
+#
+# /belt   give or take an Interim Champion, BMF (Baddest Motherfucker)
+#         or WMF (Worst Motherfucker) belt in any division (not P4P).
+#         One holder per belt per division; giving it to someone new
+#         replaces the old holder. Shows on the ranking boards, on
+#         /profile and on the website's rankings page.
+# ============================================================
+
+BELT_TYPES = {
+    "interim": ("Interim Champion", "⭐"),
+    "bmf": ("BMF", "😈"),
+    "wmf": ("WMF", "🤡"),
+}
+
+BELT_CHOICES = [
+    app_commands.Choice(name="Interim Champion", value="interim"),
+    app_commands.Choice(name="BMF (Baddest Motherfucker)", value="bmf"),
+    app_commands.Choice(name="WMF (Worst Motherfucker)", value="wmf"),
+]
+
+
+def division_weights():
+    return [weight for weight in WEIGHTS if weight != P4P_WEIGHT]
+
+
+DIVISION_ONLY_CHOICES = [app_commands.Choice(name=weight, value=weight) for weight in division_weights()]
+
+
+def setup_belt_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS division_belts (
+            guild_id INTEGER NOT NULL,
+            weight TEXT NOT NULL,
+            belt TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            since INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, weight, belt)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def get_division_belts(guild_id: int, weight: str):
+    """{'interim': user_id, 'bmf': user_id, 'wmf': user_id} (only belts that are held)."""
+
+    return {
+        row["belt"]: row["user_id"]
+        for row in discipline_query(
+            "SELECT belt, user_id FROM division_belts WHERE guild_id = ? AND weight = ?", (guild_id, weight)
+        )
+    }
+
+
+def get_member_belts(guild_id: int, user_id: int):
+    """[(weight, belt)] this fighter holds, in division order."""
+
+    rows = discipline_query("SELECT weight, belt FROM division_belts WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    order = list(WEIGHTS)
+    belt_order = list(BELT_TYPES)
+
+    return sorted(
+        [(row["weight"], row["belt"]) for row in rows],
+        key=lambda item: (order.index(item[0]) if item[0] in order else 99, belt_order.index(item[1]))
+    )
+
+
+def belt_title(weight: str, belt: str):
+    name, icon = BELT_TYPES[belt]
+    return f"{icon} Interim {weight} Champion" if belt == "interim" else f"{icon} {weight} {name}"
+
+
+@bot.tree.command(
+    name="belt",
+    description="Give or take an Interim Champion, BMF or WMF belt in a division."
+)
+@app_commands.describe(
+    action="Give or remove",
+    belt="Which belt",
+    weight="Which division",
+    fighter="Who gets it (only needed when giving)"
+)
+@app_commands.choices(
+    action=[app_commands.Choice(name="Give", value="give"), app_commands.Choice(name="Remove", value="remove")],
+    belt=BELT_CHOICES,
+    weight=DIVISION_ONLY_CHOICES
+)
+async def belt(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    belt: app_commands.Choice[str],
+    weight: app_commands.Choice[str],
+    fighter: discord.Member = None
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can change belts.", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    holders = get_division_belts(guild.id, weight.value)
+    current = holders.get(belt.value)
+    title = belt_title(weight.value, belt.value)
+
+    if action.value == "give":
+
+        if not fighter or fighter.bot:
+            await interaction.response.send_message("❌ Pick the fighter who gets the belt.", ephemeral=True)
+            return
+
+        if current == fighter.id:
+            await interaction.response.send_message(f"ℹ️ <@{fighter.id}> already holds **{title}**.", ephemeral=True)
+            return
+
+        discipline_query(
+            "INSERT OR REPLACE INTO division_belts (guild_id, weight, belt, user_id, since) VALUES (?, ?, ?, ?, ?)",
+            (guild.id, weight.value, belt.value, fighter.id, int(time.time())), write=True
+        )
+        note = f"✅ <@{fighter.id}> is now **{title}**." + (f" (Taken from <@{current}>.)" if current else "")
+
+    else:
+
+        if not current:
+            await interaction.response.send_message(f"ℹ️ Nobody holds **{title}** right now.", ephemeral=True)
+            return
+
+        if fighter and fighter.id != current:
+            await interaction.response.send_message(
+                f"ℹ️ **{title}** is held by <@{current}>, not <@{fighter.id}>. Nothing changed.", ephemeral=True
+            )
+            return
+
+        discipline_query(
+            "DELETE FROM division_belts WHERE guild_id = ? AND weight = ? AND belt = ?",
+            (guild.id, weight.value, belt.value), write=True
+        )
+        note = f"🗑️ **{title}** removed from <@{current}>. It's now vacant."
+
+    await interaction.response.send_message(note, ephemeral=True)
+    await refresh_ranking_message(guild, weight.value)
+
+
+# ============================================================
+# RANKINGS FROM WEIGHT-CLASS ROLES
+#
+# Anyone with a weight-class role (a role named like the division,
+# e.g. "Lightweight") should be on that division's rankings, and
+# anyone ranked who no longer has the role should come off.
+# P4P is never touched.
+#
+# Nothing changes by itself: the bot posts what it wants to do in the
+# staff bot channel (pfo-bot) with Apply / Dismiss. Approved fighters
+# go to the lowest open place (straight under the last ranked
+# fighter). If all 15 places are taken they wait in the UNRANKED box
+# at the bottom of the board and move in when a place opens.
+#
+# AUTO_RANK_FROM_ROLES=off in Railway turns this off.
+# ============================================================
+
+AUTO_RANK_ON = os.getenv("AUTO_RANK_FROM_ROLES", "on").strip().lower() not in ("off", "no", "false", "0")
+RANK_SLOTS = 15
+WEIGHT_CODES = {weight: code for weight, code in WEIGHTS.items()}
+CODE_WEIGHTS = {code: weight for weight, code in WEIGHTS.items()}
+_unranked_seen = {}
+_auto_rank_lock = asyncio.Lock()
+
+
+def setup_auto_rank_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS auto_rank_items (
+            guild_id INTEGER NOT NULL,
+            weight TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, weight, user_id, action)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS auto_rank_notices (
+            guild_id INTEGER NOT NULL,
+            weight TEXT NOT NULL,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, weight)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def weight_role(guild: discord.Guild, weight: str):
+    """The role named after the division ('Lightweight', '🥊 Lightweight'...), or None."""
+
+    wanted = role_key(weight)
+
+    for role in getattr(guild, "roles", []):
+        if role_key(role.name) == wanted:
+            return role
+
+    return None
+
+
+def weight_role_holders(guild: discord.Guild, weight: str):
+    """IDs of members with the division's role, or None if there's no such role."""
+
+    role = weight_role(guild, weight)
+
+    if not role:
+        return None
+
+    return {
+        member.id for member in getattr(guild, "members", [])
+        if not member.bot and any(getattr(r, "id", None) == role.id for r in getattr(member, "roles", []))
+    }
+
+
+def record_order(guild_id: int, user_id: int):
+    """Sort key: more wins first, then fewer losses."""
+
+    try:
+        stats = get_fighter_stats(guild_id, user_id)
+        return (-stats["wins"], stats["losses"], user_id)
+    except Exception:
+        return (0, 0, user_id)
+
+
+def unranked_in_division(guild: discord.Guild, weight: str):
+    """Members with the division's role who aren't on its board, best record first."""
+
+    if weight == P4P_WEIGHT:
+        return []
+
+    holders = weight_role_holders(guild, weight)
+
+    if not holders:
+        return []
+
+    ranked = {row["discord_user_id"] for row in get_division_rankings(guild.id, weight)}
+
+    return sorted(holders - ranked, key=lambda user_id: record_order(guild.id, user_id))
+
+
+def lowest_open_rank(guild_id: int, weight: str):
+    """The place straight under the last ranked fighter; else the lowest gap; else None (full)."""
+
+    taken = {row["rank"] for row in get_division_rankings(guild_id, weight) if row["rank"] >= 1}
+    last = max(taken, default=0)
+
+    if last < RANK_SLOTS:
+        return last + 1
+
+    gaps = [rank for rank in range(1, RANK_SLOTS + 1) if rank not in taken]
+
+    return max(gaps) if gaps else None
+
+
+def add_at_lowest(guild_id: int, weight: str, user_id: int):
+    """Puts a fighter in the lowest open place. Returns the rank, or None if the board is full."""
+
+    if get_user_ranking_in_division(guild_id, user_id, weight):
+        return None
+
+    rank = lowest_open_rank(guild_id, weight)
+
+    if rank is None:
+        return None
+
+    discipline_query(
+        "INSERT INTO rankings (guild_id, weight, discord_user_id, rank, movement, updated_at) VALUES (?, ?, ?, ?, 0, ?)",
+        (guild_id, weight, user_id, rank, now_utc()), write=True
+    )
+
+    return rank
+
+
+def auto_rank_items(guild_id: int, weight: str, status: str = None):
+
+    sql = "SELECT * FROM auto_rank_items WHERE guild_id = ? AND weight = ?"
+    params = [guild_id, weight]
+
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+
+    return discipline_query(sql + " ORDER BY created_at, user_id", tuple(params))
+
+
+def auto_rank_item_text(guild: discord.Guild, weight: str, item, preview_rank=None):
+
+    member = guild.get_member(item["user_id"])
+    name = f"**{name_without_record(member.display_name)}**" if member else f"<@{item['user_id']}>"
+
+    if item["action"] == "remove":
+        row = get_user_ranking_in_division(guild.id, item["user_id"], weight)
+        where = "the Champion" if row and row["rank"] == 0 else f"#{row['rank']}" if row else "the board"
+        extra = " ⚠️ title would be vacated" if row and row["rank"] == 0 else ""
+        return f"➖ Remove {name} ({where}): no longer has the {weight} role{extra}"
+
+    goes = f"#{preview_rank}" if preview_rank else "Unranked (board is full)"
+    return f"➕ Add {name} → {goes}"
+
+
+def auto_rank_notice_embed(guild: discord.Guild, weight: str, items, done_lines=None, staff_id=None):
+
+    if done_lines is not None:
+        description = "\n".join(done_lines) or "Nothing needed changing."
+        embed = discord.Embed(
+            title=f"{weight}: rankings from roles",
+            description=(description + (f"\n\n-# Done by <@{staff_id}>" if staff_id else ""))[:4000],
+            color=PFO_GOLD,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_author(name="PFO • RANKINGS", icon_url=asset_url(LOGO_FILE))
+        return embed
+
+    # Work out where each add would land, in the order they'd be applied.
+    # Removing someone closes the gaps, otherwise new fighters go under the last one.
+    removing = {item["user_id"] for item in items if item["action"] == "remove"}
+    ranked_rows = {row["discord_user_id"]: row["rank"] for row in get_division_rankings(guild.id, weight)}
+
+    if removing & set(ranked_rows):
+        next_rank = len([user for user, rank in ranked_rows.items() if rank >= 1 and user not in removing])
+    else:
+        next_rank = max([rank for rank in ranked_rows.values() if rank >= 1], default=0)
+
+    lines = []
+    adds = sorted([item for item in items if item["action"] == "add"], key=lambda item: record_order(guild.id, item["user_id"]))
+
+    for item in [item for item in items if item["action"] == "remove"]:
+        lines.append(auto_rank_item_text(guild, weight, item))
+
+    for item in adds:
+        next_rank += 1
+        lines.append(auto_rank_item_text(guild, weight, item, next_rank if next_rank <= RANK_SLOTS else None))
+
+    text = ""
+    for index, line in enumerate(lines):
+        if len(text) + len(line) > 3500:
+            text += f"…and {len(lines) - index} more"
+            break
+        text += line + "\n"
+
+    embed = discord.Embed(
+        title=f"{weight}: rankings from roles",
+        description=(
+            f"These fighters' **{weight}** role doesn't match the rankings. Nothing changes until you press **Apply**.\n\n"
+            + text
+            + "\n-# Removing someone closes the gap (everyone below moves up one). New fighters go under the last ranked fighter."
+        )[:4000],
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_author(name="PFO • RANKINGS", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text="Dismissed changes aren't suggested again unless the role changes again")
+
+    return embed
+
+
+async def apply_auto_rank(guild: discord.Guild, weight: str, items):
+    """Removes first, then adds (best record first). Returns lines saying what happened."""
+
+    done = []
+
+    for item in [item for item in items if item["action"] == "remove"]:
+
+        holders = weight_role_holders(guild, weight) or set()
+
+        if item["user_id"] in holders:
+            done.append(f"↩️ <@{item['user_id']}> has the role again, so they were kept")
+        elif remove_from_rankings(guild.id, item["user_id"], weight):
+            done.append(f"➖ Removed <@{item['user_id']}>")
+
+        discipline_query(
+            "DELETE FROM auto_rank_items WHERE guild_id = ? AND weight = ? AND user_id = ? AND action = 'remove'",
+            (guild.id, weight, item["user_id"]), write=True
+        )
+
+    for item in sorted([item for item in items if item["action"] == "add"], key=lambda item: record_order(guild.id, item["user_id"])):
+
+        holders = weight_role_holders(guild, weight) or set()
+
+        if item["user_id"] not in holders:
+            done.append(f"↩️ <@{item['user_id']}> no longer has the role, so they weren't added")
+            discipline_query(
+                "DELETE FROM auto_rank_items WHERE guild_id = ? AND weight = ? AND user_id = ? AND action = 'add'",
+                (guild.id, weight, item["user_id"]), write=True
+            )
+            continue
+
+        rank = add_at_lowest(guild.id, weight, item["user_id"])
+
+        if rank:
+            done.append(f"➕ Added <@{item['user_id']}> at **#{rank}**")
+            discipline_query(
+                "DELETE FROM auto_rank_items WHERE guild_id = ? AND weight = ? AND user_id = ? AND action = 'add'",
+                (guild.id, weight, item["user_id"]), write=True
+            )
+        else:
+            done.append(f"📋 <@{item['user_id']}> is **Unranked** for now (all {RANK_SLOTS} places taken). They'll move in when a place opens")
+            discipline_query(
+                "UPDATE auto_rank_items SET status = 'waiting' WHERE guild_id = ? AND weight = ? AND user_id = ? AND action = 'add'",
+                (guild.id, weight, item["user_id"]), write=True
+            )
+
+    await refresh_ranking_message(guild, weight)
+
+    return done
+
+
+class AutoRankView(
+    discord.ui.View
+):
+    """Apply / Dismiss on the pfo-bot notice. Works after restarts."""
+
+    def __init__(self, guild_id: int, weight: str):
+
+        super().__init__(timeout=None)
+        self.guild_id = guild_id
+        self.weight = weight
+        code = WEIGHT_CODES[weight]
+
+        pending = auto_rank_items(guild_id, weight, "pending")
+
+        if len(pending) > 1:
+            options = []
+            for item in pending[:25]:
+                label = f"{'Add' if item['action'] == 'add' else 'Remove'} user {item['user_id']}"
+                options.append(discord.SelectOption(label=label[:100], value=f"{item['user_id']}|{item['action']}"))
+            pick = discord.ui.Select(
+                placeholder="Apply only some…", options=options, min_values=1, max_values=len(options),
+                custom_id=f"pfo_autorank_{code}_pick", row=0
+            )
+            pick.callback = self.pick
+            self.pick_menu = pick
+            self.add_item(pick)
+
+        apply = discord.ui.Button(label="Apply all", emoji="✅", style=discord.ButtonStyle.green,
+                                  custom_id=f"pfo_autorank_{code}_apply", row=1)
+        apply.callback = self.apply_all
+        dismiss = discord.ui.Button(label="Dismiss all", style=discord.ButtonStyle.grey,
+                                    custom_id=f"pfo_autorank_{code}_dismiss", row=1)
+        dismiss.callback = self.dismiss_all
+        self.add_item(apply)
+        self.add_item(dismiss)
+
+    def label_options(self, guild):
+        """Real names in the menu (members are only known once the bot is connected)."""
+        for child in self.children:
+            if isinstance(child, discord.ui.Select):
+                for option in child.options:
+                    user_id, action = option.value.split("|")
+                    member = guild.get_member(int(user_id))
+                    name = name_without_record(member.display_name) if member else f"User {user_id}"
+                    option.label = f"{'Add' if action == 'add' else 'Remove'} {name}"[:100]
+        return self
+
+    async def interaction_check(self, interaction):
+
+        if is_staff(interaction):
+            return True
+
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can change the rankings.", ephemeral=True)
+        return False
+
+    async def finish(self, interaction, items, dismissed: bool):
+
+        guild = interaction.guild
+
+        if not items:
+            await interaction.response.send_message("These changes have already been dealt with.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        async with _auto_rank_lock:
+
+            if dismissed:
+                for item in items:
+                    discipline_query(
+                        "UPDATE auto_rank_items SET status = 'dismissed' WHERE guild_id = ? AND weight = ? AND user_id = ? AND action = ?",
+                        (guild.id, self.weight, item["user_id"], item["action"]), write=True
+                    )
+                done = [f"🚫 Dismissed: {'add' if item['action'] == 'add' else 'remove'} <@{item['user_id']}>" for item in items]
+            else:
+                done = await apply_auto_rank(guild, self.weight, items)
+
+            left = auto_rank_items(guild.id, self.weight, "pending")
+
+            if left:
+                await interaction.followup.send("\n".join(done)[:1900], ephemeral=True)
+                await update_auto_rank_notice(guild, self.weight)
+            else:
+                discipline_query("DELETE FROM auto_rank_notices WHERE guild_id = ? AND weight = ?", (guild.id, self.weight), write=True)
+                await interaction.edit_original_response(
+                    embed=auto_rank_notice_embed(guild, self.weight, [], done, interaction.user.id), view=None
+                )
+
+    async def apply_all(self, interaction):
+        await self.finish(interaction, auto_rank_items(interaction.guild.id, self.weight, "pending"), False)
+
+    async def dismiss_all(self, interaction):
+        await self.finish(interaction, auto_rank_items(interaction.guild.id, self.weight, "pending"), True)
+
+    async def pick(self, interaction):
+        wanted = set(interaction.data.get("values", []))
+        items = [
+            item for item in auto_rank_items(interaction.guild.id, self.weight, "pending")
+            if f"{item['user_id']}|{item['action']}" in wanted
+        ]
+        await self.finish(interaction, items, False)
+
+
+async def update_auto_rank_notice(guild: discord.Guild, weight: str):
+    """Posts the notice in pfo-bot, or edits the one already there."""
+
+    pending = auto_rank_items(guild.id, weight, "pending")
+    saved = discipline_query("SELECT * FROM auto_rank_notices WHERE guild_id = ? AND weight = ?", (guild.id, weight))
+    message = None
+
+    if saved:
+        try:
+            channel = guild.get_channel(saved[0]["channel_id"]) or await bot.fetch_channel(saved[0]["channel_id"])
+            message = await channel.fetch_message(saved[0]["message_id"])
+        except Exception:
+            message = None
+
+    if not pending:
+        if message:
+            try:
+                await message.edit(
+                    embed=auto_rank_notice_embed(guild, weight, [], ["Nothing to change any more (roles were put back)."]),
+                    view=None
+                )
+            except Exception as error:
+                print(f"Could not close auto-rank notice: {error}")
+        discipline_query("DELETE FROM auto_rank_notices WHERE guild_id = ? AND weight = ?", (guild.id, weight), write=True)
+        return
+
+    embed = auto_rank_notice_embed(guild, weight, pending)
+    view = AutoRankView(guild.id, weight).label_options(guild)
+
+    try:
+        if message:
+            await message.edit(embed=embed, view=view)
+            return
+
+        channel = find_suggestions_channel(guild)
+
+        if not channel:
+            return
+
+        message = await channel.send(embed=embed, view=view)
+        discipline_query(
+            "INSERT OR REPLACE INTO auto_rank_notices (guild_id, weight, channel_id, message_id) VALUES (?, ?, ?, ?)",
+            (guild.id, weight, message.channel.id, message.id), write=True
+        )
+    except Exception as error:
+        print(f"Could not post auto-rank notice: {error}")
+
+
+async def sweep_auto_rankings(guild: discord.Guild):
+    """Compares weight roles with the boards. Suggests changes; places approved fighters when room opens."""
+
+    if not AUTO_RANK_ON:
+        return
+
+    async with _auto_rank_lock:
+
+        for weight in division_weights():
+
+            holders = weight_role_holders(guild, weight)
+
+            if holders is None:
+                continue          # no role for this division: leave it alone
+
+            ranked = {row["discord_user_id"]: row["rank"] for row in get_division_rankings(guild.id, weight)}
+            wanted = {(user_id, "add") for user_id in holders if user_id not in ranked}
+            wanted |= {(user_id, "remove") for user_id in ranked if user_id not in holders and guild.get_member(user_id)}
+
+            existing = {(item["user_id"], item["action"]): item["status"] for item in auto_rank_items(guild.id, weight)}
+            changed = False
+
+            for key, status in existing.items():
+                if key not in wanted:
+                    discipline_query(
+                        "DELETE FROM auto_rank_items WHERE guild_id = ? AND weight = ? AND user_id = ? AND action = ?",
+                        (guild.id, weight, key[0], key[1]), write=True
+                    )
+                    changed = changed or status == "pending"
+
+            now = int(time.time())
+
+            for key in wanted:
+                if key not in existing:
+                    discipline_query(
+                        "INSERT INTO auto_rank_items (guild_id, weight, user_id, action, status, created_at) VALUES (?, ?, ?, ?, 'pending', ?)",
+                        (guild.id, weight, key[0], key[1], now), write=True
+                    )
+                    changed = True
+
+            # Approved fighters waiting in Unranked move in when a place opens.
+            placed = []
+            for item in auto_rank_items(guild.id, weight, "waiting"):
+                rank = add_at_lowest(guild.id, weight, item["user_id"])
+                if not rank:
+                    break
+                placed.append(f"➕ <@{item['user_id']}> moved from Unranked into **#{rank}**")
+                discipline_query(
+                    "DELETE FROM auto_rank_items WHERE guild_id = ? AND weight = ? AND user_id = ? AND action = 'add'",
+                    (guild.id, weight, item["user_id"]), write=True
+                )
+
+            if placed:
+                await post_staff_log(guild, staff_log_embed(f"📈 {weight} rankings", placed))
+
+            has_notice = discipline_query(
+                "SELECT 1 FROM auto_rank_notices WHERE guild_id = ? AND weight = ?", (guild.id, weight)
+            )
+            has_pending = auto_rank_items(guild.id, weight, "pending")
+
+            if changed or (has_pending and not has_notice):
+                await update_auto_rank_notice(guild, weight)
+
+            # Keep the board's Unranked box up to date.
+            now_ranked = {row["discord_user_id"] for row in get_division_rankings(guild.id, weight)}
+            unranked = frozenset(holders - now_ranked)
+            key = (guild.id, weight)
+
+            if placed or (key in _unranked_seen and _unranked_seen[key] != unranked):
+                await refresh_ranking_message(guild, weight)
+
+            _unranked_seen[key] = unranked
+
+
+async def check_auto_rankings():
+    for guild in list(getattr(bot, "guilds", [])):
+        await sweep_auto_rankings(guild)
+
+
+@bot.listen("on_member_update")
+async def weight_role_changed(before, after):
+
+    if not AUTO_RANK_ON or getattr(after, "bot", False):
+        return
+
+    if {role.id for role in before.roles} == {role.id for role in after.roles}:
+        return
+
+    try:
+        await sweep_auto_rankings(after.guild)
+    except Exception as error:
+        print(f"Auto-rank sweep error: {error}")
+
+
+def restore_auto_rank_buttons():
+
+    try:
+        for row in discipline_query("SELECT guild_id, weight FROM auto_rank_notices"):
+            if row["weight"] in WEIGHT_CODES:
+                bot.add_view(AutoRankView(row["guild_id"], row["weight"]))
+    except Exception as error:
+        print(f"Could not restore auto-rank buttons: {error}")
+
+
+async def ranking_board_extras(guild: discord.Guild, weight: str):
+    """Extra lines for a division's board: interim / BMF / WMF and the Unranked box."""
+
+    belts = get_division_belts(guild.id, weight)
+    interim_line = None
+    belt_lines = []
+
+    for key in ("interim", "bmf", "wmf"):
+        if key not in belts:
+            continue
+        member = await get_server_member(guild, belts[key])
+        name, icon = BELT_TYPES[key]
+        text = f"{icon} {name}: {fighter_link_text(member)}"
+        if key == "interim":
+            interim_line = text
+        else:
+            belt_lines.append(text)
+
+    unranked_lines = []
+    unranked = unranked_in_division(guild, weight) if AUTO_RANK_ON else []
+
+    if unranked:
+        names = []
+        for user_id in unranked:
+            member = guild.get_member(user_id)
+            names.append(f"**{member.display_name}**" if member else f"<@{user_id}>")
+        text = " · ".join(names)
+        if len(text) > 1200:
+            shown = []
+            for name in names:
+                if len(" · ".join(shown + [name])) > 1150:
+                    break
+                shown.append(name)
+            text = " · ".join(shown) + f" · …and {len(names) - len(shown)} more"
+        unranked_lines = [text]
+
+    return interim_line, belt_lines, unranked_lines
+
+
+# ============================================================
 # FIGHT STATS FROM A SCREENSHOT
 #
 # /addstrikes left:@A right:@B screenshot:[image]
@@ -18551,6 +19552,8 @@ async def setup_hook():
     setup_interview_tables()
     setup_rankings_update_tables()
     setup_fight_stats_tables()
+    setup_belt_tables()
+    setup_auto_rank_tables()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
@@ -18560,6 +19563,7 @@ async def setup_hook():
     restore_copy_buttons()
     restore_sportsbook_buttons()
     restore_interview_buttons()
+    restore_auto_rank_buttons()
 
     if not vote_closer.is_running():
         vote_closer.start()
