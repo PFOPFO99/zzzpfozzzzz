@@ -378,6 +378,8 @@ def setup_database():
     setup_fight_stats_tables()
     setup_belt_tables()
     setup_auto_rank_tables()
+    setup_stat_override_tables()
+    setup_card_section_columns()
 
 
 # ============================================================
@@ -1440,6 +1442,36 @@ def is_staff(
     return has_any_role(
         interaction.user,
         STAFF_ROLE_NAMES
+    )
+
+
+# Moderator and above: /transferfighter and /editstats.
+MODERATOR_ROLE_NAMES = [
+    name.strip()
+    for name in os.getenv(
+        "MODERATOR_ROLES",
+        "Moderator,Head Moderator,Vice President,Owner"
+    ).split(",")
+    if name.strip()
+]
+
+MODERATOR_ONLY_TEXT = "Only " + ", ".join(MODERATOR_ROLE_NAMES[:-1]) + (" or " if len(MODERATOR_ROLE_NAMES) > 1 else "") + MODERATOR_ROLE_NAMES[-1]
+
+
+def is_moderator_plus(
+    interaction: discord.Interaction
+):
+    """Moderator, Head Moderator, Vice President, Owner (and the server owner)."""
+
+    if not interaction.guild:
+        return False
+
+    if interaction.user.id == interaction.guild.owner_id:
+        return True
+
+    return has_any_role(
+        interaction.user,
+        MODERATOR_ROLE_NAMES
     )
 
 
@@ -3860,6 +3892,61 @@ def get_fighter_stats(
         streak = f"{last}{count}"
 
     finishes = wins_by.get("KO/TKO", 0) + wins_by.get("SUB", 0)
+    finish_rate = round(100 * finishes / wins) if wins else None
+
+    # Numbers set by staff with /editstats (streak, title wins, finishes).
+    # Fights logged afterwards carry on from the number that was set.
+    overrides = get_stat_overrides(guild_id, user_id) if user_id else {}
+
+    if overrides:
+
+        def after(field):
+            anchor = overrides[field]["anchor"]
+            return [fight for fight in fights if fight["id"] > anchor]
+
+        def result_of(fight):
+            if fight["method"] == "NC":
+                return None
+            if fight["method"] == "DRAW":
+                return "D"
+            return "W" if fight_is_win_for(fight, user_id, name) else "L"
+
+        if "streak" in overrides:
+            value = overrides["streak"]["value"] or ""
+            sequence = [value[0]] * int(value[1:]) if value else []
+            sequence += [result for result in map(result_of, after("streak")) if result]
+            streak = ""
+            if sequence:
+                last = sequence[-1]
+                count = 0
+                for result in reversed(sequence):
+                    if result != last:
+                        break
+                    count += 1
+                streak = f"{last}{count}"
+
+        if "title_wins" in overrides:
+            title_wins = int(overrides["title_wins"]["value"]) + sum(
+                1 for fight in after("title_wins") if fight["title_fight"] and result_of(fight) == "W"
+            )
+
+        changed_methods = False
+
+        for field, method in (("ko", "KO/TKO"), ("sub", "SUB"), ("dec", "DEC")):
+            if field in overrides:
+                changed_methods = True
+                count = int(overrides[field]["value"]) + sum(
+                    1 for fight in after(field) if fight["method"] == method and result_of(fight) == "W"
+                )
+                if count:
+                    wins_by[method] = count
+                else:
+                    wins_by.pop(method, None)
+
+        if changed_methods:
+            total = sum(wins_by.values())
+            finishes = wins_by.get("KO/TKO", 0) + wins_by.get("SUB", 0)
+            finish_rate = round(100 * finishes / total) if total else None
 
     return {
         "fights": fights,
@@ -3872,9 +3959,7 @@ def get_fighter_stats(
         "losses_by": losses_by,
         "title_wins": title_wins,
         "streak": streak,
-        "finish_rate": (
-            round(100 * finishes / wins) if wins else None
-        ),
+        "finish_rate": finish_rate,
         "starting_record": (
             format_record(start_w, start_l, start_d)
             if start and min(start_w, start_l, start_d) >= 0 else None
@@ -10340,19 +10425,24 @@ def create_notice(
     event: str = None,
     event_date: str = None,
     deadline: str = None,
-    card_url: str = None
+    card_url: str = None,
+    sections: tuple = None
 ):
-    """fighters: list of (user_id, name, opponent_id)"""
+    """fighters: list of (user_id, name, opponent_id). sections: (main card, prelims, early prelims)."""
 
     db = get_db()
     cursor = db.cursor()
 
+    main_card, prelims, early = sections if sections else (None, None, None)
+
     cursor.execute("""
         INSERT INTO card_notices
-        (guild_id, kind, event, event_date, deadline, card_url, created_by, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (guild_id, kind, event, event_date, deadline, card_url, created_by, created_at,
+         main_card, prelims, early_prelims)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        guild_id, kind, event, event_date, deadline, card_url, created_by, now_utc()
+        guild_id, kind, event, event_date, deadline, card_url, created_by, now_utc(),
+        main_card, prelims, early
     ))
 
     notice_id = cursor.lastrowid
@@ -10682,6 +10772,203 @@ async def collect_card(
 
 
 # ------------------------------------------------------------
+# Card sections (Main Card / Prelims / Early Prelims)
+#
+# /dmfightnight and /dmlivecard take the fights in order from the
+# Main Event down to the last Early Prelim. Optional main_card,
+# prelims and early_prelims say how many fights are in each part
+# (fight 1 = Main Event, fight 2 = Co-Main Event). Each fighter is
+# told where they are in their DM, and the website, the sportsbook
+# and the recap's starting layout use the same order.
+# ------------------------------------------------------------
+
+CARD_SECTION_NAMES = {"main": "Main Card", "prelims": "Prelims", "early": "Early Prelims"}
+
+
+def setup_card_section_columns():
+
+    db = get_db()
+    columns = [row[1] for row in db.execute("PRAGMA table_info(card_notices)").fetchall()]
+
+    for column in ("main_card", "prelims", "early_prelims"):
+        if column not in columns:
+            db.execute(f"ALTER TABLE card_notices ADD COLUMN {column} INTEGER")
+
+    db.commit()
+    db.close()
+
+
+def split_card(total: int, main_card: int = None, prelims: int = None, early: int = None):
+    """How many fights in each part. Anything not filled in takes what's left. Raises CardInputError."""
+
+    given = [value for value in (main_card, prelims, early) if value is not None]
+
+    if sum(given) > total:
+        raise CardInputError(
+            f"That's {sum(given)} fights across the sections, but the card has {total}."
+        )
+
+    left = total - sum(given)
+
+    if main_card is None:
+        main_card, left = left, 0
+    if early is None:
+        early, left = left, 0
+    if prelims is None:
+        prelims, left = left, 0
+
+    if left:
+        raise CardInputError(
+            f"The sections add up to {total - left} fights, but the card has {total}. "
+            "Leave one of them empty and it takes the rest."
+        )
+
+    if main_card < 1 and total:
+        raise CardInputError("The Main Card needs at least 1 fight (the Main Event).")
+
+    return main_card, prelims, early
+
+
+def bout_spots(total: int, main_card: int = None, prelims: int = None, early: int = None):
+    """One entry per fight, Main Event first: {'number', 'section', 'slot', 'label'}."""
+
+    if main_card is None and prelims is None and early is None:
+        main_card, prelims, early = total, 0, 0
+    else:
+        main_card, prelims, early = main_card or 0, prelims or 0, early or 0
+
+    spots = []
+
+    for index in range(total):
+
+        if index < main_card:
+            section = "main"
+        elif index < main_card + prelims:
+            section = "prelims"
+        else:
+            section = "early"
+
+        slot = "Main Event" if index == 0 else "Co-Main Event" if index == 1 and section == "main" else None
+        label = f"{slot} · Main Card" if slot else f"{CARD_SECTION_NAMES[section]} · fight {index + 1} of {total}"
+
+        spots.append({"number": index + 1, "section": section, "slot": slot, "label": label})
+
+    return spots
+
+
+def pairs_in_order(rows):
+    """[(user_id, opponent_id)] in card order -> [(a, b)] fights, each once."""
+
+    seen = set()
+    bouts = []
+
+    for user_id, opponent_id in rows:
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        if opponent_id and opponent_id not in seen:
+            seen.add(opponent_id)
+            bouts.append((user_id, opponent_id))
+
+    return bouts
+
+
+def fighter_spots(fighters: list, sections: tuple = None):
+    """{user_id: spot} for a card being DMed (fighters as from collect_card)."""
+
+    bouts = pairs_in_order([(user_id, opponent_id) for user_id, _, _, opponent_id in fighters])
+    spots = bout_spots(len(bouts), *(sections or (None, None, None)))
+    found = {}
+
+    for (a, b), spot in zip(bouts, spots):
+        found[a] = spot
+        found[b] = spot
+
+    return found
+
+
+def notice_layout(notice):
+    """[(fighter_a, fighter_b, spot)] for a DMed card, Main Event first."""
+
+    bouts = pairs_in_order(
+        [(row["user_id"], row["opponent_id"]) for row in get_card_fighters(notice["id"])]
+    )
+
+    def column(name):
+        try:
+            return notice[name]
+        except (IndexError, KeyError):
+            return None
+
+    spots = bout_spots(len(bouts), column("main_card"), column("prelims"), column("early_prelims"))
+
+    return [(a, b, spot) for (a, b), spot in zip(bouts, spots)]
+
+
+def find_card_notice(guild_id: int, event: str):
+    """The latest DMed card with this event name, or None."""
+
+    key = event_key(event or "")
+
+    if not key:
+        return None
+
+    for notice in discipline_query(
+        "SELECT * FROM card_notices WHERE guild_id = ? AND event IS NOT NULL ORDER BY id DESC LIMIT 30", (guild_id,)
+    ):
+        if event_key(notice["event"]) == key:
+            return notice
+
+    return None
+
+
+def card_spot_for(guild_id: int, event: str, a: int, b: int):
+    """Where this fight is on the DMed card for that event (spot dict), or None."""
+
+    notice = find_card_notice(guild_id, event)
+
+    if not notice:
+        return None
+
+    for fighter_a, fighter_b, spot in notice_layout(notice):
+        if {fighter_a, fighter_b} == {a, b}:
+            return spot
+
+    return None
+
+
+def card_recap_layout(guild_id: int, event: str, fights: list):
+    """Recap starting layout from the DMed card (Main Event first), or None if there's no card."""
+
+    notice = find_card_notice(guild_id, event)
+
+    if not notice:
+        return None
+
+    places = {}
+    for fighter_a, fighter_b, spot in notice_layout(notice):
+        if spot["slot"] == "Main Event":
+            section = "Main Event"
+        elif spot["slot"] == "Co-Main Event":
+            section = "Co-Main Event"
+        else:
+            section = CARD_SECTION_NAMES[spot["section"]]
+        places[frozenset((fighter_a, fighter_b))] = [section, spot["number"]]
+
+    if not places:
+        return None
+
+    layout = {}
+    extra = default_recap_layout(fights)
+
+    for fight in fights:
+        key = frozenset((fight["winner_id"], fight["loser_id"]))
+        layout[fight["id"]] = places.get(key) or [extra[fight["id"]][0], 1000 + extra[fight["id"]][1]]
+
+    return layout
+
+
+# ------------------------------------------------------------
 # DM embeds and buttons
 # ------------------------------------------------------------
 
@@ -10690,7 +10977,8 @@ def create_selection_dm_embed(
     event: str = None,
     event_date: str = None,
     deadline: str = None,
-    opponent_text: str = None
+    opponent_text: str = None,
+    spot: dict = None
 ):
 
     if kind == "fight_night":
@@ -10726,6 +11014,18 @@ def create_selection_dm_embed(
         embed.add_field(
             name="🆚 Your Opponent",
             value=opponent_text,
+            inline=False
+        )
+
+    if spot:
+        if spot["slot"]:
+            where = f"You're the **{spot['slot']}** on the **Main Card**."
+        else:
+            where = (f"You're on the **{CARD_SECTION_NAMES[spot['section']]}** "
+                     f"(fight {spot['number']} of the card).")
+        embed.add_field(
+            name="📍 Your Spot",
+            value=where,
             inline=False
         )
 
@@ -10939,12 +11239,15 @@ class SendDMsView(
         fighters: list,
         event: str = None,
         event_date: str = None,
-        deadline: str = None
+        deadline: str = None,
+        sections: tuple = None
     ):
 
         super().__init__(
             timeout=600
         )
+
+        self.sections = sections
 
         self.author_id = author_id
         self.guild = guild
@@ -11020,13 +11323,15 @@ class SendDMsView(
             [(user_id, name, opponent_id) for user_id, name, _, opponent_id in self.fighters],
             event=self.event,
             event_date=self.event_date,
-            deadline=self.deadline
+            deadline=self.deadline,
+            sections=self.sections
         )
 
         sent = []
         failed = []
 
         names = {user_id: name for user_id, name, _, _ in self.fighters}
+        spots = fighter_spots(self.fighters, self.sections)
 
         for index, (user_id, name, member, opponent_id) in enumerate(self.fighters):
 
@@ -11051,7 +11356,8 @@ class SendDMsView(
                 opponent_text=opponent_text,
                 event=self.event,
                 event_date=self.event_date,
-                deadline=self.deadline
+                deadline=self.deadline,
+                spot=spots.get(user_id)
             )
 
             view = CheckInView(notice_id) if self.kind == "live_card" else None
@@ -11102,13 +11408,16 @@ def create_dm_preview_embed(
     fighters: list,
     event: str = None,
     event_date: str = None,
-    deadline: str = None
+    deadline: str = None,
+    sections: tuple = None
 ):
 
     lines = []
     shown = set()
     number = 0
     by_id = {user_id: (name, member, opponent_id) for user_id, name, member, opponent_id in fighters}
+    spots = fighter_spots(fighters, sections)
+    current_section = None
 
     def tag(user_id):
         member = by_id.get(user_id, (None, None, None))[1]
@@ -11124,12 +11433,17 @@ def create_dm_preview_embed(
 
         if opponent_id and opponent_id in by_id and opponent_id not in shown:
             shown.add(opponent_id)
-            lines.append(f"`{number:>2}` {tag(user_id)}  vs  {tag(opponent_id)}")
+            spot = spots.get(user_id)
+            if spot and spot["section"] != current_section:
+                current_section = spot["section"]
+                lines.append(("\n" if lines else "") + f"**{CARD_SECTION_NAMES[current_section].upper()}**")
+            slot = f" · *{spot['slot']}*" if spot and spot["slot"] else ""
+            lines.append(f"`{number:>2}` {tag(user_id)}  vs  {tag(opponent_id)}{slot}")
         else:
             lines.append(f"`{number:>2}` {tag(user_id)}  ⚠️ no opponent (odd number of fighters)")
 
     if kind == "fight_night":
-        details = f"**Deadline:** {format_saved_time(deadline)}"
+        details = (f"**Event:** {event}\n" if event else "") + f"**Deadline:** {format_saved_time(deadline)}"
         if CARD_REMINDERS:
             details += (
                 "\n**Reminder:** sent automatically 1 day before the deadline"
@@ -11172,7 +11486,10 @@ async def start_card_dms(
     fighters_text: str,
     event: str = None,
     event_date: str = None,
-    deadline: str = None
+    deadline: str = None,
+    main_card: int = None,
+    prelims: int = None,
+    early_prelims: int = None
 ):
 
     if not is_staff(interaction):
@@ -11197,9 +11514,18 @@ async def start_card_dms(
         await interaction.followup.send(f"❌ {error}", ephemeral=True)
         return
 
+    # Fights are typed Main Event first. Work out Main Card / Prelims / Early Prelims.
+    bouts = pairs_in_order([(user_id, opponent_id) for user_id, _, _, opponent_id in fighters])
+
+    try:
+        sections = split_card(len(bouts), main_card, prelims, early_prelims)
+    except CardInputError as error:
+        await interaction.followup.send(f"❌ {error}", ephemeral=True)
+        return
+
     await interaction.followup.send(
         embed=create_dm_preview_embed(
-            kind, fighters, event, event_date, deadline
+            kind, fighters, event, event_date, deadline, sections
         ),
         view=SendDMsView(
             interaction.user.id,
@@ -11208,7 +11534,8 @@ async def start_card_dms(
             fighters,
             event=event,
             event_date=event_date,
-            deadline=deadline
+            deadline=deadline,
+            sections=sections
         ),
         ephemeral=True
     )
@@ -11224,12 +11551,20 @@ async def start_card_dms(
 )
 @app_commands.describe(
     deadline="Deadline in UK time, e.g. 19/10/2026 22:00 (or any text, e.g. Sunday night)",
-    fighters="@mention in fight order: @Joe @Dan @Tom @Ben = Joe v Dan, Tom v Ben"
+    fighters="@mention Main Event first: @Joe @Dan @Tom @Ben = Joe v Dan (main event), Tom v Ben (co-main)",
+    event="Event name, e.g. PFO Fight Night 17 (links the card to the website, recap and betting)",
+    main_card="How many fights on the Main Card, incl. main and co-main (default: all that's left)",
+    prelims="How many fights on the Prelims (default 0)",
+    early_prelims="How many fights on the Early Prelims (default 0)"
 )
 async def dmfightnight(
     interaction: discord.Interaction,
     deadline: str,
-    fighters: str
+    fighters: str,
+    event: str = None,
+    main_card: app_commands.Range[int, 1, 30] = None,
+    prelims: app_commands.Range[int, 0, 30] = None,
+    early_prelims: app_commands.Range[int, 0, 30] = None
 ):
 
     moment = parse_event_datetime(deadline)
@@ -11238,7 +11573,11 @@ async def dmfightnight(
         interaction,
         "fight_night",
         fighters,
-        deadline=str(int(moment.timestamp())) if moment else deadline.strip()
+        event=event.strip() if event and event.strip() else None,
+        deadline=str(int(moment.timestamp())) if moment else deadline.strip(),
+        main_card=main_card,
+        prelims=prelims,
+        early_prelims=early_prelims
     )
 
 
@@ -11249,13 +11588,19 @@ async def dmfightnight(
 @app_commands.describe(
     event="Event name, e.g. PFO Live Card 6",
     date="Date and time in UK time, e.g. 24/10/2026 20:00 or 24/10 8pm",
-    fighters="@mention in fight order: @Joe @Dan @Tom @Ben = Joe v Dan, Tom v Ben"
+    fighters="@mention Main Event first: @Joe @Dan @Tom @Ben = Joe v Dan (main event), Tom v Ben (co-main)",
+    main_card="How many fights on the Main Card, incl. main and co-main (default: all that's left)",
+    prelims="How many fights on the Prelims (default 0)",
+    early_prelims="How many fights on the Early Prelims (default 0)"
 )
 async def dmlivecard(
     interaction: discord.Interaction,
     event: str,
     date: str,
-    fighters: str
+    fighters: str,
+    main_card: app_commands.Range[int, 1, 30] = None,
+    prelims: app_commands.Range[int, 0, 30] = None,
+    early_prelims: app_commands.Range[int, 0, 30] = None
 ):
 
     moment = parse_event_datetime(date)
@@ -11284,7 +11629,10 @@ async def dmlivecard(
         "live_card",
         fighters,
         event=event.strip(),
-        event_date=str(int(moment.timestamp()))
+        event_date=str(int(moment.timestamp())),
+        main_card=main_card,
+        prelims=prelims,
+        early_prelims=early_prelims
     )
 
 
@@ -13456,7 +13804,13 @@ def load_recap_layout(
         )
     }
 
-    layout = default_recap_layout(fights)
+    # Starting layout: the DMed card's order (Main Event first) if there is one.
+    layout = None
+    try:
+        layout = card_recap_layout(guild_id, event, fights)
+    except Exception as error:
+        print(f"Card layout for recap failed: {error}")
+    layout = layout or default_recap_layout(fights)
 
     # Saved spots win; fights logged since get the default spot at the end.
     for fight_id in layout:
@@ -14482,9 +14836,25 @@ def sportsbook_embeds(market):
     fields = []
     total = len(bouts)
 
+    # Where each fight sits on the DMed card for this event (Main Event first).
+    spots = {}
+    try:
+        for bout in bouts:
+            spots[bout["position"]] = card_spot_for(market["guild_id"], market["event"], bout["fighter_a"], bout["fighter_b"])
+    except Exception as error:
+        print(f"Card spot lookup failed: {error}")
+
+    if bouts and all(spots.get(bout["position"]) for bout in bouts):
+        bouts = sorted(bouts, key=lambda bout: spots[bout["position"]]["number"])
+
     for bout in bouts:
 
-        name = bout_slot(bout["position"], total) + (f" · {bout['weight']}" if bout["weight"] else "")
+        spot = spots.get(bout["position"])
+        if spot:
+            slot_name = spot["slot"].replace(" Event", "") if spot["slot"] == "Co-Main Event" else (spot["slot"] or CARD_SECTION_NAMES[spot["section"]])
+        else:
+            slot_name = bout_slot(bout["position"], total)
+        name = slot_name + (f" · {bout['weight']}" if bout["weight"] else "")
 
         if bout["result"]:
             if bout["result"] == "void" and bout["method"] == "CANCELLED":
@@ -18886,6 +19256,529 @@ async def addstrikes(
 
 
 # ============================================================
+# EDITING STATS AND MOVING A FIGHTER TO A NEW ACCOUNT
+#
+# /editstats       set a fighter's win streak, title wins or
+#                  KO / submission / decision wins to an exact number
+#                  (W7 means W7, it doesn't add). Fights logged after
+#                  that carry on from it: W7 then a win = W8.
+#                  Use "auto" to go back to counting from the fights.
+#
+# /transferfighter move everything from an old account to a new one:
+#                  fights (so records, title wins, streaks and title
+#                  history follow), earlier record, rankings, belts,
+#                  fight stats and betting history. Optionally coins
+#                  and warnings too. Preview first, then Confirm.
+# ============================================================
+
+OVERRIDE_FIELDS = {
+    "streak": "Win streak",
+    "title_wins": "Title fight wins",
+    "ko": "KO/TKO wins",
+    "sub": "Submission wins",
+    "dec": "Decision wins",
+}
+
+
+def setup_stat_override_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS fighter_stat_overrides (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            field TEXT NOT NULL,
+            value TEXT NOT NULL,
+            anchor INTEGER NOT NULL DEFAULT 0,
+            set_by INTEGER,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(guild_id, user_id, field)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def get_stat_overrides(guild_id: int, user_id: int):
+    """{field: {"value": ..., "anchor": last fight id when it was set}}"""
+
+    try:
+        rows = discipline_query(
+            "SELECT field, value, anchor FROM fighter_stat_overrides WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id)
+        )
+    except sqlite3.OperationalError:
+        return {}
+
+    return {row["field"]: {"value": row["value"], "anchor": row["anchor"]} for row in rows}
+
+
+def last_fight_id(guild_id: int, user_id: int):
+    rows = discipline_query(
+        "SELECT MAX(id) AS last FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)",
+        (guild_id, user_id, user_id)
+    )
+    return rows[0]["last"] or 0
+
+
+def parse_streak_text(text: str):
+    """'W7', 'w 7', 'L2', 'D1' -> 'W7'; 'none'/'0' -> ''; 'auto' -> None; else raises ValueError."""
+
+    cleaned = re.sub(r"\s+", "", (text or "")).upper()
+
+    if cleaned in ("AUTO", "RESET"):
+        return None
+
+    if cleaned in ("NONE", "0", "-", "NOSTREAK"):
+        return ""
+
+    match = re.fullmatch(r"([WLD])(\d{1,3})", cleaned)
+
+    if not match or int(match.group(2)) == 0:
+        raise ValueError(text)
+
+    return f"{match.group(1)}{int(match.group(2))}"
+
+
+def stats_snapshot(guild_id: int, user_id: int):
+    stats = get_fighter_stats(guild_id, user_id)
+    return {
+        "streak": stats["streak"] or "none",
+        "title_wins": stats["title_wins"],
+        "ko": stats["wins_by"].get("KO/TKO", 0),
+        "sub": stats["wins_by"].get("SUB", 0),
+        "dec": stats["wins_by"].get("DEC", 0),
+    }
+
+
+@bot.tree.command(
+    name="editstats",
+    description="Set a fighter's streak, title wins or finishes to an exact number (W7 = W7)."
+)
+@app_commands.describe(
+    fighter="The fighter",
+    streak="Exact streak, e.g. W7 or L2 ('none' = no streak, 'auto' = count from fights again)",
+    title_wins="Exact number of title fight wins (-1 = count from fights again)",
+    ko_wins="Exact number of KO/TKO wins (-1 = count from fights again)",
+    sub_wins="Exact number of submission wins (-1 = count from fights again)",
+    dec_wins="Exact number of decision wins (-1 = count from fights again)"
+)
+async def editstats(
+    interaction: discord.Interaction,
+    fighter: discord.Member,
+    streak: str = None,
+    title_wins: app_commands.Range[int, -1, 999] = None,
+    ko_wins: app_commands.Range[int, -1, 999] = None,
+    sub_wins: app_commands.Range[int, -1, 999] = None,
+    dec_wins: app_commands.Range[int, -1, 999] = None
+):
+
+    if not is_moderator_plus(interaction):
+        await interaction.response.send_message(f"❌ {MODERATOR_ONLY_TEXT} can edit fighter stats.", ephemeral=True)
+        return
+
+    changes = {}
+
+    if streak is not None:
+        try:
+            changes["streak"] = parse_streak_text(streak)
+        except ValueError:
+            await interaction.response.send_message(
+                "❌ Write the streak like `W7`, `L2` or `none` (or `auto` to count from the fights again).",
+                ephemeral=True
+            )
+            return
+
+    for field, value in (("title_wins", title_wins), ("ko", ko_wins), ("sub", sub_wins), ("dec", dec_wins)):
+        if value is not None:
+            changes[field] = None if value < 0 else str(value)
+
+    if not changes:
+        current = stats_snapshot(interaction.guild.id, fighter.id)
+        overrides = get_stat_overrides(interaction.guild.id, fighter.id)
+        lines = [
+            f"`{OVERRIDE_FIELDS[field]:<17}` **{current[field]}**" + ("  · set by staff" if field in overrides else "")
+            for field in OVERRIDE_FIELDS
+        ]
+        await interaction.response.send_message(
+            f"**{name_without_record(fighter.display_name)}**\n" + "\n".join(lines)
+            + "\n\nFill in any of the options to change them.",
+            ephemeral=True
+        )
+        return
+
+    guild_id = interaction.guild.id
+    before = stats_snapshot(guild_id, fighter.id)
+    anchor = last_fight_id(guild_id, fighter.id)
+
+    for field, value in changes.items():
+        if value is None:
+            discipline_query(
+                "DELETE FROM fighter_stat_overrides WHERE guild_id = ? AND user_id = ? AND field = ?",
+                (guild_id, fighter.id, field), write=True
+            )
+        else:
+            discipline_query(
+                "INSERT OR REPLACE INTO fighter_stat_overrides (guild_id, user_id, field, value, anchor, set_by, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (guild_id, fighter.id, field, value, anchor, interaction.user.id, now_utc()), write=True
+            )
+
+    after = stats_snapshot(guild_id, fighter.id)
+    lines = [
+        f"`{OVERRIDE_FIELDS[field]:<17}` {before[field]} → **{after[field]}**"
+        + ("  (counting from fights again)" if changes[field] is None else "")
+        for field in OVERRIDE_FIELDS if field in changes
+    ]
+
+    await interaction.response.send_message(
+        f"✅ **{name_without_record(fighter.display_name)}** updated.\n" + "\n".join(lines)
+        + "\n-# Fights logged from now on carry on from these numbers.",
+        ephemeral=True
+    )
+
+
+# ------------------------------------------------------------
+# /transferfighter
+# ------------------------------------------------------------
+
+def fights_for_transfer(guild_id: int, old_id, old_name: str):
+    """Fight rows that belong to the old account (by ID, or by name for name-only records)."""
+
+    if old_id:
+        return discipline_query(
+            "SELECT * FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?)", (guild_id, old_id, old_id)
+        )
+
+    return get_fighter_fights(guild_id, None, old_name)
+
+
+def transfer_preview(guild: discord.Guild, old_id, old_name: str, new_member, personal: bool):
+
+    guild_id = guild.id
+    lines = []
+
+    fights = fights_for_transfer(guild_id, old_id, old_name)
+    shared = [
+        fight for fight in fights
+        if new_member.id in (fight["winner_id"], fight["loser_id"])
+    ]
+    lines.append(f"• **{plural(len(fights), 'fight')}**" + (f" ({len(shared)} against the new account itself are skipped)" if shared else ""))
+
+    if old_id:
+        old_stats = get_fighter_stats(guild_id, old_id)
+        lines.append(f"• Record **{stats_record(old_stats)}**, streak **{old_stats['streak'] or 'none'}**, "
+                     f"**{plural(old_stats['title_wins'], 'title fight win')}**")
+
+        if get_starting_record(guild_id, old_id):
+            lines.append("• Earlier record (from /setrecord or /editrecord)")
+
+        if get_stat_overrides(guild_id, old_id):
+            lines.append("• Stats set with /editstats")
+
+        ranks = discipline_query("SELECT weight, rank FROM rankings WHERE guild_id = ? AND discord_user_id = ?", (guild_id, old_id))
+        if ranks:
+            lines.append("• Rankings: " + ", ".join(
+                f"{'Champion' if row['rank'] == 0 else '#' + str(row['rank'])} {row['weight']}" for row in ranks
+            ))
+
+        belts = get_member_belts(guild_id, old_id)
+        if belts:
+            lines.append("• Belts: " + ", ".join(belt_title(weight, belt) for weight, belt in belts))
+
+        stats_rows = discipline_query("SELECT COUNT(*) AS n FROM fight_stats WHERE guild_id = ? AND user_id = ?", (guild_id, old_id))[0]["n"]
+        if stats_rows:
+            lines.append(f"• Fight stats from {plural(stats_rows, 'fight')}")
+
+        if personal:
+            wallet = discipline_query("SELECT balance FROM coin_wallets WHERE guild_id = ? AND user_id = ?", (guild_id, old_id))
+            if wallet:
+                lines.append(f"• {COIN} **{coins_text(wallet[0]['balance'])}** coins and their bets (added to the new account)")
+            warns = len(active_warnings(guild_id, old_id))
+            if warns:
+                lines.append(f"• {plural(warns, 'active warning')}")
+            if get_active_suspension(guild_id, old_id):
+                lines.append("• Their suspension")
+
+    return lines
+
+
+def merge_rankings(guild_id: int, old_id: int, new_id: int):
+    """Moves rankings; if both accounts are in a division, the better spot is kept."""
+
+    touched = []
+
+    for row in discipline_query("SELECT weight, rank FROM rankings WHERE guild_id = ? AND discord_user_id = ?", (guild_id, old_id)):
+
+        weight = row["weight"]
+        existing = get_user_ranking_in_division(guild_id, new_id, weight)
+
+        if existing:
+            if row["rank"] < existing["rank"]:
+                remove_from_rankings(guild_id, new_id, weight)
+                discipline_query(
+                    "UPDATE rankings SET discord_user_id = ? WHERE guild_id = ? AND weight = ? AND discord_user_id = ?",
+                    (new_id, guild_id, weight, old_id), write=True
+                )
+            else:
+                remove_from_rankings(guild_id, old_id, weight)
+        else:
+            discipline_query(
+                "UPDATE rankings SET discord_user_id = ? WHERE guild_id = ? AND weight = ? AND discord_user_id = ?",
+                (new_id, guild_id, weight, old_id), write=True
+            )
+
+        touched.append(weight)
+
+    return touched
+
+
+def transfer_fighter(guild_id: int, old_id, old_name: str, new_id: int, new_name: str, personal: bool):
+    """Does the move. Returns the divisions whose ranking boards need refreshing."""
+
+    # Fights (records, streaks, title wins and title history all come from these)
+    for fight in fights_for_transfer(guild_id, old_id, old_name):
+
+        for side in ("winner", "loser"):
+
+            other = "loser" if side == "winner" else "winner"
+
+            if fight[f"{other}_id"] == new_id:
+                continue      # a fight between the two accounts stays as it is
+
+            mine = (
+                fight[f"{side}_id"] == old_id if old_id
+                else fight[f"{side}_id"] is None and normalise_name(fight[f"{side}_name"]) == normalise_name(old_name)
+            )
+
+            if mine:
+                discipline_query(
+                    f"UPDATE fights SET {side}_id = ?, {side}_name = ? WHERE id = ?",
+                    (new_id, new_name, fight["id"]), write=True
+                )
+
+    if not old_id:
+        return []
+
+    # Earlier record: added together if both accounts have one.
+    old_start = get_starting_record(guild_id, old_id)
+
+    if old_start:
+        new_start = get_starting_record(guild_id, new_id)
+        if new_start:
+            set_starting_record(
+                guild_id, new_id,
+                old_start["wins"] + new_start["wins"],
+                old_start["losses"] + new_start["losses"],
+                old_start["draws"] + new_start["draws"],
+                new_start["streak"] or old_start["streak"]
+            )
+        else:
+            set_starting_record(guild_id, new_id, old_start["wins"], old_start["losses"], old_start["draws"], old_start["streak"])
+        clear_starting_record(guild_id, old_id)
+
+    # /editstats numbers (the new account's own ones win if both have them)
+    discipline_query(
+        "UPDATE OR IGNORE fighter_stat_overrides SET user_id = ? WHERE guild_id = ? AND user_id = ?",
+        (new_id, guild_id, old_id), write=True
+    )
+    discipline_query("DELETE FROM fighter_stat_overrides WHERE guild_id = ? AND user_id = ?", (guild_id, old_id), write=True)
+
+    touched = merge_rankings(guild_id, old_id, new_id)
+
+    discipline_query(
+        "UPDATE OR IGNORE ranking_snapshots SET user_id = ? WHERE guild_id = ? AND user_id = ?",
+        (new_id, guild_id, old_id), write=True
+    )
+    discipline_query("DELETE FROM ranking_snapshots WHERE guild_id = ? AND user_id = ?", (guild_id, old_id), write=True)
+
+    for row in discipline_query("SELECT DISTINCT weight FROM division_belts WHERE guild_id = ? AND user_id = ?", (guild_id, old_id)):
+        touched.append(row["weight"])
+    discipline_query("UPDATE division_belts SET user_id = ? WHERE guild_id = ? AND user_id = ?", (new_id, guild_id, old_id), write=True)
+
+    # Fight stats, betting history (favourite / underdog), cards and votes
+    for table, columns in (
+        ("fight_stats", ("user_id", "opponent_id")),
+        ("bet_fights", ("fighter_a", "fighter_b")),
+        ("fight_card_bouts", ("fighter_a", "fighter_b")),
+        ("vote_bouts", ("fighter_a", "fighter_b", "winner_id")),
+    ):
+        for column in columns:
+            try:
+                discipline_query(f"UPDATE {table} SET {column} = ? WHERE {column} = ?", (new_id, old_id), write=True)
+            except sqlite3.OperationalError:
+                pass
+
+    discipline_query("UPDATE votes SET pick = ? WHERE pick = ?", (new_id, old_id), write=True)
+    discipline_query("DELETE FROM auto_rank_items WHERE guild_id = ? AND user_id = ?", (guild_id, old_id), write=True)
+
+    if personal:
+
+        old_wallet = discipline_query("SELECT * FROM coin_wallets WHERE guild_id = ? AND user_id = ?", (guild_id, old_id))
+
+        if old_wallet:
+            new_wallet = discipline_query("SELECT 1 FROM coin_wallets WHERE guild_id = ? AND user_id = ?", (guild_id, new_id))
+            if new_wallet:
+                discipline_query(
+                    "UPDATE coin_wallets SET balance = balance + ? WHERE guild_id = ? AND user_id = ?",
+                    (old_wallet[0]["balance"], guild_id, new_id), write=True
+                )
+                discipline_query("DELETE FROM coin_wallets WHERE guild_id = ? AND user_id = ?", (guild_id, old_id), write=True)
+            else:
+                # New account has never used coins: the old wallet (and daily streak) just moves over.
+                discipline_query("UPDATE coin_wallets SET user_id = ? WHERE guild_id = ? AND user_id = ?", (new_id, guild_id, old_id), write=True)
+
+        for table in ("coin_ledger", "bets", "warnings", "suspensions"):
+            discipline_query(f"UPDATE {table} SET user_id = ? WHERE guild_id = ? AND user_id = ?", (new_id, guild_id, old_id), write=True)
+
+        discipline_query("UPDATE OR IGNORE votes SET user_id = ? WHERE user_id = ?", (new_id, old_id), write=True)
+        discipline_query("DELETE FROM votes WHERE user_id = ?", (old_id,), write=True)
+
+    return list(dict.fromkeys(touched))
+
+
+class TransferView(
+    discord.ui.View
+):
+
+    def __init__(self, staff_id: int, old_id, old_name: str, new_member, personal: bool):
+        super().__init__(timeout=900)
+        self.staff_id = staff_id
+        self.old_id = old_id
+        self.old_name = old_name
+        self.new_member = new_member
+        self.personal = personal
+
+        go = discord.ui.Button(label="Transfer everything", style=discord.ButtonStyle.green)
+        go.callback = self.confirm
+        stop = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.grey)
+        stop.callback = self.cancel
+        self.add_item(go)
+        self.add_item(stop)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.staff_id and is_moderator_plus(interaction)
+
+    async def confirm(self, interaction):
+
+        self.stop()
+        await interaction.response.defer()
+
+        guild = interaction.guild
+        new_name = name_without_record(self.new_member.display_name)
+        touched = transfer_fighter(guild.id, self.old_id, self.old_name, self.new_member.id, new_name, self.personal)
+
+        stats = get_fighter_stats(guild.id, self.new_member.id)
+
+        for weight in touched:
+            await refresh_ranking_message(guild, weight)
+
+        problem = None
+        try:
+            problem, _ = await sync_nickname(guild, self.new_member.id)
+        except Exception as error:
+            print(f"Transfer nickname sync failed: {error}")
+
+        await interaction.edit_original_response(
+            content=(
+                f"✅ **Moved to <@{self.new_member.id}>.** Their record is now **{stats_record(stats)}** "
+                f"(streak {stats['streak'] or 'none'}, {plural(stats['title_wins'], 'title fight win')})."
+                + (f"\n⚠️ Nickname not updated: {problem}" if problem else "")
+                + "\n-# Use /editstats if any number needs adjusting."
+            ),
+            embed=None,
+            view=None
+        )
+
+        await post_staff_log(guild, staff_log_embed(
+            "🔁 Fighter moved to a new account",
+            [f"**{self.old_name}** ({f'<@{self.old_id}>' if self.old_id else 'name only'}) → <@{self.new_member.id}>",
+             f"By <@{interaction.user.id}>"]
+        ))
+
+    async def cancel(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(content="Cancelled. Nothing was moved.", embed=None, view=None)
+
+
+@bot.tree.command(
+    name="transferfighter",
+    description="Move a fighter's fights, record, titles, rankings and stats from an old account to a new one."
+)
+@app_commands.describe(
+    new_account="The fighter's new account",
+    old_account="Their old account, if it's still in the server",
+    old_account_left="Old account that has LEFT the server: user ID or the name on their fights",
+    coins_and_warnings="Also move their coins, bets and warnings (default: yes)"
+)
+async def transferfighter(
+    interaction: discord.Interaction,
+    new_account: discord.Member,
+    old_account: discord.Member = None,
+    old_account_left: str = None,
+    coins_and_warnings: bool = True
+):
+
+    if not is_moderator_plus(interaction):
+        await interaction.response.send_message(f"❌ {MODERATOR_ONLY_TEXT} can transfer fighters.", ephemeral=True)
+        return
+
+    if old_account:
+        old_id, old_name = old_account.id, name_without_record(old_account.display_name)
+    elif old_account_left:
+        try:
+            old_id, old_name, _ = await resolve_left_fighter(interaction.guild, old_account_left)
+        except FighterInputError as error:
+            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            return
+        old_name = name_without_record(old_name)
+    else:
+        await interaction.response.send_message(
+            "❌ Fill in **old_account** (still in the server) or **old_account_left** (user ID or name).", ephemeral=True
+        )
+        return
+
+    if old_id == new_account.id:
+        await interaction.response.send_message("❌ The old and new account are the same.", ephemeral=True)
+        return
+
+    if new_account.bot:
+        await interaction.response.send_message("❌ Bots can't have fights.", ephemeral=True)
+        return
+
+    lines = transfer_preview(interaction.guild, old_id, old_name, new_account, coins_and_warnings)
+
+    if not fights_for_transfer(interaction.guild.id, old_id, old_name) and len(lines) <= 2:
+        await interaction.response.send_message(f"❌ I couldn't find anything for **{old_name}** to move.", ephemeral=True)
+        return
+
+    new_stats = get_fighter_stats(interaction.guild.id, new_account.id)
+    note = ""
+    if new_stats["fights"] or get_starting_record(interaction.guild.id, new_account.id):
+        note = (f"\n\n⚠️ The new account already has a record (**{stats_record(new_stats)}**). "
+                "Both are added together and every fight keeps its own date, so the history, "
+                "streak and title wins are worked out in the order the fights happened. "
+                "In rankings the better spot is kept.")
+
+    embed = discord.Embed(
+        title="Move fighter to a new account?",
+        description=(
+            f"From **{old_name}**" + (f" (<@{old_id}>)" if old_id else " (name only)")
+            + f"\nTo <@{new_account.id}>\n\n**What moves**\n" + "\n".join(lines) + note
+            + "\n\n-# Records, streaks, title wins and title history all come from the fights, so they move with them."
+        )[:4000],
+        color=PFO_GOLD
+    )
+    embed.set_author(name="PFO • FIGHTER RECORDS", icon_url=asset_url(LOGO_FILE))
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=TransferView(interaction.user.id, old_id, old_name, new_account, coins_and_warnings),
+        ephemeral=True
+    )
+
+
+# ============================================================
 # RANKINGS UPDATES
 #
 # Posted by itself in the fighter news channel (any channel with
@@ -19554,6 +20447,8 @@ async def setup_hook():
     setup_fight_stats_tables()
     setup_belt_tables()
     setup_auto_rank_tables()
+    setup_stat_override_tables()
+    setup_card_section_columns()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
