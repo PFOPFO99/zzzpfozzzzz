@@ -13490,9 +13490,12 @@ def title_lineage(
     outcomes: {fight_id: "new" | "defence" | "first" | "draw"}
     """
 
+    # Every fight in the division (not just title fights), so a champion
+    # who loses in between is no longer champion. A title fight win only
+    # counts as a defence if the winner went into it as the champion.
     fights = discipline_query("""
         SELECT * FROM fights
-        WHERE guild_id = ? AND title_fight = 1 AND division = ?
+        WHERE guild_id = ? AND division = ?
         ORDER BY COALESCE(fight_date, substr(created_at, 1, 10)) ASC, id ASC
     """, (guild_id, division))
 
@@ -13502,7 +13505,19 @@ def title_lineage(
 
     for fight in fights:
 
-        if fight["method"] in ("DRAW", "NC"):
+        is_draw = fight["method"] in ("DRAW", "NC")
+
+        if not fight["title_fight"]:
+
+            # The champion lost a fight: the reign is over.
+            if current and not is_draw and fighter_key(fight["loser_id"], fight["loser_name"]) == current["key"]:
+                current["end"] = fight_day(fight)
+                current["end_fight"] = fight
+                current = None
+
+            continue
+
+        if is_draw:
             outcomes[fight["id"]] = "draw"
             continue
 
@@ -13517,7 +13532,7 @@ def title_lineage(
             current["end"] = fight_day(fight)
             current["end_fight"] = fight
 
-        outcomes[fight["id"]] = "new" if current else "first"
+        outcomes[fight["id"]] = "new" if reigns else "first"
 
         current = {
             "key": winner,
@@ -15685,6 +15700,68 @@ async def givecoins(
 
 
 @bot.tree.command(
+    name="admincoin",
+    description="Give or take PFO Coins (made from nothing, not from your balance). Head Mod+ only."
+)
+@app_commands.describe(
+    action="Give or take",
+    member="Who",
+    amount="How many coins",
+    reason="Optional note (shown in the staff log)"
+)
+@app_commands.choices(
+    action=[app_commands.Choice(name="Give", value="give"), app_commands.Choice(name="Take", value="take")]
+)
+async def admincoin(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    member: discord.Member,
+    amount: app_commands.Range[int, 1, 1_000_000],
+    reason: str = None
+):
+
+    if not is_senior_staff(interaction):
+        await interaction.response.send_message(f"❌ {SENIOR_ONLY_TEXT} can use /admincoin.", ephemeral=True)
+        return
+
+    if member.bot:
+        await interaction.response.send_message("❌ Bots don't have coins.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+    before = get_wallet(guild_id, member.id)["balance"]
+    note = ""
+
+    if action.value == "give":
+        change = amount
+    else:
+        change = -min(amount, max(before, 0))
+        if amount > before:
+            note = f" They only had {COIN} **{coins_text(before)}**, so that's all that was taken."
+
+    if change:
+        add_coins(guild_id, member.id, change, f"admin:{interaction.user.id}:{(reason or '')[:80]}")
+
+    after = get_wallet(guild_id, member.id)["balance"]
+    verb = "Gave" if change > 0 else "Took"
+
+    await interaction.response.send_message(
+        f"{'✅' if change > 0 else '➖'} {verb} {COIN} **{coins_text(abs(change))}** "
+        f"{'to' if change > 0 else 'from'} **{name_without_record(member.display_name)}**. "
+        f"Balance: {coins_text(before)} → **{coins_text(after)}**.{note}",
+        ephemeral=True
+    )
+
+    if change:
+        await post_staff_log(interaction.guild, staff_log_embed(
+            "🪙 Admin coins",
+            [f"<@{interaction.user.id}> {'gave' if change > 0 else 'took'} **{coins_text(abs(change))}** coins "
+             f"{'to' if change > 0 else 'from'} <@{member.id}> ({coins_text(before)} → {coins_text(after)})"]
+            + ([f"Reason: {reason[:200]}"] if reason else [])
+        ))
+
+
+@bot.tree.command(
     name="openbets",
     description="Open betting on a card with live odds (the sportsbook post)."
 )
@@ -15955,7 +16032,7 @@ def bet_overview_summary(guild: discord.Guild, market_id: int = None, user_id: i
                 "Fighting" if reason.startswith("fight") else
                 "Vote picks" if reason.startswith("votepick") else
                 "Bets (net)" if reason.startswith(("bet:", "stake:")) else
-                "Staff" if reason.startswith("staff") else None
+                "Staff" if reason.startswith(("staff", "admin")) else None
             )
             if key:
                 sources[key] += row["total"]
@@ -18124,11 +18201,27 @@ async def belt(
             await interaction.response.send_message(f"ℹ️ <@{fighter.id}> already holds **{title}**.", ephemeral=True)
             return
 
+        ranked = get_user_ranking_in_division(guild.id, fighter.id, weight.value)
+
+        if belt.value == "interim" and ranked and ranked["rank"] == 0:
+            await interaction.response.send_message(
+                f"❌ <@{fighter.id}> is the {weight.value} Champion, so they can't be the interim champion too.",
+                ephemeral=True
+            )
+            return
+
         discipline_query(
             "INSERT OR REPLACE INTO division_belts (guild_id, weight, belt, user_id, since) VALUES (?, ?, ?, ?, ?)",
             (guild.id, weight.value, belt.value, fighter.id, int(time.time())), write=True
         )
         note = f"✅ <@{fighter.id}> is now **{title}**." + (f" (Taken from <@{current}>.)" if current else "")
+
+        # The interim champion is the #1 contender.
+        if belt.value == "interim" and not (ranked and ranked["rank"] == 1):
+            update_ranking(guild.id, weight.value, fighter.id, 1)
+            note += f"\n📈 Moved to **#1** in the {weight.value} rankings" + (
+                f" (was #{ranked['rank']})." if ranked else " (wasn't ranked before)."
+            )
 
     else:
 
