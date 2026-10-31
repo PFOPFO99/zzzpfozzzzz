@@ -8879,6 +8879,7 @@ LEADERBOARD_CHOICES = [
     app_commands.Choice(name="Most awards (FOTN / POTN / KOTN)", value="awards"),
     app_commands.Choice(name="Fantasy: most points", value="fantasy"),
     app_commands.Choice(name="Fantasy: top scoring fighters", value="fantasyfighters"),
+    app_commands.Choice(name="Fantasy: most picked fighters", value="fantasypicked"),
 ]
 
 LEADERBOARD_TITLES = {
@@ -8903,6 +8904,7 @@ LEADERBOARD_TITLES = {
     "awards": "🏅 Most Awards",
     "fantasy": "🏆 Fantasy: Most Points",
     "fantasyfighters": "🏆 Fantasy: Top Scoring Fighters",
+    "fantasypicked": "📋 Fantasy: Most Picked Fighters",
 }
 
 # Short names used on /profile for top 3 spots.
@@ -8915,6 +8917,7 @@ LEADERBOARD_SHORT = {
     "awards": "Most awards",
     "fantasy": "Fantasy points",
     "fantasyfighters": "Fantasy scoring fighter",
+    "fantasypicked": "Most picked in fantasy",
 }
 
 STATS_MIN_FIGHTS = 1       # fights with stats needed for the accuracy boards (1 = show straight away)
@@ -9175,7 +9178,7 @@ def leaderboard_rows(guild: discord.Guild, category: str, cache: dict = None):
         return odds_leaderboard(guild, category)
     if category == "awards":
         return awards_leaderboard(guild)
-    if category in ("fantasy", "fantasyfighters"):
+    if category in ("fantasy", "fantasyfighters", "fantasypicked"):
         return fantasy_leaderboard(guild, category)
     return fighter_leaderboard(guild, category, cache)
 
@@ -9307,6 +9310,7 @@ async def leaderboard(
         "awards": "Fight / Performance / Knockout of the Night logged with /awards",
         "fantasy": "Fantasy PFO players • /fantasy to make your team",
         "fantasyfighters": "Fantasy points scored by each fighter on DMed cards",
+        "fantasypicked": "How many fantasy teams each fighter is in right now",
     }
 
     embed.set_footer(
@@ -23308,7 +23312,7 @@ def fantasy_set_captain(guild_id: int, user_id: int, pick_id: int):
     discipline_query("UPDATE fantasy_picks SET captain = 1 WHERE id = ? AND user_id = ?", (pick_id, user_id), write=True)
 
 
-def fantasy_embed(guild: discord.Guild, user_id: int, note: str = None):
+def fantasy_embed(guild: discord.Guild, user_id: int, note: str = None, owner_name: str = None):
 
     team = fantasy_team(guild.id, user_id)
     players, fighters, per_pick = fantasy_scores(guild.id)
@@ -23338,7 +23342,8 @@ def fantasy_embed(guild: discord.Guild, user_id: int, note: str = None):
             member = guild.get_member(pick["fighter_id"])
             name = name_without_record(member.display_name) if member else f"User {pick['fighter_id']}"
             earned = per_pick.get((user_id, pick["fighter_id"]), 0)
-            lines.append(f"{'⭐' if pick['captain'] else '▫️'} **{name}** `{pick['paid']:>2}` · {earned} pts for you")
+            lines.append(f"{'⭐' if pick['captain'] else '▫️'} **{name}** `{pick['paid']:>2}` · {earned} pts"
+                         + ("" if owner_name else " for you"))
     else:
         lines.append(f"No team yet. Add {FANTASY_TEAM_SIZE} fighters with the menu below.")
 
@@ -23348,7 +23353,8 @@ def fantasy_embed(guild: discord.Guild, user_id: int, note: str = None):
 
     lines += ["", f"Bank: `{fantasy_bank(guild.id, user_id)} / {FANTASY_BUDGET}`"]
 
-    embed = discord.Embed(title="🏆 Your fantasy team", description="\n".join(lines)[:4000], color=PFO_GOLD)
+    embed = discord.Embed(title=f"🏆 {owner_name}'s fantasy team" if owner_name else "🏆 Your fantasy team",
+                          description="\n".join(lines)[:4000], color=PFO_GOLD)
     embed.set_author(name="PFO • FANTASY", icon_url=asset_url(LOGO_FILE))
     embed.set_footer(text="⭐ captain scores double • only fights on DMed cards score")
     return embed
@@ -23377,17 +23383,44 @@ def fantasy_rules_embed():
     return embed
 
 
-def fantasy_prices_embed(guild: discord.Guild):
+FANTASY_PRICES_PAGE = 20
+
+
+def fantasy_price_rows(guild: discord.Guild):
     rows = []
     for member in getattr(guild, "members", []):
         if is_fantasy_fighter(guild, member):
             rows.append((fantasy_price(guild.id, member.id), name_without_record(member.display_name), member.id))
     rows.sort(key=lambda row: (-row[0], row[1].lower()))
+    return rows
+
+
+def fantasy_price_pages(guild: discord.Guild):
+    return max(1, -(-len(fantasy_price_rows(guild)) // FANTASY_PRICES_PAGE))
+
+
+def fantasy_prices_embed(guild: discord.Guild, page: int = 0, user_id: int = None):
+
+    rows = fantasy_price_rows(guild)
+    pages = max(1, -(-len(rows) // FANTASY_PRICES_PAGE))
+    page = max(0, min(page, pages - 1))
     _, fighter_points, _ = fantasy_scores(guild.id)
-    lines = [f"`{price:>2}` **{name}** · {fighter_points.get(uid, 0)} pts" for price, name, uid in rows[:30]]
-    embed = discord.Embed(title="Fighter prices", description="\n".join(lines) or "No fighters yet.", color=PFO_GOLD)
+    mine = {pick["fighter_id"] for pick in fantasy_team(guild.id, user_id)} if user_id else set()
+    bank = fantasy_bank(guild.id, user_id) if user_id else None
+
+    start = page * FANTASY_PRICES_PAGE
+    lines = []
+    for place, (price, name, uid) in enumerate(rows[start:start + FANTASY_PRICES_PAGE], start=start + 1):
+        lines.append(f"`{place:>2}.` `{price:>2}` **{name}** · {fighter_points.get(uid, 0)} pts" + (" ✅" if uid in mine else ""))
+
+    description = "\n".join(lines) or "No fighters yet."
+    if bank is not None:
+        description = f"Your bank: `{bank} / {FANTASY_BUDGET}`\n\n" + description
+
+    embed = discord.Embed(title="Fighter prices", description=description[:4000], color=PFO_GOLD)
     embed.set_author(name="PFO • FANTASY", icon_url=asset_url(LOGO_FILE))
-    embed.set_footer(text=f"Top {min(len(rows), 30)} of {len(rows)} • pts = fantasy points scored so far")
+    embed.set_footer(text=f"Page {page + 1} of {pages} • {len(rows)} fighters • pts = fantasy points scored so far"
+                          + (" • ✅ in your team" if mine else ""))
     return embed
 
 
@@ -23399,6 +23432,7 @@ class FantasyPanel(
         super().__init__(timeout=900)
         self.guild = guild
         self.user_id = user_id
+        self.price_page = None      # a page number while the prices are showing
         self.build()
 
     def build(self):
@@ -23439,10 +23473,22 @@ class FantasyPanel(
             button.callback = callback
             self.add_item(button)
 
+        if self.price_page is not None:
+            pages = fantasy_price_pages(self.guild)
+            if pages > 1:
+                back = discord.ui.Button(label="◀ Prices", style=discord.ButtonStyle.grey, row=4, disabled=self.price_page <= 0)
+                back.callback = self.price_back
+                forward = discord.ui.Button(label="Prices ▶", style=discord.ButtonStyle.grey, row=4,
+                                            disabled=self.price_page >= pages - 1)
+                forward.callback = self.price_next
+                self.add_item(back)
+                self.add_item(forward)
+
     async def interaction_check(self, interaction):
         return interaction.user.id == self.user_id
 
     async def redraw(self, interaction, note=None):
+        self.price_page = None
         self.build()
         await interaction.response.edit_message(embed=fantasy_embed(self.guild, self.user_id, note), view=self)
 
@@ -23457,10 +23503,25 @@ class FantasyPanel(
         fantasy_set_captain(self.guild.id, self.user_id, int(interaction.data["values"][0]))
         await self.redraw(interaction, "⭐ Captain updated.")
 
+    async def show_prices(self, interaction, page):
+        self.price_page = max(0, min(page, fantasy_price_pages(self.guild) - 1))
+        self.build()
+        await interaction.response.edit_message(
+            embed=fantasy_prices_embed(self.guild, self.price_page, self.user_id), view=self
+        )
+
     async def prices(self, interaction):
-        await interaction.response.edit_message(embed=fantasy_prices_embed(self.guild), view=self)
+        await self.show_prices(interaction, 0)
+
+    async def price_back(self, interaction):
+        await self.show_prices(interaction, (self.price_page or 0) - 1)
+
+    async def price_next(self, interaction):
+        await self.show_prices(interaction, (self.price_page or 0) + 1)
 
     async def rules(self, interaction):
+        self.price_page = None
+        self.build()
         await interaction.response.edit_message(embed=fantasy_rules_embed(), view=self)
 
     async def back(self, interaction):
@@ -23483,7 +23544,29 @@ async def fantasy(
     await interaction.response.send_message(embed=fantasy_embed(interaction.guild, interaction.user.id), view=panel, ephemeral=True)
 
 
+def fantasy_pick_counts(guild_id: int):
+    """{fighter_id: how many teams have them right now}"""
+    return {row["fighter_id"]: row["n"] for row in discipline_query(
+        "SELECT fighter_id, COUNT(*) AS n FROM fantasy_picks WHERE guild_id = ? AND removed_at IS NULL GROUP BY fighter_id",
+        (guild_id,)
+    )}
+
+
 def fantasy_leaderboard(guild: discord.Guild, kind: str):
+
+    if kind == "fantasypicked":
+        counts = fantasy_pick_counts(guild.id)
+        teams = discipline_query(
+            "SELECT COUNT(DISTINCT user_id) AS n FROM fantasy_picks WHERE guild_id = ? AND removed_at IS NULL", (guild.id,)
+        )[0]["n"]
+        rows = []
+        for user_id, count in counts.items():
+            member = guild.get_member(user_id)
+            if member:
+                share = f" ({round(count / teams * 100)}%)" if teams else ""
+                rows.append((member, count, f"in {count} team{'s' if count != 1 else ''}{share}"))
+        rows.sort(key=lambda row: row[1], reverse=True)
+        return rows
 
     players, fighters, _ = fantasy_scores(guild.id)
     source = players if kind == "fantasy" else fighters
@@ -23496,6 +23579,165 @@ def fantasy_leaderboard(guild: discord.Guild, kind: str):
 
     rows.sort(key=lambda row: row[1], reverse=True)
     return rows
+
+
+# ------------------------------------------------------------
+# /fantasyoverview  every fantasy team (Head Moderator+)
+# ------------------------------------------------------------
+
+FANTASY_OVERVIEW_PAGE = 10
+
+
+def fantasy_member_name(guild: discord.Guild, user_id: int):
+    member = guild.get_member(user_id)
+    return name_without_record(member.display_name) if member else f"User {user_id}"
+
+
+def fantasy_overview_rows(guild: discord.Guild):
+    """[(user_id, points, team)] for everyone with a team or points, best first."""
+
+    players, _, _ = fantasy_scores(guild.id)
+    owners = {row["user_id"] for row in discipline_query(
+        "SELECT DISTINCT user_id FROM fantasy_picks WHERE guild_id = ? AND removed_at IS NULL", (guild.id,)
+    )}
+    rows = [(user_id, players.get(user_id, 0), fantasy_team(guild.id, user_id)) for user_id in owners | set(players)]
+    rows.sort(key=lambda row: (-row[1], fantasy_member_name(guild, row[0]).lower()))
+    return rows
+
+
+def fantasy_overview_embed(guild: discord.Guild, page: int = 0):
+
+    rows = fantasy_overview_rows(guild)
+    current = open_fantasy_round(guild.id)
+    pages = max(1, -(-len(rows) // FANTASY_OVERVIEW_PAGE))
+    page = max(0, min(page, pages - 1))
+
+    lines = [f"**{len(rows)}** player{'s' if len(rows) != 1 else ''} with a team"]
+    if current:
+        lines.append(f"🔁 Swaps open for **{current['event'] or 'this card'}** · locks <t:{current['locks_at']}:R>")
+    else:
+        lines.append("-# No card open for swaps right now")
+
+    counts = fantasy_pick_counts(guild.id)
+    top = sorted(counts.items(), key=lambda item: item[1], reverse=True)[:5]
+    if top:
+        lines.append("📋 Most picked: " + ", ".join(f"{fantasy_member_name(guild, fid)} ({n})" for fid, n in top))
+
+    lines.append("")
+
+    if not rows:
+        lines.append("Nobody has made a team yet.")
+
+    start = page * FANTASY_OVERVIEW_PAGE
+    for place, (user_id, points, team) in enumerate(rows[start:start + FANTASY_OVERVIEW_PAGE], start=start + 1):
+        names = [("⭐" if pick["captain"] else "") + fantasy_member_name(guild, pick["fighter_id"]) for pick in team]
+        extra = []
+        if len(team) < FANTASY_TEAM_SIZE:
+            extra.append(f"{FANTASY_TEAM_SIZE - len(team)} empty")
+        if current:
+            extra.append(f"{FANTASY_SWAPS - swaps_used(guild.id, user_id, current)} swaps left")
+        extra.append(f"bank {fantasy_bank(guild.id, user_id)}")
+        lines.append(f"`#{place:<2}` **{fantasy_member_name(guild, user_id)}** · **{points}** pts")
+        lines.append(f"-# {', '.join(names) if names else 'No fighters'} · {' · '.join(extra)}")
+
+    embed = discord.Embed(title="🏆 Fantasy overview", description="\n".join(lines)[:4000], color=PFO_GOLD)
+    embed.set_author(name="PFO • FANTASY", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text=f"Page {page + 1} of {pages} • ⭐ captain • pick a player below to see their full team")
+    return embed, page, pages
+
+
+def fantasy_history_lines(guild: discord.Guild, user_id: int, limit: int = 8):
+    """Their latest team changes, newest first."""
+
+    events = []
+    for pick in discipline_query("SELECT * FROM fantasy_picks WHERE guild_id = ? AND user_id = ?", (guild.id, user_id)):
+        name = fantasy_member_name(guild, pick["fighter_id"])
+        events.append(((pick["added_at"], pick["id"], 0), f"➕ {name} (`{pick['paid']}`) <t:{pick['added_at']}:R>"))
+        if pick["removed_at"]:
+            events.append(((pick["removed_at"], pick["id"], 1), f"➖ {name} <t:{pick['removed_at']}:R>"))
+    events.sort(key=lambda item: item[0], reverse=True)
+    return [text for _, text in events[:limit]]
+
+
+class FantasyOverviewView(
+    discord.ui.View
+):
+
+    def __init__(self, guild: discord.Guild, viewer_id: int, page: int = 0):
+
+        super().__init__(timeout=900)
+        self.guild = guild
+        self.viewer_id = viewer_id
+        self.page = page
+
+        _, self.page, pages = fantasy_overview_embed(guild, page)
+
+        pick = discord.ui.UserSelect(placeholder="See a player's full team…", min_values=1, max_values=1, row=0)
+        pick.callback = self.show_player
+        self.pick = pick
+        self.add_item(pick)
+
+        back = discord.ui.Button(label="◀", style=discord.ButtonStyle.grey, row=1, disabled=self.page == 0)
+        back.callback = self.previous
+        forward = discord.ui.Button(label="▶", style=discord.ButtonStyle.grey, row=1, disabled=self.page >= pages - 1)
+        forward.callback = self.next
+        overview = discord.ui.Button(label="All teams", emoji="📋", style=discord.ButtonStyle.blurple, row=1)
+        overview.callback = self.all_teams
+        self.add_item(back)
+        self.add_item(forward)
+        self.add_item(overview)
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id != self.viewer_id:
+            await interaction.response.send_message("❌ This isn't your overview. Use /fantasyoverview.", ephemeral=True)
+            return False
+        return True
+
+    async def redraw(self, interaction, page):
+        view = FantasyOverviewView(self.guild, self.viewer_id, page)
+        await interaction.response.edit_message(embed=fantasy_overview_embed(self.guild, view.page)[0], view=view)
+
+    async def previous(self, interaction):
+        await self.redraw(interaction, self.page - 1)
+
+    async def next(self, interaction):
+        await self.redraw(interaction, self.page + 1)
+
+    async def all_teams(self, interaction):
+        await self.redraw(interaction, self.page)
+
+    async def show_player(self, interaction):
+        member = self.pick.values[0]
+        await interaction.response.edit_message(embed=fantasy_player_embed(self.guild, member.id), view=self)
+
+
+def fantasy_player_embed(guild: discord.Guild, user_id: int):
+
+    embed = fantasy_embed(guild, user_id, owner_name=fantasy_member_name(guild, user_id))
+    history = fantasy_history_lines(guild, user_id)
+    if history:
+        embed.add_field(name="Latest changes", value="\n".join(history)[:1024], inline=False)
+    embed.set_footer(text="⭐ captain scores double • 📋 All teams to go back")
+    return embed
+
+
+@bot.tree.command(
+    name="fantasyoverview",
+    description="See every fantasy team, points, swaps and the most picked fighters (Head Moderator+)."
+)
+@app_commands.describe(member="Only this player's team (default: everyone)")
+async def fantasyoverview(
+    interaction: discord.Interaction,
+    member: discord.Member = None
+):
+
+    if not is_senior_staff(interaction):
+        await interaction.response.send_message(f"❌ {SENIOR_ONLY_TEXT} can see the fantasy overview.", ephemeral=True)
+        return
+
+    view = FantasyOverviewView(interaction.guild, interaction.user.id)
+    embed = fantasy_player_embed(interaction.guild, member.id) if member else fantasy_overview_embed(interaction.guild)[0]
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # ============================================================
