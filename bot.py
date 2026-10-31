@@ -659,6 +659,12 @@ def setup_signup_time_columns():
     if "card_out" not in columns:
         cursor.execute("ALTER TABLE signup_sessions ADD COLUMN card_out TEXT")
 
+    if "event_name" not in columns:
+        cursor.execute("ALTER TABLE signup_sessions ADD COLUMN event_name TEXT")
+
+    if "starts_at" not in columns:
+        cursor.execute("ALTER TABLE signup_sessions ADD COLUMN starts_at TEXT")
+
     db.commit()
     db.close()
 
@@ -668,6 +674,49 @@ def session_value(session, key: str):
         return session[key]
     except (IndexError, KeyError):
         return None
+
+
+def signup_title(signup_type: str, session_id: int = None):
+    """The sign-up's title: the event name if one was given, e.g. 'PFO Live Card 7 Sign-Ups'."""
+
+    try:
+        session = get_session(session_id) if session_id else None
+    except Exception:
+        session = None
+
+    event = (session_value(session, "event_name") or "").strip() if session else ""
+    return f"{event} Sign-Ups" if event else SIGNUP_INFO[signup_type]["title"]
+
+
+def signup_start_line(value):
+    """'🗓️ Card starts: …' from a stored start (ts:unix or text)."""
+
+    if not value:
+        return None
+    if str(value).startswith("ts:"):
+        unix = int(str(value)[3:])
+        return f"🗓️ **Card starts:** <t:{unix}:F> (<t:{unix}:R>)"
+    return f"🗓️ **Card starts:** {value}"
+
+
+def read_signup_start(starts: str):
+    """Stored value for a card start time: ts:unix, the text as written, or None to clear."""
+
+    if not starts or starts.strip().lower() in ("none", "clear", "-"):
+        return None
+    moment = parse_event_datetime(starts)
+    return f"ts:{int(moment.timestamp())}" if moment else starts.strip()[:100]
+
+
+def set_signup_event(session_id: int, event=None, starts=None, change_event=True, change_starts=True):
+
+    db = get_db()
+    if change_event:
+        db.execute("UPDATE signup_sessions SET event_name = ? WHERE id = ?", (event, session_id))
+    if change_starts:
+        db.execute("UPDATE signup_sessions SET starts_at = ? WHERE id = ?", (starts, session_id))
+    db.commit()
+    db.close()
 
 
 def signup_time_lines(
@@ -686,6 +735,10 @@ def signup_time_lines(
     lines = []
     closes_at = session_value(session, "closes_at")
     card_out = session_value(session, "card_out")
+
+    start_line = signup_start_line(session_value(session, "starts_at"))
+    if start_line:
+        lines.append(start_line)
 
     if closes_at and not closed:
         lines.append(f"⏰ **Sign-ups close:** <t:{closes_at}:F> (<t:{closes_at}:R>)")
@@ -808,7 +861,9 @@ async def start_signup(
     interaction: discord.Interaction,
     signup_type: str,
     closes: str = None,
-    card_out: str = None
+    card_out: str = None,
+    event: str = None,
+    starts: str = None
 ):
 
     if not is_admin(interaction):
@@ -853,6 +908,9 @@ async def start_signup(
 
     set_signup_times(session_id, closes_at, card_value)
 
+    if (event and event.strip()) or starts:
+        set_signup_event(session_id, (event or "").strip()[:80] or None, read_signup_start(starts))
+
     await message.edit(
         content=None,
         embed=create_signup_embed(
@@ -884,7 +942,7 @@ def create_signup_embed(
     times = signup_time_lines(session_id)
 
     embed = discord.Embed(
-        title=info["title"],
+        title=signup_title(signup_type, session_id),
         description=(
             f"**{info['message']}**\n\n"
             f"🥊 **Current Sign-Ups: {count}**\n"
@@ -922,7 +980,7 @@ def create_closed_embed(
     )
 
     embed = discord.Embed(
-        title=info["title"],
+        title=signup_title(signup_type, session_id),
         description=(
             f"🔒 **Sign-Ups Closed! [{count} SIGN-UPS]!**\n\n"
             "This signup is no longer accepting entries."
@@ -1557,16 +1615,20 @@ async def fnsignup(
     description="Create a new PFO Live Card signup."
 )
 @app_commands.describe(
+    event="Optional: event name for the title, e.g. PFO Live Card 7",
+    starts="Optional: when the card starts, UK time, e.g. 07/11/2026 20:00 (or any text)",
     closes="Optional: when sign-ups close by themselves, UK time, e.g. 24/10/2026 18:00",
     card_out="Optional: when the card will be out, e.g. 25/10/2026 12:00 (or any text)"
 )
 async def livesignup(
     interaction: discord.Interaction,
+    event: str = None,
+    starts: str = None,
     closes: str = None,
     card_out: str = None
 ):
 
-    await start_signup(interaction, "live_card", closes, card_out)
+    await start_signup(interaction, "live_card", closes, card_out, event, starts)
 
 
 # ============================================================
@@ -1645,7 +1707,9 @@ async def signupclose(
 @app_commands.describe(
     signup_type="Which sign-up?",
     closes="When sign-ups close, UK time, e.g. 24/10/2026 18:00 ('none' to remove)",
-    card_out="When the card will be out, e.g. 25/10/2026 12:00 or any text ('none' to remove)"
+    card_out="When the card will be out, e.g. 25/10/2026 12:00 or any text ('none' to remove)",
+    event="Event name for the title, e.g. PFO Live Card 7 ('none' to remove)",
+    starts="When the card starts, UK time, e.g. 07/11/2026 20:00 ('none' to remove)"
 )
 @app_commands.choices(
     signup_type=[
@@ -1657,7 +1721,9 @@ async def signuptimes(
     interaction: discord.Interaction,
     signup_type: app_commands.Choice[str],
     closes: str = None,
-    card_out: str = None
+    card_out: str = None,
+    event: str = None,
+    starts: str = None
 ):
 
     if not is_admin(interaction):
@@ -1676,9 +1742,9 @@ async def signuptimes(
         )
         return
 
-    if closes is None and card_out is None:
+    if closes is None and card_out is None and event is None and starts is None:
         await interaction.response.send_message(
-            "❌ Fill in **closes**, **card_out** or both.",
+            "❌ Fill in at least one of **closes**, **card_out**, **event** or **starts**.",
             ephemeral=True
         )
         return
@@ -1695,8 +1761,16 @@ async def signuptimes(
         change_card=card_out is not None
     )
 
+    if event is not None or starts is not None:
+        name = None if event is None or event.strip().lower() in ("none", "clear", "-") else event.strip()[:80]
+        set_signup_event(
+            session["id"], name, read_signup_start(starts),
+            change_event=event is not None, change_starts=starts is not None
+        )
+
     await interaction.response.send_message(
-        "✅ Updated:\n" + ("\n".join(signup_time_lines(session["id"])) or "Times removed."),
+        f"✅ Updated **{signup_title(signup_type.value, session['id'])}**:\n"
+        + ("\n".join(signup_time_lines(session["id"])) or "Times removed."),
         ephemeral=True
     )
 
@@ -1713,8 +1787,8 @@ async def signuptimes(
 )
 @app_commands.describe(
     signup_type="Which signup list do you want to paste?",
-    event="Live Cards: event name for the title, e.g. PFO Live Card 7",
-    starts="Live Cards: when the card starts, UK time, e.g. 07/11/2026 20:00"
+    event="Live Cards: event name for the title (default: the one set on /livesignup)",
+    starts="Live Cards: when the card starts, UK time (default: the one set on /livesignup)"
 )
 @app_commands.choices(
     signup_type=[
@@ -1806,10 +1880,15 @@ async def signuppaste(
             f"**{number}.** {fighter_link}"
         )
 
-    title = SIGNUP_INFO[signup_type_value]["title"]
+    title = signup_title(signup_type_value, session["id"])
     header = []
 
-    # Live Cards: optional event name and start time.
+    saved_start = signup_start_line(session_value(session, "starts_at"))
+    if saved_start and not (starts and starts.strip()):
+        header = [saved_start, ""]
+
+    # Live Cards: optional event name and start time (these override
+    # what was set on /livesignup, just for this paste).
     if signup_type_value == "live_card":
 
         if event and event.strip():
