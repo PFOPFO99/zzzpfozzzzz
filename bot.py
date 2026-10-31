@@ -390,6 +390,7 @@ def setup_database():
     setup_hof_tables()
     setup_title_change_table()
     setup_shop_tables()
+    setup_shop_board_table()
     setup_fantasy_tables()
 
 
@@ -8711,6 +8712,7 @@ async def vote_closer():
     try:
         await check_shop_expiry()
         await check_jackpot_draws()
+        await check_shop_board()
     except Exception as error:
         print(f"Shop check error: {error}")
 
@@ -22704,6 +22706,190 @@ async def shopadmin(
         ephemeral=True
     )
 
+    if item and (price is not None or enabled is not None):
+        await refresh_shop_board(interaction.guild)
+
+
+# ------------------------------------------------------------
+# The shop post in pfo-shop
+#
+# A post that stays in the shop channel with the prices and an
+# Open Shop button. The button opens the same private /shop panel.
+# The bot posts it by itself the first time, /shoppost reposts it,
+# and /shopadmin keeps the prices on it up to date.
+# ------------------------------------------------------------
+
+SHOP_CHANNEL = os.getenv("SHOP_CHANNEL", "pfo-shop").strip()
+
+
+def setup_shop_board_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS shop_board (
+            guild_id INTEGER PRIMARY KEY,
+            channel_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def find_shop_channel(guild: discord.Guild):
+
+    if SHOP_CHANNEL.isdigit():
+        return guild.get_channel(int(SHOP_CHANNEL))
+
+    wanted = role_key(SHOP_CHANNEL)
+    for channel in getattr(guild, "text_channels", []):
+        if role_key(channel.name) == wanted:
+            return channel
+    return None
+
+
+def shop_board_embed(guild: discord.Guild):
+
+    embed = discord.Embed(
+        title="PFO Shop",
+        description=f"Spend your {COIN} PFO Coins on fighter perks, profile items, betting perks and games.\n"
+                    "-# Press **Open Shop** to see your balance, item details and buy. Only you can see your shop.",
+        color=PFO_GOLD
+    )
+    apply_branding(embed, banner_file=SHOP_BANNER, author_text="PFO • SHOP")
+
+    for category in SHOP_CATEGORIES:
+        rows = []
+        for key, (name, emoji, _, cat, needs_staff, _) in SHOP_ITEMS.items():
+            if cat != category:
+                continue
+            price, enabled = item_setting(guild.id, key)
+            if not enabled:
+                continue
+            label = f"{round(GIFT_FEE * 100)}% fee" if key == "gift" else (f"{coins_text(price)}+" if key == "bounty" else coins_text(price))
+            rows.append(f"`{label:>7}`  {emoji} {name}" + (" 🛂" if needs_staff else ""))
+        if rows:
+            embed.add_field(name=category, value="\n".join(rows), inline=False)
+
+    embed.set_footer(text="🛂 staff approve first, refunded if declined • coins are points only", icon_url=asset_url(LOGO_FILE))
+    return embed
+
+
+class ShopBoardView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        button = discord.ui.Button(label="Open Shop", emoji="🛒", style=discord.ButtonStyle.green,
+                                   custom_id="pfo_shop_open")
+        button.callback = self.open_shop
+        self.add_item(button)
+
+    async def open_shop(self, interaction: discord.Interaction):
+
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Use this in the PFO server.", ephemeral=True)
+            return
+
+        panel = ShopPanel(interaction.guild, interaction.user.id)
+        await interaction.response.send_message(
+            embed=shop_embed(interaction.guild, interaction.user.id), view=panel, ephemeral=True
+        )
+
+
+async def fetch_shop_board(guild: discord.Guild):
+
+    rows = discipline_query("SELECT * FROM shop_board WHERE guild_id = ?", (guild.id,))
+    if not rows:
+        return None
+
+    channel = guild.get_channel(rows[0]["channel_id"])
+    if not channel:
+        return None
+
+    try:
+        return await channel.fetch_message(rows[0]["message_id"])
+    except Exception:
+        return None
+
+
+async def post_shop_board(guild: discord.Guild, channel=None):
+    """Posts a fresh shop post (removing the old one). Returns the message or None."""
+
+    channel = channel or find_shop_channel(guild)
+    if not channel:
+        return None
+
+    old = await fetch_shop_board(guild)
+
+    message = await channel.send(embed=shop_board_embed(guild), view=ShopBoardView())
+    discipline_query(
+        "INSERT OR REPLACE INTO shop_board (guild_id, channel_id, message_id) VALUES (?, ?, ?)",
+        (guild.id, channel.id, message.id), write=True
+    )
+
+    if old:
+        try:
+            await old.delete()
+        except Exception:
+            pass
+
+    return message
+
+
+async def refresh_shop_board(guild: discord.Guild):
+    """Updates the prices on the shop post, if there is one."""
+
+    message = await fetch_shop_board(guild)
+    if message:
+        try:
+            await message.edit(embed=shop_board_embed(guild), view=ShopBoardView())
+        except Exception as error:
+            print(f"Could not refresh the shop post: {error}")
+
+
+async def check_shop_board():
+    """Posts the shop in pfo-shop the first time (only once; after that use /shoppost)."""
+
+    for guild in list(getattr(bot, "guilds", [])):
+        if discipline_query("SELECT 1 FROM shop_board WHERE guild_id = ?", (guild.id,)):
+            continue
+        channel = find_shop_channel(guild)
+        if channel:
+            try:
+                await post_shop_board(guild, channel)
+            except Exception as error:
+                print(f"Could not post the shop: {error}")
+
+
+@bot.tree.command(
+    name="shoppost",
+    description="Post (or repost) the shop with its Open Shop button in pfo-shop (Moderator+)."
+)
+async def shoppost(
+    interaction: discord.Interaction
+):
+
+    if not is_moderator_plus(interaction):
+        await interaction.response.send_message(f"❌ {MODERATOR_ONLY_TEXT} can post the shop.", ephemeral=True)
+        return
+
+    channel = find_shop_channel(interaction.guild)
+    if not channel:
+        await interaction.response.send_message(
+            f"❌ I couldn't find a **#{SHOP_CHANNEL}** channel. Make one (or set SHOP_CHANNEL in Railway) and try again.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        message = await post_shop_board(interaction.guild, channel)
+    except Exception as error:
+        await interaction.followup.send(f"❌ Couldn't post in {channel.mention}: {error}", ephemeral=True)
+        return
+
+    await interaction.followup.send(f"✅ Shop posted in {channel.mention}. The old post was removed.\n{message.jump_url}", ephemeral=True)
+
 
 # ============================================================
 # FANTASY PFO
@@ -23987,6 +24173,7 @@ async def setup_hook():
     setup_hof_tables()
     setup_title_change_table()
     setup_shop_tables()
+    setup_shop_board_table()
     setup_fantasy_tables()
 
     # Buttons first, so they work even if the sync below fails.
@@ -23999,6 +24186,7 @@ async def setup_hook():
     restore_interview_buttons()
     restore_auto_rank_buttons()
     restore_shop_buttons()
+    bot.add_view(ShopBoardView())
 
     if not vote_closer.is_running():
         vote_closer.start()
