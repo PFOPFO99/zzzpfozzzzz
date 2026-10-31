@@ -46,7 +46,7 @@ except ImportError:  # only when testing without discord.py installed
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "7"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "9"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -311,6 +311,7 @@ NAV = [
     ("results", "/results", "Results"),
     ("leaderboards", "/leaderboards", "Leaderboards"),
     ("titles", "/titles", "Titles"),
+    ("halloffame", "/hall-of-fame", "Hall of Fame"),
 ]
 
 
@@ -423,6 +424,36 @@ def next_event(ctx):
             if ctx.event_key(card["event"]) == key:
                 return [(b["fighter_a"], b["fighter_b"], row_get(b, "weight")) for b in ctx.get_fight_card_bouts(card["id"])]
         return None
+
+    # 0) The newest card DMed with /dmlivecard or /dmfightnight that's still to come.
+    #    These are typed Main Event first, with Main Card / Prelims / Early Prelims.
+    layout_fn = getattr(ctx, "notice_layout", None)
+
+    if layout_fn:
+        for notice in ctx.q("SELECT * FROM card_notices WHERE guild_id = ? ORDER BY id DESC LIMIT 3", (ctx.gid,)):
+            kind = row_get(notice, "kind")
+            raw = str(row_get(notice, "event_date" if kind == "live_card" else "deadline", ""))
+            if not raw.isdigit():
+                continue
+            when = int(raw)
+            if kind == "live_card" and when < now - 4 * 3600:
+                continue
+            if kind != "live_card" and when < now - 12 * 3600:
+                continue
+            name = row_get(notice, "event") or ("Live Card" if kind == "live_card" else "Fight Night")
+            layout = layout_fn(notice)
+            if not layout:
+                continue
+            if row_get(notice, "event") and len(ctx.event_fights(ctx.gid, name)) >= len(layout):
+                continue          # every fight's been logged: the event is over
+            return {
+                "name": name,
+                "when": when,
+                "kind": kind,
+                "main_first": True,
+                "bouts": [(a, b, ctx.auto_weight(ctx.gid, a, b)) for a, b, _ in layout],
+                "spots": [spot for _, _, spot in layout],
+            }
 
     # 1) A Live Card that's been DMed with a date that hasn't passed.
     for notice in ctx.q("SELECT * FROM card_notices WHERE guild_id = ? AND kind = 'live_card' ORDER BY id DESC LIMIT 3",
@@ -655,7 +686,19 @@ def render_home(ctx):
     # ---------- next event ----------
     event_html = ""
     if event and event["bouts"]:
-        a, b, weight = event["bouts"][-1]
+        # Main Event first, with each fight's label and card section.
+        if event.get("main_first"):
+            ordered = []
+            for (fa, fb, fw), spot in zip(event["bouts"], event["spots"]):
+                label = (spot["slot"] or "").upper().replace("CO-MAIN EVENT", "CO-MAIN") or f"FIGHT {spot['number']}"
+                ordered.append((fa, fb, fw, label, ctx.CARD_SECTION_NAMES[spot["section"]].upper()))
+        else:
+            total = len(event["bouts"])
+            ordered = [
+                (fa, fb, fw, "MAIN EVENT" if n == 1 else "CO-MAIN" if n == 2 else f"FIGHT {total - n + 1}", None)
+                for n, (fa, fb, fw) in enumerate(reversed(event["bouts"]), start=1)
+            ]
+        a, b, weight = ordered[0][:3]
         title_fight = rank_in(ctx, a, weight) == 0 or rank_in(ctx, b, weight) == 0
 
         def corner(uid, side):
@@ -688,20 +731,26 @@ def render_home(ctx):
           <div><b class="d" data-unit="s">--</b><span>SEC</span></div>
         </div>"""
 
-        when_line = f"NEXT EVENT · {event_when(event['when']).upper()}" if event["when"] else "NEXT EVENT"
+        if event.get("kind") == "fight_night" and event["when"]:
+            when_line = f"FIGHT NIGHT · FIGHTS DUE BY {event_when(event['when']).upper()}"
+        else:
+            when_line = f"NEXT EVENT · {event_when(event['when']).upper()}" if event["when"] else "NEXT EVENT"
         detail = " · ".join(part for part in [
             f"{weight} championship" if title_fight and weight else (weight or ""),
             "main event",
         ] if part)
 
         card_rows = ""
-        for number, (fa, fb, fw) in enumerate(reversed(event["bouts"]), start=1):
-            label = "MAIN EVENT" if number == 1 else "CO-MAIN" if number == 2 else f"FIGHT {len(event['bouts']) - number + 1}"
+        current_section = None
+        for number, (fa, fb, fw, label, section) in enumerate(ordered, start=1):
+            if section and section != current_section:
+                current_section = section
+                card_rows += f'<li class="card-sec rv">{esc(section)}</li>'
             ra = rank_label(rank_in(ctx, fa, fw))
             rb = rank_label(rank_in(ctx, fb, fw))
             card_rows += f"""
           <li class="row card-row {stagger(number)}">
-            <span class="card-slot">{label}</span>
+            <span class="card-slot{' gold' if label == 'MAIN EVENT' else ''}">{label}</span>
             <span class="card-fight d">{name_link(ctx, fa, fighter_name(ctx, fa))}{f' <small>{esc(ra)}</small>' if ra else ''}<span class="vs-s">VS</span>{name_link(ctx, fb, fighter_name(ctx, fb))}{f' <small>{esc(rb)}</small>' if rb else ''}</span>
             <span class="card-weight">{esc((fw or '').upper())}</span>
           </li>"""
@@ -861,10 +910,19 @@ def result_row(ctx, fight, i=0, show_weight=True):
     joiner = "VS" if fight["method"] in ("DRAW", "NC") else "DEF."
     belt = '<span class="belt" title="Title fight">TITLE</span>' if fight["title_fight"] else ""
     weight = f'<span class="res-w">{esc((fight["division"] or "").upper())}</span>' if show_weight else ""
+    award_fn = getattr(ctx, "awards_for_fight", None)
+    awards = ""
+    if award_fn:
+        kinds = []
+        for row in award_fn(ctx.gid, fight["id"]):
+            if row["award"] not in kinds:
+                kinds.append(row["award"])
+        titles = {"fotn": "Fight of the Night", "potn": "Performance of the Night", "kotn": "Knockout of the Night"}
+        awards = "".join(f'<span class="award award-{k}" title="{titles[k]}">{k.upper()}</span>' for k in kinds)
     return f"""
           <div class="row res {stagger(i)}">
             <span class="d res-who">{name_link(ctx, fight['winner_id'], w)}<span class="def">{joiner}</span>{name_link(ctx, fight['loser_id'], l, 'loser')}</span>
-            {belt}
+            {belt}{awards}
             <span class="res-m {method_class(fight['method'])}">{esc(method_short(ctx, fight))}</span>
             {weight}
           </div>"""
@@ -1157,6 +1215,9 @@ def render_fighter(ctx, user_id):
         badge_bits.append(f"P4P #{ranks[ctx.P4P_WEIGHT]}")
     if not member:
         badge_bits.append("FORMER FIGHTER")
+    hof_fn = getattr(ctx, "hof_entry", None)
+    if hof_fn and hof_fn(ctx.gid, user_id, name)[0]:
+        badge_bits.insert(0, "HALL OF FAME")
     badge = " · ".join(badge_bits) or "PFO FIGHTER"
 
     fights = stats["fights"]
@@ -1277,6 +1338,8 @@ def render_fighter(ctx, user_id):
   </section>"""
 
     # Fight history
+    rival_fn_rows = getattr(ctx, "rivalries_for", None)
+    rival_ids_for_rows = {r["opponent_id"] for r in rival_fn_rows(ctx.gid, user_id)} if rival_fn_rows else set()
     rows = ""
     for i, fight in enumerate(reversed(fights)):
         if fight["method"] == "NC":
@@ -1292,6 +1355,8 @@ def render_fighter(ctx, user_id):
         else:
             opp_id, opp_saved = fight["winner_id"], fight["winner_name"]
         method = method_short(ctx, fight) + (" · TITLE" if fight["title_fight"] else "")
+        if rival_ids_for_rows and opp_id in rival_ids_for_rows:
+            method += " · RIVALRY"
         rows += f"""
           <tr class="row {stagger(i, 3)}">
             <td><span class="pill {cls}">{r}</span></td>
@@ -1326,12 +1391,42 @@ def render_fighter(ctx, user_id):
           <span class="muted">{esc(short_day(reign['start']))} · {d} defence{'s' if d != 1 else ''}{f' · {days} days' if days is not None else ''}</span>
         </div>"""
 
+    # Rivalries and awards
+    side_blocks = ""
+    rival_fn = getattr(ctx, "rivalries_for", None)
+    rival_tiles = ""
+    for rival in (rival_fn(ctx.gid, user_id) if rival_fn else [])[:3]:
+        opp = fighter_name(ctx, rival["opponent_id"], rival["opponent_name"])
+        rec = f"{rival['wins']}-{rival['losses']}" + (f"-{rival['draws']}" if rival["draws"] else "")
+        state = "LEADS" if rival["wins"] > rival["losses"] else "TRAILS" if rival["wins"] < rival["losses"] else "LEVEL"
+        rival_tiles += f"""
+        <div class="reign rv2">
+          <span class="reign-tag">RIVALRY · {state}</span>
+          <span class="d reign-t">vs {name_link(ctx, rival['opponent_id'], opp)}</span>
+          <span class="muted">{esc(rec)} · {rival['fights']} fights · last: {esc(rival['last']['event'] or nice_day(fight_day(rival['last'])))}</span>
+        </div>"""
+    if rival_tiles:
+        side_blocks += f'<h2 id="rivals" class="d h-m rv">RIVALRIES</h2>{rival_tiles}'
+
+    award_fn = getattr(ctx, "awards_for_member", None)
+    award_rows = award_fn(ctx.gid, user_id) if award_fn else []
+    if award_rows:
+        counts = {"fotn": 0, "potn": 0, "kotn": 0}
+        for row in award_rows:
+            counts[row["award"]] += 1
+        labels = {"fotn": "FIGHT OF THE NIGHT", "potn": "PERFORMANCE OF THE NIGHT", "kotn": "KNOCKOUT OF THE NIGHT"}
+        award_tiles = "".join(
+            f'<div class="reign rv2"><span class="reign-tag">{labels[k]}</span><span class="d reign-t">×{v}</span></div>'
+            for k, v in counts.items() if v
+        )
+        side_blocks += f'<h2 id="awards" class="d h-m rv">AWARDS</h2>{award_tiles}'
+
     aside = ""
-    if reign_tiles:
+    if reign_tiles or side_blocks:
         aside = f"""
-    <aside class="reigns" aria-labelledby="titles">
-      <h2 id="titles" class="d h-m rv">TITLE REIGNS</h2>
-      {reign_tiles}
+    <aside class="reigns" aria-labelledby="{'titles' if reign_tiles else 'rivals'}">
+      {f'<h2 id="titles" class="d h-m rv">TITLE REIGNS</h2>{reign_tiles}' if reign_tiles else ''}
+      {side_blocks}
     </aside>"""
 
     body = hero + f"""
@@ -1417,6 +1512,80 @@ def render_results(ctx, page_no=1):
 # ============================================================
 # TITLES
 # ============================================================
+
+def render_hall_of_fame(ctx):
+    rows_fn = getattr(ctx, "hall_of_fame", None)
+    rows = rows_fn(ctx.gid) if rows_fn else []
+
+    def card_data(number, row):
+        uid = row["user_id"]
+        name = fighter_name(ctx, uid, row["name"]) if uid else clean_name(ctx, row["name"])
+        career = ctx.hof_career(ctx.gid, uid, row["name"])
+        return {
+            "number": number, "uid": uid, "name": name, "notes": ctx.hof_notes(row),
+            "career": career, "inducted": uk_time(row["inducted_at"]),
+        }
+
+    cards = [card_data(n, row) for n, row in enumerate(rows, start=1)]
+
+    if not cards:
+        body = page_hero("PFO LEGENDS", "HALL OF FAME", "HOF") + \
+            '<div class="wrap hof-wrap"><p class="empty">Nobody has been inducted yet.</p></div>'
+        return page(ctx, "Hall of Fame", "halloffame", body, "The PFO Hall of Fame.")
+
+    top, rest = cards[0], cards[1:]
+
+    def link_open(card):
+        return f'<a href="{fighter_url(card["uid"])}"' if card["uid"] else '<div'
+
+    def link_close(card):
+        return "</a>" if card["uid"] else "</div>"
+
+    first, last = split_name(top["name"])
+    c = top["career"]
+    belts = "".join(f'<span class="hof-belt">{esc(b.upper())} CHAMPION</span>' for b in c["belts"])
+    notes = "".join(f'<li><span aria-hidden="true">◆</span>{esc(n)}</li>' for n in top["notes"])
+    feature = f"""
+    {link_open(top)} class="hof-feature rv">
+      <div class="hof-side">
+        <span class="eyebrow">INDUCTEE #1 · {esc(top['inducted'].strftime('%b %Y').upper())}</span>
+        {avatar_html(ctx, top['uid'], top['name'], 'av av-xl')}
+        <span class="d hof-name">{esc(first)}<br>{esc(last)}</span>
+        <span class="feature-stats">
+          <span><strong class="d">{esc(c['record'])}</strong>RECORD</span>
+          <span><strong class="d">{c['reigns']}</strong>TITLE REIGNS</span>
+          <span><strong class="d">{c['defences']}</strong>DEFENCES</span>
+        </span>
+      </div>
+      <div class="hof-main">
+        <ul class="hof-notes">{notes}</ul>
+        {f'<div class="hof-belts">{belts}</div>' if belts else ''}
+      </div>
+    {link_close(top)}"""
+
+    grid = ""
+    for i, card in enumerate(rest):
+        notes = "".join(f'<li><span aria-hidden="true">◆</span>{esc(n)}</li>' for n in card["notes"])
+        grid += f"""
+      {link_open(card)} class="hof-card {stagger(i, 3)}">
+        <span class="hof-head">
+          {avatar_html(ctx, card['uid'], card['name'], 'av')}
+          <span class="hof-who"><span class="eyebrow">INDUCTEE #{card['number']} · {esc(card['inducted'].strftime('%b %Y').upper())}</span>
+          <span class="d hof-cname">{esc(card['name'])}</span></span>
+          <span class="d hof-rec">{esc(card['career']['record'])}</span>
+        </span>
+        <ul class="hof-notes hof-notes-sm">{notes}</ul>
+      {link_close(card)}"""
+
+    extra = f'<p class="muted l-up">{len(cards)} inductee{"s" if len(cards) != 1 else ""} · the fighters who defined PFO</p>'
+    body = page_hero("PFO LEGENDS", "HALL OF FAME", "HOF", extra) + f"""
+<div class="wrap hof-wrap">
+  {feature}
+  {f'<div class="hof-grid">{grid}</div>' if grid else ''}
+</div>"""
+
+    return page(ctx, "Hall of Fame", "halloffame", body, "The PFO Hall of Fame: the fighters who defined the Prestige Fighting Organisation.")
+
 
 def render_titles(ctx):
     blocks = ""
@@ -1771,7 +1940,9 @@ img{max-width:100%}
 .card-list{display:flex;flex-direction:column;gap:18px}
 .card-row{display:grid;grid-template-columns:120px 1fr auto;align-items:center;gap:8px 20px;padding:18px 6px}
 .card-slot{font-size:11px;font-weight:700;letter-spacing:.2em;color:var(--dim)}
-.card-row:first-child .card-slot{color:var(--gold)}
+.card-row:first-child .card-slot,.card-slot.gold{color:var(--gold)}
+.card-sec{list-style:none;padding:26px 6px 10px;font-size:11px;font-weight:700;letter-spacing:.26em;color:var(--dim);border-bottom:1px solid var(--line)}
+.card-sec:first-child{padding-top:6px}
 .card-fight{font-size:24px;font-weight:700;display:flex;flex-wrap:wrap;align-items:baseline;gap:4px 10px}
 .card-fight a{color:var(--text)}.card-fight a:hover{color:var(--gold2)}
 .card-fight small{font:600 12px Inter,sans-serif;color:var(--gold);letter-spacing:.06em}
@@ -1928,6 +2099,36 @@ img{max-width:100%}
 .td-e{font-size:13px;color:var(--muted);text-align:right}
 .td-e span{display:block;font-size:12px;color:var(--dim)}
 .reigns{flex:1 1 300px;display:flex;flex-direction:column;gap:16px}
+.reigns h2+.reign,.reigns .reign+h2{margin-top:0}
+.reigns .reign+h2{margin-top:18px}
+.award{display:inline-block;margin-left:8px;padding:3px 8px;border-radius:999px;font:700 10px var(--ui,Inter);letter-spacing:.14em;border:1px solid rgba(201,162,74,.5);color:var(--gold2);background:rgba(201,162,74,.08)}
+.award-kotn{border-color:rgba(240,122,126,.5);color:#F5A3A6;background:rgba(240,122,126,.08)}
+.award-potn{border-color:rgba(127,176,255,.45);color:#A9C8FF;background:rgba(127,176,255,.08)}
+.hof-wrap{padding-top:64px;padding-bottom:120px;display:flex;flex-direction:column;gap:28px}
+.hof-feature{position:relative;overflow:hidden;display:flex;flex-wrap:wrap;gap:40px;padding:48px;border:1px solid #3A311B;border-radius:22px;color:var(--text);background:radial-gradient(120% 120% at 0% 0%,rgba(201,162,74,.18),rgba(8,8,10,0) 55%),var(--panel);transition:border-color .35s,transform .35s var(--ease)}
+.hof-feature:hover{color:var(--text);border-color:#5A4A22;transform:translateY(-3px)}
+.hof-side{flex:1 1 280px;display:flex;flex-direction:column;gap:22px}
+.hof-name{font-size:84px;line-height:.85}
+.hof-side .feature-stats{gap:22px;flex-wrap:wrap}
+.hof-side .feature-stats strong{white-space:nowrap}
+.hof-main{flex:999 1 380px;display:flex;flex-direction:column;justify-content:center;gap:22px}
+.hof-notes{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:14px}
+.hof-notes li{display:flex;gap:16px;align-items:baseline;font:700 32px/1.05 var(--d)}
+.hof-notes li span{color:var(--gold);font-size:16px}
+.hof-notes-sm{padding-top:18px;border-top:1px solid var(--line);gap:10px}
+.hof-notes-sm li{font:500 16px/1.4 var(--ui,Inter);color:#D7D7DC}
+.hof-notes-sm li span{font-size:11px}
+.hof-belts{display:flex;flex-wrap:wrap;gap:10px}
+.hof-belt{border:1px solid rgba(201,162,74,.45);background:rgba(201,162,74,.08);color:var(--gold2);padding:8px 14px;border-radius:999px;font-size:12px;font-weight:700;letter-spacing:.16em}
+.hof-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:28px}
+.hof-card{display:flex;flex-direction:column;gap:18px;padding:30px;border:1px solid var(--line2);border-radius:18px;background:var(--panel);color:var(--text);transition:border-color .35s,transform .35s var(--ease)}
+.hof-card:hover{color:var(--text);border-color:#4A3D1E;transform:translateY(-3px)}
+.hof-head{display:flex;align-items:center;gap:16px}
+.hof-who{display:flex;flex-direction:column;gap:6px;min-width:0}
+.hof-who .eyebrow{font-size:11px;letter-spacing:.2em}
+.hof-cname{font-size:36px;line-height:.9}
+.hof-rec{margin-left:auto;font-size:24px;color:var(--muted)}
+@media (max-width:640px){.hof-feature{padding:30px 22px}.hof-name{font-size:56px}.hof-notes li{font-size:24px}}
 .reigns h2{margin-bottom:6px}
 .reign{border:1px solid var(--line2);border-radius:16px;padding:24px;background:var(--panel);display:flex;flex-direction:column;gap:10px;transition:border-color .35s,transform .35s var(--ease)}
 .reign:hover{border-color:#4A3D1E;transform:translateY(-3px)}
@@ -2501,6 +2702,9 @@ def make_app(bot, g):
     async def leaderboards(request):
         return await serve(request, "leaderboards", render_leaderboards)
 
+    async def hall(request):
+        return await serve(request, "halloffame", render_hall_of_fame)
+
     async def css(request):
         return web.Response(text=SITE_CSS, content_type="text/css", headers={"Cache-Control": "public, max-age=86400"})
 
@@ -2521,6 +2725,7 @@ def make_app(bot, g):
     app.router.add_get("/results", results)
     app.router.add_get("/titles", titles)
     app.router.add_get("/leaderboards", leaderboards)
+    app.router.add_get("/hall-of-fame", hall)
     app.router.add_get("/assets/site.css", css)
     app.router.add_get("/assets/site.js", js)
     app.router.add_get("/health", health)
