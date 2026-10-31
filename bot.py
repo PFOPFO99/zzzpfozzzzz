@@ -380,6 +380,8 @@ def setup_database():
     setup_auto_rank_tables()
     setup_stat_override_tables()
     setup_card_section_columns()
+    setup_award_tables()
+    setup_hof_tables()
 
 
 # ============================================================
@@ -1700,7 +1702,9 @@ async def signuptimes(
     description="Paste the current signup list."
 )
 @app_commands.describe(
-    signup_type="Which signup list do you want to paste?"
+    signup_type="Which signup list do you want to paste?",
+    event="Live Cards: event name for the title, e.g. PFO Live Card 7",
+    starts="Live Cards: when the card starts, UK time, e.g. 07/11/2026 20:00"
 )
 @app_commands.choices(
     signup_type=[
@@ -1716,7 +1720,9 @@ async def signuptimes(
 )
 async def signuppaste(
     interaction: discord.Interaction,
-    signup_type: app_commands.Choice[str]
+    signup_type: app_commands.Choice[str],
+    event: str = None,
+    starts: str = None
 ):
 
     if not is_staff(interaction):
@@ -1790,11 +1796,26 @@ async def signuppaste(
             f"**{number}.** {fighter_link}"
         )
 
+    title = SIGNUP_INFO[signup_type_value]["title"]
+    header = []
+
+    # Live Cards: optional event name and start time.
+    if signup_type_value == "live_card":
+
+        if event and event.strip():
+            title = f"{event.strip()} Sign-Ups"
+
+        if starts and starts.strip():
+            moment = parse_event_datetime(starts)
+            if moment:
+                stamp = int(moment.timestamp())
+                header = [f"🗓️ **Card starts:** <t:{stamp}:F> (<t:{stamp}:R>)", ""]
+            else:
+                header = [f"🗓️ **Card starts:** {starts.strip()[:100]}", ""]
+
     embed = discord.Embed(
-        title=SIGNUP_INFO[
-            signup_type_value
-        ]["title"],
-        description="\n".join(lines),
+        title=title,
+        description="\n".join(header + lines)[:4096],
         color=PFO_GOLD,
         timestamp=discord.utils.utcnow()
     )
@@ -4138,6 +4159,14 @@ async def create_profile_embed(
             f"win{'s' if stats['title_wins'] != 1 else ''}"
         )
 
+    # Hall of Fame
+    try:
+        hof_number, _ = hof_entry(guild.id, member.id, member.display_name)
+        if hof_number:
+            description.insert(0, f"🏛️ **Hall of Fame** (#{hof_number})")
+    except Exception as error:
+        print(f"Profile Hall of Fame lookup failed: {error}")
+
     # Interim / BMF / WMF belts
     if member.id:
         try:
@@ -4290,6 +4319,32 @@ async def create_profile_embed(
         except Exception as error:
             print(f"Profile leaderboard lookup failed: {error}")
 
+    # Rivalries (2+ fights against the same person) and awards
+    rival_keys = set()
+
+    try:
+        rivals = rivalries_for(guild.id, member.id, member.display_name)
+        rival_keys = {fighter_key(rival["opponent_id"], rival["opponent_name"]) for rival in rivals}
+        rival_lines = rivalry_profile_lines(guild, member.id, member.display_name)
+        if rival_lines:
+            embed.add_field(name="⚔️ Rivalries", value="\n".join(rival_lines)[:1024], inline=False)
+    except Exception as error:
+        print(f"Profile rivalry lookup failed: {error}")
+
+    if member.id:
+        try:
+            award_rows = awards_for_member(guild.id, member.id)
+            if award_rows:
+                latest = award_rows[0]
+                embed.add_field(
+                    name="🏅 Awards",
+                    value=f"{award_counts_text(award_rows)}\n-# Latest: {AWARD_TYPES[latest['award']][0]}"
+                          + (f" at {latest['fight_event'] or latest['event']}"),
+                    inline=False
+                )
+        except Exception as error:
+            print(f"Profile awards lookup failed: {error}")
+
     # Last 5 fights, newest first
     recent = list(reversed(stats["fights"]))[:5]
 
@@ -4312,6 +4367,14 @@ async def create_profile_embed(
 
             if fight["title_fight"]:
                 extra += " 👑"
+
+            if fight_is_win_for(fight, member.id, member.display_name):
+                opp_key = fighter_key(fight["loser_id"], fight["loser_name"])
+            else:
+                opp_key = fighter_key(fight["winner_id"], fight["winner_name"])
+
+            if opp_key in rival_keys:
+                opp += " ⚔️"
 
             lines.append(
                 f"{fight_line_tag(fight, member.id, member.display_name)} vs {opp} — "
@@ -4348,7 +4411,8 @@ def create_result_embed(
     fight: dict,
     before: dict,
     after: dict,
-    logged_by_name: str
+    logged_by_name: str,
+    extra_line: str = None
 ):
     """
     before / after: {"winner": "6-0-0", "loser": "4-2-0"}
@@ -4390,6 +4454,9 @@ def create_result_embed(
 
     if fight.get("round") and method not in ("DRAW", "NC"):
         lines.append(f"**Round:** {fight['round']}")
+
+    if extra_line:
+        lines += ["", extra_line]
 
     lines += [
         "",
@@ -4885,13 +4952,20 @@ async def result(
             "loser": stats_record(get_fighter_stats(guild_id, loser_id, loser_name)),
         }
 
+        try:
+            rivalry = rivalry_result_line(guild_id, fight)
+        except Exception as error:
+            print(f"Rivalry line failed: {error}")
+            rivalry = None
+
         await interaction.followup.send(
             embed=create_result_embed(
                 fight_id,
                 fight,
                 before,
                 after,
-                interaction.user.display_name
+                interaction.user.display_name,
+                rivalry
             )
         )
 
@@ -8718,6 +8792,7 @@ LEADERBOARD_CHOICES = [
     app_commands.Choice(name="Stats: knockdowns", value="knockdowns"),
     app_commands.Choice(name="Wins as favourite", value="favwins"),
     app_commands.Choice(name="Wins as underdog", value="dogwins"),
+    app_commands.Choice(name="Most awards (FOTN / POTN / KOTN)", value="awards"),
 ]
 
 LEADERBOARD_TITLES = {
@@ -8739,6 +8814,7 @@ LEADERBOARD_TITLES = {
     "knockdowns": "💫 Most Knockdowns",
     "favwins": "⭐ Wins as Favourite",
     "dogwins": "🐶 Wins as Underdog",
+    "awards": "🏅 Most Awards",
 }
 
 # Short names used on /profile for top 3 spots.
@@ -8748,6 +8824,7 @@ LEADERBOARD_SHORT = {
     "strikes": "Strikes landed", "sigstrikes": "Significant strikes", "sigacc": "Striking accuracy",
     "takedowns": "Takedowns", "tdacc": "Takedown accuracy", "control": "Control time",
     "knockdowns": "Knockdowns", "favwins": "Wins as favourite", "dogwins": "Wins as underdog",
+    "awards": "Most awards",
 }
 
 STATS_MIN_FIGHTS = 1       # fights with stats needed for the accuracy boards (1 = show straight away)
@@ -9006,6 +9083,8 @@ def leaderboard_rows(guild: discord.Guild, category: str, cache: dict = None):
         return stats_leaderboard(guild, category)
     if category in ("favwins", "dogwins"):
         return odds_leaderboard(guild, category)
+    if category == "awards":
+        return awards_leaderboard(guild)
     return fighter_leaderboard(guild, category, cache)
 
 
@@ -9133,6 +9212,7 @@ async def leaderboard(
         "knockdowns": "From /addstrikes fight stats",
         "favwins": "Favourite = shorter betting odds when betting closed • fights with betting only",
         "dogwins": "Underdog = longer betting odds when betting closed • fights with betting only",
+        "awards": "Fight / Performance / Knockout of the Night logged with /awards",
     }
 
     embed.set_footer(
@@ -13891,6 +13971,14 @@ def recap_fight_line(
     else:
         line = f"{belt}**{winner}** def. **{loser}** · {fight_method_text(fight)}{weight}"
 
+    try:
+        badges = award_badges(guild.id, fight["id"])
+    except Exception:
+        badges = ""
+
+    if badges:
+        line += f" · {badges}"
+
     division = fight["division"] or "the"
 
     if outcome == "new":
@@ -17942,8 +18030,9 @@ def tale_of_the_tape_embed(
         )
 
         embed.add_field(
-            name="Head to head",
-            value=f"**{a_wins}-{b_wins}** · last fight: {last_text}" + (f" ({last['event']})" if last["event"] else ""),
+            name="⚔️ Rivalry" if len(meetings) >= RIVALRY_MIN_FIGHTS else "Head to head",
+            value=f"**{a_wins}-{b_wins}** · last fight: {last_text}" + (f" ({last['event']})" if last["event"] else "")
+            + (f"\n-# This one is the {rivalry_count_name(len(meetings) + 1)}" if len(meetings) >= 1 else ""),
             inline=False
         )
     else:
@@ -19872,6 +19961,1044 @@ async def transferfighter(
 
 
 # ============================================================
+# RIVALRIES
+#
+# Any two fighters who have fought each other 2+ times. Shown on
+# /profile, on /result when they meet again, in the Tale of the
+# Tape and on the website.
+# ============================================================
+
+RIVALRY_MIN_FIGHTS = 2
+
+
+def rivalries_for(guild_id: int, user_id: int, name: str = None):
+    """[{opponent_id, opponent_name, wins, losses, draws, fights, last}] most fights first, then most recent."""
+
+    found = {}
+
+    for fight in get_fighter_fights(guild_id, user_id, name):
+
+        if fight["winner_id"] == user_id:
+            opp_id, opp_name = fight["loser_id"], fight["loser_name"]
+        else:
+            opp_id, opp_name = fight["winner_id"], fight["winner_name"]
+
+        key = fighter_key(opp_id, opp_name)
+        entry = found.setdefault(key, {"opponent_id": opp_id, "opponent_name": opp_name,
+                                       "wins": 0, "losses": 0, "draws": 0, "fights": 0, "last": None})
+        entry["fights"] += 1
+        entry["last"] = fight
+
+        if fight["method"] in ("DRAW", "NC"):
+            entry["draws"] += 1
+        elif fight_is_win_for(fight, user_id, name):
+            entry["wins"] += 1
+        else:
+            entry["losses"] += 1
+
+    rivals = [entry for entry in found.values() if entry["fights"] >= RIVALRY_MIN_FIGHTS]
+    rivals.sort(key=lambda entry: (entry["fights"], entry["last"]["id"]), reverse=True)
+
+    return rivals
+
+
+def rivalry_count_name(count: int):
+    if count in (2, 3):
+        return {2: "rematch", 3: "trilogy fight"}[count]
+    suffix = "th" if 10 <= count % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(count % 10, "th")
+    return f"{count}{suffix} meeting"
+
+
+def rivalry_result_line(guild_id: int, fight: dict):
+    """'⚔️ Rivalry: Reyes now leads 2-1 (trilogy fight)' after a result, or None."""
+
+    a, b = fight.get("winner_id"), fight.get("loser_id")
+
+    if not a or not b:
+        return None
+
+    meetings = head_to_head(guild_id, a, b)
+
+    if len(meetings) < RIVALRY_MIN_FIGHTS:
+        return None
+
+    a_wins = sum(1 for f in meetings if f["winner_id"] == a and f["method"] not in ("DRAW", "NC"))
+    b_wins = sum(1 for f in meetings if f["winner_id"] == b and f["method"] not in ("DRAW", "NC"))
+    name_a = name_without_record(fight["winner_name"]).split()[-1] if fight.get("winner_name") else "Winner"
+    name_b = name_without_record(fight["loser_name"]).split()[-1] if fight.get("loser_name") else "Loser"
+
+    if a_wins == b_wins:
+        standing = f"level at **{a_wins}-{b_wins}**"
+    elif a_wins > b_wins:
+        standing = f"{name_a} {'now leads' if fight.get('method') not in ('DRAW', 'NC') else 'leads'} **{a_wins}-{b_wins}**"
+    else:
+        standing = f"{name_b} still leads **{b_wins}-{a_wins}**"
+
+    return f"⚔️ **Rivalry:** {standing} ({rivalry_count_name(len(meetings))})"
+
+
+def rivalry_profile_lines(guild: discord.Guild, user_id: int, name: str = None, limit: int = 3):
+
+    lines = []
+
+    for rival in rivalries_for(guild.id, user_id, name)[:limit]:
+
+        opp = fight_display_name(guild, rival["opponent_id"], rival["opponent_name"])
+        last = rival["last"]
+
+        if last["method"] in ("DRAW", "NC"):
+            last_text = "Draw" if last["method"] == "DRAW" else "NC"
+        else:
+            last_text = ("W" if fight_is_win_for(last, user_id, name) else "L") + f" by {fight_method_text(last)}"
+
+        if rival["wins"] > rival["losses"]:
+            state = "leads"
+        elif rival["wins"] < rival["losses"]:
+            state = "trails"
+        else:
+            state = "level"
+
+        record = f"{rival['wins']}-{rival['losses']}" + (f"-{rival['draws']}" if rival["draws"] else "")
+        event = f", {last['event']}" if last["event"] else ""
+        lines.append(f"**{opp}** · **{record}** ({state} · {rival['fights']} fights · last: {last_text}{event})")
+
+    return lines
+
+
+# ============================================================
+# AWARDS: FOTN, POTN, KOTN
+#
+# /awards event:…   log Fight of the Night, Performance of the Night
+#                   and Knockout of the Night for an event (as many
+#                   as you like). Only logged: staff post and pay
+#                   coins themselves. Shows on /profile, /myawards,
+#                   recaps, the website and the "Most awards" board.
+# /myawards         anyone: your awards (or someone else's)
+# ============================================================
+
+AWARD_TYPES = {
+    "fotn": ("Fight of the Night", "🔥"),
+    "potn": ("Performance of the Night", "⭐"),
+    "kotn": ("Knockout of the Night", "💥"),
+}
+
+
+def setup_award_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS fight_awards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            award TEXT NOT NULL,
+            fight_id INTEGER NOT NULL,
+            user_id INTEGER,
+            added_by INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def awards_for_event(guild_id: int, event: str):
+    key = event_key(event)
+    return [
+        row for row in discipline_query("SELECT * FROM fight_awards WHERE guild_id = ? ORDER BY id", (guild_id,))
+        if event_key(row["event"]) == key
+    ]
+
+
+def awards_for_fight(guild_id: int, fight_id: int):
+    try:
+        return discipline_query("SELECT * FROM fight_awards WHERE guild_id = ? AND fight_id = ? ORDER BY id", (guild_id, fight_id))
+    except sqlite3.OperationalError:
+        return []
+
+
+def awards_for_member(guild_id: int, user_id: int):
+    """Every award this fighter has: POTN/KOTN given to them, FOTN for fights they were in. Newest first."""
+
+    try:
+        rows = discipline_query("""
+            SELECT fight_awards.*, fights.winner_id, fights.loser_id, fights.winner_name, fights.loser_name,
+                   fights.method, fights.round, fights.event AS fight_event
+            FROM fight_awards JOIN fights ON fights.id = fight_awards.fight_id
+            WHERE fight_awards.guild_id = ?
+            ORDER BY fight_awards.id DESC
+        """, (guild_id,))
+    except sqlite3.OperationalError:
+        return []
+
+    return [
+        row for row in rows
+        if row["user_id"] == user_id or (row["award"] == "fotn" and user_id in (row["winner_id"], row["loser_id"]))
+    ]
+
+
+def award_counts_text(rows):
+    counts = {key: 0 for key in AWARD_TYPES}
+    for row in rows:
+        counts[row["award"]] += 1
+    return " · ".join(f"{AWARD_TYPES[key][1]} {key.upper()} ×{count}" for key, count in counts.items() if count)
+
+
+def award_fight_text(guild: discord.Guild, row, fight=None):
+
+    fight = fight or row
+    winner = fight_display_name(guild, fight["winner_id"], fight["winner_name"])
+    loser = fight_display_name(guild, fight["loser_id"], fight["loser_name"])
+    how = fight_method_text(fight) if fight["method"] not in ("DRAW", "NC") else ("Draw" if fight["method"] == "DRAW" else "No contest")
+
+    if row["award"] == "fotn":
+        return f"**{winner}** vs **{loser}** · {how}"
+
+    who = fight_display_name(guild, row["user_id"], winner)
+    other = loser if row["user_id"] == fight["winner_id"] else winner
+    return f"**{who}** · vs {other}, {how}"
+
+
+def award_badges(guild_id: int, fight_id: int):
+    """'🔥 FOTN · 💥 KOTN' for a recap line, or ''."""
+    seen = []
+    for row in awards_for_fight(guild_id, fight_id):
+        tag = f"{AWARD_TYPES[row['award']][1]} {row['award'].upper()}"
+        if tag not in seen:
+            seen.append(tag)
+    return " · ".join(seen)
+
+
+async def recent_event_autocomplete(interaction: discord.Interaction, current: str):
+    return [
+        app_commands.Choice(name=name[:100], value=name[:100])
+        for name in recent_events(interaction.guild.id)[:50]
+        if current.lower() in name.lower()
+    ][:25]
+
+
+class AwardsPanel(
+    discord.ui.View
+):
+
+    def __init__(self, guild: discord.Guild, staff_id: int, event: str):
+        super().__init__(timeout=1800)
+        self.guild = guild
+        self.staff_id = staff_id
+        self.event = event
+        self.award = "fotn"
+        self.pick = None
+        self.build()
+
+    def fights(self):
+        return event_fights(self.guild.id, self.event)
+
+    def embed(self, note: str = None):
+
+        rows = awards_for_event(self.guild.id, self.event)
+        fights = {fight["id"]: fight for fight in self.fights()}
+        lines = []
+
+        for key, (label, icon) in AWARD_TYPES.items():
+            given = [row for row in rows if row["award"] == key]
+            if given:
+                lines.append(f"**{icon} {label}**")
+                lines += [f"• {award_fight_text(self.guild, row, fights.get(row['fight_id']))}" for row in given if row["fight_id"] in fights]
+                lines.append("")
+
+        if not lines:
+            lines = ["Nothing logged yet. Pick an award and a fight below, then press **Add**.", ""]
+
+        lines.append("-# Logged only: nothing is posted and no coins are given.")
+
+        if note:
+            lines = [note, ""] + lines
+
+        embed = discord.Embed(title=f"{self.event} · Awards", description="\n".join(lines)[:4000], color=PFO_GOLD)
+        embed.set_author(name="PFO • AWARDS", icon_url=asset_url(LOGO_FILE))
+        return embed
+
+    def build(self):
+
+        self.clear_items()
+        fights = self.fights()
+
+        kind = discord.ui.Select(
+            placeholder="1) Award",
+            options=[
+                discord.SelectOption(label=label, value=key, emoji=icon, default=key == self.award)
+                for key, (label, icon) in AWARD_TYPES.items()
+            ],
+            row=0
+        )
+        kind.callback = self.choose_award
+        self.add_item(kind)
+
+        options = []
+        for fight in fights[-25:]:
+            winner = fight_display_name(self.guild, fight["winner_id"], fight["winner_name"])
+            loser = fight_display_name(self.guild, fight["loser_id"], fight["loser_name"])
+            if self.award == "fotn":
+                label = f"{winner} vs {loser}"
+                value = f"{fight['id']}|"
+            else:
+                if fight["method"] in ("DRAW", "NC") or not fight["winner_id"]:
+                    continue
+                label = f"{winner} (def. {loser})"
+                value = f"{fight['id']}|{fight['winner_id']}"
+            options.append(discord.SelectOption(
+                label=label[:100], value=value, description=fight_method_text(fight)[:100],
+                default=value == self.pick
+            ))
+
+        if options:
+            who = discord.ui.Select(
+                placeholder="2) Fight" if self.award == "fotn" else "2) Fighter",
+                options=options, row=1
+            )
+            who.callback = self.choose_fight
+            self.add_item(who)
+
+        add = discord.ui.Button(label="Add", emoji="➕", style=discord.ButtonStyle.green, row=2, disabled=not self.pick)
+        add.callback = self.add
+        self.add_item(add)
+
+        existing = awards_for_event(self.guild.id, self.event)
+        if existing:
+            remove = discord.ui.Select(
+                placeholder="Remove one…",
+                options=[
+                    discord.SelectOption(
+                        label=f"{row['award'].upper()} · " + (
+                            fight_display_name(self.guild, row["user_id"], "") if row["user_id"] else f"fight {row['fight_id']}"
+                        )[:90],
+                        value=str(row["id"])
+                    )
+                    for row in existing[-25:]
+                ],
+                row=3
+            )
+            remove.callback = self.remove
+            self.add_item(remove)
+
+        done = discord.ui.Button(label="Done", style=discord.ButtonStyle.grey, row=2)
+        done.callback = self.done
+        self.add_item(done)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.staff_id
+
+    async def choose_award(self, interaction):
+        self.award = interaction.data["values"][0]
+        self.pick = None
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def choose_fight(self, interaction):
+        self.pick = interaction.data["values"][0]
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def add(self, interaction):
+
+        fight_id, user_id = self.pick.split("|")
+        discipline_query(
+            "INSERT INTO fight_awards (guild_id, event, award, fight_id, user_id, added_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (self.guild.id, self.event, self.award, int(fight_id), int(user_id) if user_id else None,
+             interaction.user.id, now_utc()), write=True
+        )
+        label, icon = AWARD_TYPES[self.award]
+        self.pick = None
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(f"✅ Added {icon} **{label}**."), view=self)
+
+    async def remove(self, interaction):
+        discipline_query(
+            "DELETE FROM fight_awards WHERE id = ? AND guild_id = ?", (int(interaction.data["values"][0]), self.guild.id), write=True
+        )
+        self.build()
+        await interaction.response.edit_message(embed=self.embed("🗑️ Removed."), view=self)
+
+    async def done(self, interaction):
+        self.stop()
+        await interaction.response.edit_message(embed=self.embed("✅ Saved."), view=None)
+
+
+@bot.tree.command(
+    name="awards",
+    description="Log Fight / Performance / Knockout of the Night for an event."
+)
+@app_commands.describe(
+    event="The event (start typing its name)"
+)
+@app_commands.autocomplete(event=recent_event_autocomplete)
+async def awards(
+    interaction: discord.Interaction,
+    event: str
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can log awards.", ephemeral=True)
+        return
+
+    match = next((name for name in recent_events(interaction.guild.id) if event_key(name) == event_key(event)), None)
+
+    if not match:
+        await interaction.response.send_message(
+            "❌ No fights are logged under that event name yet. Log the results first, then add awards.", ephemeral=True
+        )
+        return
+
+    panel = AwardsPanel(interaction.guild, interaction.user.id, match)
+    await interaction.response.send_message(embed=panel.embed(), view=panel, ephemeral=True)
+
+
+def myawards_embed(guild: discord.Guild, member):
+
+    rows = awards_for_member(guild.id, member.id)
+    name = name_without_record(member.display_name)
+
+    if not rows:
+        description = "No awards yet. Fight of the Night, Performance of the Night and Knockout of the Night all show here."
+    else:
+        lines = [f"**{award_counts_text(rows)}**", ""]
+        for row in rows[:20]:
+            label, icon = AWARD_TYPES[row["award"]]
+            lines.append(f"{icon} **{label}** · {row['fight_event'] or row['event']}\n-# {award_fight_text(guild, row)}")
+        if len(rows) > 20:
+            lines.append(f"…and {len(rows) - 20} more")
+        description = "\n".join(lines)
+
+    embed = discord.Embed(title=f"🏅 {name}'s awards", description=description[:4000], color=PFO_GOLD)
+    embed.set_author(name="PFO • AWARDS", icon_url=asset_url(LOGO_FILE))
+    avatar = getattr(member, "display_avatar", None)
+    if avatar:
+        embed.set_thumbnail(url=avatar.url)
+    return embed
+
+
+@bot.tree.command(
+    name="myawards",
+    description="Your Fight / Performance / Knockout of the Night awards."
+)
+@app_commands.describe(
+    member="See someone else's awards (optional)"
+)
+async def myawards(
+    interaction: discord.Interaction,
+    member: discord.Member = None
+):
+    target = member or interaction.user
+    await interaction.response.send_message(embed=myawards_embed(interaction.guild, target), ephemeral=True)
+
+
+def awards_leaderboard(guild: discord.Guild):
+
+    totals = {}
+
+    try:
+        rows = discipline_query("""
+            SELECT fight_awards.award, fight_awards.user_id, fights.winner_id, fights.loser_id
+            FROM fight_awards JOIN fights ON fights.id = fight_awards.fight_id WHERE fight_awards.guild_id = ?
+        """, (guild.id,))
+    except sqlite3.OperationalError:
+        return []
+
+    for row in rows:
+        people = (row["winner_id"], row["loser_id"]) if row["award"] == "fotn" else (row["user_id"],)
+        for user_id in people:
+            if user_id:
+                totals.setdefault(user_id, {key: 0 for key in AWARD_TYPES})[row["award"]] += 1
+
+    board = []
+    for user_id, counts in totals.items():
+        member = guild.get_member(user_id)
+        if not member:
+            continue
+        total = sum(counts.values())
+        text = f"{total} award{'s' if total != 1 else ''} (" + " · ".join(
+            f"{AWARD_TYPES[key][1]} {count}" for key, count in counts.items() if count
+        ) + ")"
+        board.append((member, total, text))
+
+    board.sort(key=lambda row: row[1], reverse=True)
+    return board
+
+
+# ============================================================
+# HALL OF FAME
+#
+# /halloffame add | edit | remove   (Moderator+)
+# /halloffame list                  (anyone)
+# Notes are written by staff, points split with |. Record, title
+# reigns, defences and belts are filled in by the bot.
+# ============================================================
+
+HOF_BANNER = "hall_of_fame.gif"
+
+
+def setup_hof_tables():
+
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS hall_of_fame (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER,
+            name TEXT NOT NULL,
+            notes TEXT NOT NULL,
+            inducted_at INTEGER NOT NULL,
+            added_by INTEGER
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def hall_of_fame(guild_id: int):
+    """Inductees in order (first inducted = #1)."""
+    try:
+        return discipline_query("SELECT * FROM hall_of_fame WHERE guild_id = ? ORDER BY inducted_at, id", (guild_id,))
+    except sqlite3.OperationalError:
+        return []
+
+
+def hof_entry(guild_id: int, user_id, name: str):
+    key = fighter_key(user_id, name)
+    for number, row in enumerate(hall_of_fame(guild_id), start=1):
+        if fighter_key(row["user_id"], row["name"]) == key:
+            return number, row
+    return None, None
+
+
+def hof_notes(row):
+    try:
+        return [note for note in json.loads(row["notes"]) if note]
+    except Exception:
+        return [row["notes"]] if row["notes"] else []
+
+
+def split_notes(text: str):
+    return [part.strip() for part in re.split(r"\s*\|\s*|\n", text or "") if part.strip()][:8]
+
+
+def hof_career(guild_id: int, user_id, name: str):
+    """Record, reigns, defences and belts won, for the Hall of Fame card."""
+
+    stats = get_fighter_stats(guild_id, user_id, name)
+    key = fighter_key(user_id, name)
+    reigns = defences = 0
+    belts = []
+
+    for division in DIVISION_NAMES:
+        mine = [reign for reign in title_lineage(guild_id, division)[0] if reign["key"] == key]
+        if mine:
+            reigns += len(mine)
+            defences += sum(reign["defences"] for reign in mine)
+            belts.append(division)
+
+    return {"record": stats_record(stats), "reigns": reigns, "defences": defences, "belts": belts}
+
+
+def hof_card_embed(guild: discord.Guild, number: int, row, inducted_now: bool = False):
+
+    career = hof_career(guild.id, row["user_id"], row["name"])
+    member = guild.get_member(row["user_id"]) if row["user_id"] else None
+    name = name_without_record(member.display_name) if member else row["name"]
+    notes = hof_notes(row)
+
+    lines = [f"*Inducted <t:{row['inducted_at']}:D>*", ""] + [f"◆ {note}" for note in notes]
+
+    embed = discord.Embed(
+        title=f"🏛️ {name} enters the Hall of Fame" if inducted_now else f"🏛️ {name}",
+        description="\n".join(lines)[:4000],
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    apply_branding(embed, banner_file=HOF_BANNER, author_text="PFO • HALL OF FAME", show_thumbnail=False)
+
+    avatar = getattr(member, "display_avatar", None) if member else None
+    if avatar:
+        embed.set_thumbnail(url=avatar.url)
+
+    embed.add_field(name="Record", value=f"**{career['record']}**", inline=True)
+    embed.add_field(name="Title reigns", value=f"**{career['reigns']}**", inline=True)
+    embed.add_field(name="Defences", value=f"**{career['defences']}**", inline=True)
+
+    if career["belts"]:
+        embed.add_field(name="Belts held", value=" · ".join(f"👑 {belt}" for belt in career["belts"]), inline=False)
+
+    embed.set_footer(text=f"Prestige Fighting Organisation • Hall of Fame #{number}", icon_url=asset_url(LOGO_FILE))
+    return embed
+
+
+def hof_list_embed(guild: discord.Guild):
+
+    rows = hall_of_fame(guild.id)
+    lines = []
+
+    for number, row in enumerate(rows, start=1):
+        member = guild.get_member(row["user_id"]) if row["user_id"] else None
+        name = name_without_record(member.display_name) if member else row["name"]
+        record = hof_career(guild.id, row["user_id"], row["name"])["record"]
+        lines.append(f"`#{number}` **{name}** · {record}\n-# {' · '.join(hof_notes(row))}")
+
+    embed = discord.Embed(
+        title="🏛️ PFO Hall of Fame",
+        description="\n\n".join(lines)[:4000] if lines else "Nobody has been inducted yet.",
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    apply_branding(embed, author_text="PFO • HALL OF FAME")
+    embed.set_footer(text=f"{plural(len(rows), 'inductee')}", icon_url=asset_url(LOGO_FILE))
+    return embed
+
+
+@bot.tree.command(
+    name="halloffame",
+    description="The PFO Hall of Fame: add, edit or remove an inductee (Moderator+), or see the list."
+)
+@app_commands.describe(
+    action="What to do",
+    fighter="The fighter",
+    fighter_left="A fighter who has LEFT the server: user ID or name",
+    notes="Their achievements, split with | e.g. First Triple Champ | 10-0 perfect record"
+)
+@app_commands.choices(
+    action=[
+        app_commands.Choice(name="List", value="list"),
+        app_commands.Choice(name="Show one", value="show"),
+        app_commands.Choice(name="Add", value="add"),
+        app_commands.Choice(name="Edit notes", value="edit"),
+        app_commands.Choice(name="Remove", value="remove"),
+    ]
+)
+async def halloffame(
+    interaction: discord.Interaction,
+    action: app_commands.Choice[str],
+    fighter: discord.Member = None,
+    fighter_left: str = None,
+    notes: str = None
+):
+
+    guild = interaction.guild
+
+    if action.value == "list":
+        await interaction.response.send_message(embed=hof_list_embed(guild))
+        return
+
+    if action.value in ("add", "edit", "remove") and not is_moderator_plus(interaction):
+        await interaction.response.send_message(f"❌ {MODERATOR_ONLY_TEXT} can change the Hall of Fame.", ephemeral=True)
+        return
+
+    if fighter:
+        user_id, name = fighter.id, name_without_record(fighter.display_name)
+    elif fighter_left:
+        try:
+            user_id, name, _ = await resolve_left_fighter(guild, fighter_left)
+        except FighterInputError as error:
+            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            return
+        name = name_without_record(name)
+    else:
+        await interaction.response.send_message("❌ Pick the fighter (or use fighter_left).", ephemeral=True)
+        return
+
+    number, row = hof_entry(guild.id, user_id, name)
+
+    if action.value == "show":
+        if not row:
+            await interaction.response.send_message(f"ℹ️ **{name}** isn't in the Hall of Fame.", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=hof_card_embed(guild, number, row))
+        return
+
+    if action.value == "add":
+
+        if row:
+            await interaction.response.send_message(
+                f"ℹ️ **{name}** is already in the Hall of Fame (#{number}). Use **Edit notes** to change their notes.",
+                ephemeral=True
+            )
+            return
+
+        points = split_notes(notes)
+
+        if not points:
+            await interaction.response.send_message(
+                "❌ Add some notes, split with |, e.g. `First Triple Champ | 10-0 perfect record`.", ephemeral=True
+            )
+            return
+
+        discipline_query(
+            "INSERT INTO hall_of_fame (guild_id, user_id, name, notes, inducted_at, added_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (guild.id, user_id, name, json.dumps(points), int(time.time()), interaction.user.id), write=True
+        )
+        number, row = hof_entry(guild.id, user_id, name)
+        await interaction.response.send_message(embed=hof_card_embed(guild, number, row, inducted_now=True))
+        return
+
+    if not row:
+        await interaction.response.send_message(f"ℹ️ **{name}** isn't in the Hall of Fame.", ephemeral=True)
+        return
+
+    if action.value == "edit":
+        points = split_notes(notes)
+        if not points:
+            await interaction.response.send_message("❌ Write the new notes, split with |.", ephemeral=True)
+            return
+        discipline_query("UPDATE hall_of_fame SET notes = ? WHERE id = ?", (json.dumps(points), row["id"]), write=True)
+        number, row = hof_entry(guild.id, user_id, name)
+        await interaction.response.send_message("✏️ Notes updated.", embed=hof_card_embed(guild, number, row), ephemeral=True)
+        return
+
+    discipline_query("DELETE FROM hall_of_fame WHERE id = ?", (row["id"],), write=True)
+    await interaction.response.send_message(f"🗑️ **{name}** was removed from the Hall of Fame.", ephemeral=True)
+
+
+# ============================================================
+# MATCHMAKING
+#
+# /matchmaking  pick a sign-up list, untick anyone to leave out,
+#               then the bot suggests fair fights: same weight first,
+#               then closest rank and record, avoiding an immediate
+#               rematch. Open the result in the card builder.
+# ============================================================
+
+def fighter_weight_for_matching(guild: discord.Guild, user_id: int):
+
+    row = get_user_weight_class(guild.id, user_id)
+
+    if row:
+        return row["weight"]
+
+    member = guild.get_member(user_id)
+
+    if member:
+        for weight in division_weights():
+            role = weight_role(guild, weight)
+            if role and any(getattr(r, "id", None) == role.id for r in getattr(member, "roles", [])):
+                return weight
+
+    return None
+
+
+def matchmaking_profile(guild: discord.Guild, user_id: int):
+
+    stats = get_fighter_stats(guild.id, user_id)
+    weight = fighter_weight_for_matching(guild, user_id)
+    rank_row = get_user_ranking_in_division(guild.id, user_id, weight) if weight else None
+    fights = stats["wins"] + stats["losses"] + stats["draws"]
+    last = stats["fights"][-1] if stats["fights"] else None
+    last_opp = None
+    if last:
+        last_opp = last["loser_id"] if last["winner_id"] == user_id else last["winner_id"]
+
+    return {
+        "id": user_id,
+        "weight": weight,
+        "rank": rank_row["rank"] if rank_row else None,
+        "win_rate": (stats["wins"] + stats["draws"] / 2) / fights if fights else 0.5,
+        "record": stats_record(stats),
+        "streak": stats["streak"],
+        "last_opp": last_opp,
+    }
+
+
+def suggest_fights(guild: discord.Guild, user_ids: list, shuffle: int = 0):
+    """Returns ({weight: [(a, b, reason)]}, [left over ids])."""
+
+    import random
+
+    rng = random.Random(shuffle) if shuffle else None
+    profiles = [matchmaking_profile(guild, user_id) for user_id in user_ids]
+    groups = {}
+
+    for profile in profiles:
+        groups.setdefault(profile["weight"], []).append(profile)
+
+    order = [weight for weight in division_weights() if weight in groups] + ([None] if None in groups else [])
+    result = {}
+    leftovers = []
+
+    def rank_value(profile):
+        return profile["rank"] if profile["rank"] is not None else 20
+
+    def cost(a, b):
+        value = abs(rank_value(a) - rank_value(b)) + abs(a["win_rate"] - b["win_rate"]) * 10
+        if a["last_opp"] == b["id"] or b["last_opp"] == a["id"]:
+            value += 100
+        if rng:
+            value += rng.random() * 6
+        return value
+
+    for weight in order:
+
+        pool = sorted(groups[weight], key=lambda p: (rank_value(p), -p["win_rate"]))
+        if rng:
+            rng.shuffle(pool)
+            pool.sort(key=lambda p: rank_value(p) + rng.random() * 4)
+
+        pairs = []
+
+        while len(pool) >= 2:
+            first = pool.pop(0)
+            best = min(pool, key=lambda other: cost(first, other))
+            pool.remove(best)
+            pairs.append((first, best))
+
+        leftovers += [profile["id"] for profile in pool]
+        result[weight] = [(a["id"], b["id"], matchmaking_reason(guild, a, b)) for a, b in pairs]
+
+    return result, leftovers
+
+
+def matchmaking_reason(guild: discord.Guild, a, b):
+
+    bits = []
+
+    if a["rank"] is not None and b["rank"] is not None:
+        if abs(a["rank"] - b["rank"]) <= 3:
+            bits.append("close in rank")
+    elif a["rank"] is None and b["rank"] is None:
+        bits.append("both unranked")
+
+    if abs(a["win_rate"] - b["win_rate"]) <= 0.15:
+        bits.append("similar records")
+
+    if a["streak"] and a["streak"] == b["streak"] and a["streak"].startswith("W"):
+        bits.append(f"both on {a['streak']} streaks")
+
+    meetings = head_to_head(guild.id, a["id"], b["id"])
+    if meetings:
+        last = meetings[-1]
+        winner = fight_display_name(guild, last["winner_id"], last["winner_name"])
+        bits.append(f"met before ({winner} won{', ' + last['event'] if last['event'] else ''})")
+
+    text = " · ".join(bits)
+    return text[:1].upper() + text[1:] if text else ""
+
+
+class MatchmakingView(
+    discord.ui.View
+):
+
+    def __init__(self, guild: discord.Guild, staff_id: int, signup_type: str, signup_ids: list):
+        super().__init__(timeout=1800)
+        self.guild = guild
+        self.staff_id = staff_id
+        self.signup_type = signup_type
+        self.signup_ids = signup_ids
+        self.included = set(signup_ids)
+        self.suggested = None
+        self.leftovers = []
+        self.shuffle = 0
+        self.show_picker()
+
+    def name(self, user_id):
+        member = self.guild.get_member(user_id)
+        return name_without_record(member.display_name) if member else f"User {user_id}"
+
+    def picker_embed(self):
+        title = SIGNUP_LABELS[self.signup_type].title()
+        embed = discord.Embed(
+            title="Who should I match up?",
+            description=(
+                f"**{title}** sign-ups: **{len(self.signup_ids)}** · **{len(self.included)}** included\n\n"
+                "Untick anyone you don't want on this card, then press **Suggest fights**."
+            ),
+            color=PFO_GOLD
+        )
+        embed.set_author(name="PFO • MATCHMAKING", icon_url=asset_url(LOGO_FILE))
+        embed.set_footer(text="Only you can see this • nothing is posted")
+        return embed
+
+    def show_picker(self):
+
+        self.clear_items()
+
+        for index in range(0, min(len(self.signup_ids), 100), 25):
+            chunk = self.signup_ids[index:index + 25]
+            menu = discord.ui.Select(
+                placeholder=f"Fighters {index + 1}-{index + len(chunk)} (ticked = included)",
+                options=[
+                    discord.SelectOption(label=self.name(user_id)[:100], value=str(user_id), default=user_id in self.included)
+                    for user_id in chunk
+                ],
+                min_values=0, max_values=len(chunk), row=index // 25
+            )
+            menu.callback = self.make_pick(chunk)
+            self.add_item(menu)
+
+        go = discord.ui.Button(label="Suggest fights", emoji="🧩", style=discord.ButtonStyle.green, row=4,
+                               disabled=len(self.included) < 2)
+        go.callback = self.suggest
+        self.add_item(go)
+
+    def make_pick(self, chunk):
+        async def callback(interaction):
+            chosen = {int(value) for value in interaction.data.get("values", [])}
+            for user_id in chunk:
+                if user_id in chosen:
+                    self.included.add(user_id)
+                else:
+                    self.included.discard(user_id)
+            self.show_picker()
+            await interaction.response.edit_message(embed=self.picker_embed(), view=self)
+        return callback
+
+    def ordered_pairs(self):
+        return [(a, b) for weight in self.suggested for a, b, _ in self.suggested[weight]]
+
+    def suggestions_embed(self):
+
+        embed = discord.Embed(
+            title=f"Suggested fights · {SIGNUP_LABELS[self.signup_type].title()}",
+            description=(
+                f"From **{len(self.included)}** chosen fighters"
+                + (f" ({len(self.signup_ids) - len(self.included)} left out)" if len(self.included) < len(self.signup_ids) else "")
+                + "\nSame weight first, then closest rank and record. Nobody fights their last opponent if it can be avoided."
+            ),
+            color=PFO_GOLD
+        )
+        embed.set_author(name="PFO • MATCHMAKING", icon_url=asset_url(LOGO_FILE))
+
+        number = 0
+        for weight, pairs in self.suggested.items():
+            if not pairs:
+                continue
+            lines = []
+            for a, b, reason in pairs:
+                number += 1
+                pa, pb = matchmaking_profile(self.guild, a), matchmaking_profile(self.guild, b)
+                tag_a = f" #{pa['rank']}" if pa["rank"] else (" C" if pa["rank"] == 0 else "")
+                tag_b = f" #{pb['rank']}" if pb["rank"] else (" C" if pb["rank"] == 0 else "")
+                lines.append(f"`{number:>2}` **{self.name(a)}**{tag_a} ({pa['record']})  vs  **{self.name(b)}**{tag_b} ({pb['record']})"
+                             + (f"\n-# {reason}" if reason else ""))
+            text = "\n".join(lines)
+            embed.add_field(name=weight or "Weight unknown", value=text[:1024], inline=False)
+
+        if self.leftovers:
+            embed.add_field(
+                name="No match yet",
+                value="-# " + ", ".join(self.name(user_id) for user_id in self.leftovers)[:1000],
+                inline=False
+            )
+
+        embed.set_footer(text="Suggestions only • change anything in the card builder")
+        return embed
+
+    def show_suggestions(self):
+
+        self.clear_items()
+        buttons = [
+            ("Open in card builder", "🥊", discord.ButtonStyle.green, self.open_builder),
+            ("Shuffle suggestions", "🔀", discord.ButtonStyle.grey, self.reshuffle),
+            ("Copy as text", "📋", discord.ButtonStyle.grey, self.copy),
+            ("Back", None, discord.ButtonStyle.grey, self.back),
+        ]
+        for label, emoji, style, callback in buttons:
+            button = discord.ui.Button(label=label, emoji=emoji, style=style, disabled=label == "Open in card builder" and not self.ordered_pairs())
+            button.callback = callback
+            self.add_item(button)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.staff_id
+
+    async def suggest(self, interaction):
+        ids = [user_id for user_id in self.signup_ids if user_id in self.included]
+        self.suggested, self.leftovers = suggest_fights(self.guild, ids, self.shuffle)
+        self.show_suggestions()
+        await interaction.response.edit_message(embed=self.suggestions_embed(), view=self)
+
+    async def reshuffle(self, interaction):
+        self.shuffle += 1
+        await self.suggest(interaction)
+
+    async def back(self, interaction):
+        self.show_picker()
+        await interaction.response.edit_message(embed=self.picker_embed(), view=self)
+
+    async def copy(self, interaction):
+        lines = []
+        for weight, pairs in self.suggested.items():
+            if pairs:
+                lines.append(weight or "Weight unknown")
+                lines += [f"{self.name(a)} vs {self.name(b)}" for a, b, _ in pairs]
+                lines.append("")
+        await interaction.response.send_message("```\n" + "\n".join(lines).strip()[:1900] + "\n```", ephemeral=True)
+
+    async def open_builder(self, interaction):
+
+        signup_type = self.signup_type
+        event = f"PFO {SIGNUP_LABELS[signup_type].title()} {datetime.now(timezone.utc):%d/%m/%Y}"
+
+        try:
+            draft_id = create_card_draft(self.guild.id, interaction.user.id, event, self.signup_ids, signup_type, True)
+        except Exception as error:
+            print(f"Could not create card draft: {error}")
+            draft_id = None
+
+        builder = CardBuilderView(interaction.user.id, self.guild, event, self.signup_ids, signup_type, True, draft_id)
+        builder.pairs = self.ordered_pairs()
+        builder.rebuild()
+        builder.save_draft()
+
+        await interaction.response.edit_message(content="🥊 Opened in the card builder below.", embed=self.suggestions_embed(), view=None)
+        await interaction.followup.send(
+            content="🧩 Built from **/matchmaking**. Change anything, then press **Save card** or **Copy as text**.\n"
+                    "👥 Any staff member can use this panel at the same time.",
+            embed=builder.embed(),
+            view=builder
+        )
+
+
+@bot.tree.command(
+    name="matchmaking",
+    description="Suggest fair fights from a sign-up list (pick who to include)."
+)
+@app_commands.describe(
+    sign_ups="Which sign-up list to use"
+)
+@app_commands.choices(
+    sign_ups=[
+        app_commands.Choice(name="Fight Night", value="fight_night"),
+        app_commands.Choice(name="Live Card", value="live_card"),
+    ]
+)
+async def matchmaking(
+    interaction: discord.Interaction,
+    sign_ups: app_commands.Choice[str]
+):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can use matchmaking.", ephemeral=True)
+        return
+
+    session = get_latest_signup_session(interaction.guild.id, sign_ups.value)
+
+    if not session:
+        await interaction.response.send_message(f"❌ There's no {SIGNUP_INFO[sign_ups.value]['title']} sign-up yet.", ephemeral=True)
+        return
+
+    signup_ids = []
+    for row in get_signups(session["id"]):
+        member = interaction.guild.get_member(row["discord_user_id"])
+        if member and not member.bot and member.id not in signup_ids:
+            signup_ids.append(member.id)
+
+    if len(signup_ids) < 2:
+        await interaction.response.send_message("❌ Fewer than 2 people are signed up.", ephemeral=True)
+        return
+
+    view = MatchmakingView(interaction.guild, interaction.user.id, sign_ups.value, signup_ids)
+    note = "\n\n⚠️ Only the first 100 sign-ups can be picked here." if len(signup_ids) > 100 else ""
+    embed = view.picker_embed()
+    embed.description += note
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ============================================================
 # RANKINGS UPDATES
 #
 # Posted by itself in the fighter news channel (any channel with
@@ -20542,6 +21669,8 @@ async def setup_hook():
     setup_auto_rank_tables()
     setup_stat_override_tables()
     setup_card_section_columns()
+    setup_award_tables()
+    setup_hof_tables()
 
     # Buttons first, so they work even if the sync below fails.
     restore_signup_buttons()
