@@ -46,7 +46,7 @@ except ImportError:  # only when testing without discord.py installed
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "9"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "10"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -641,7 +641,8 @@ def render_home(ctx):
             w = fighter_name(ctx, fight["winner_id"], fight["winner_name"])
             l = fighter_name(ctx, fight["loser_id"], fight["loser_name"])
             joiner = "vs" if fight["method"] in ("DRAW", "NC") else "def."
-            belt = '<span class="tick-belt">TITLE</span>' if fight["title_fight"] else ""
+            belt = (f'<span class="tick-belt">{"INTERIM" if row_get(fight, "interim") else "TITLE"}</span>'
+                    if fight["title_fight"] else "")
             parts.append(
                 f'<span class="tick">{belt}<b>{esc(w)}</b><span class="tick-dim">{joiner}</span>{esc(l)}'
                 f'<span class="tick-m {method_class(fight["method"])}">{esc(method_short(ctx, fight))}</span></span>'
@@ -800,6 +801,32 @@ def render_home(ctx):
       <div class="btns rv3">{discord_button('Sign up in the Discord', 'btn-gold-solid')}</div>
     </section>"""
 
+    # ---------- spotlight (bought in the /shop) ----------
+    spotlight_html = ""
+    spot_fn = getattr(ctx, "active_spotlights", None)
+    seen_spots = []
+    for row in (spot_fn(ctx.gid) if spot_fn else []):
+        if row["user_id"] in seen_spots:
+            continue
+        seen_spots.append(row["user_id"])
+    if seen_spots:
+        cards = ""
+        for i, uid in enumerate(seen_spots[:3]):
+            name = fighter_name(ctx, uid)
+            stats = stats_for(ctx, uid, cache)
+            cos = ctx.get_cosmetics(ctx.gid, uid) if getattr(ctx, "get_cosmetics", None) else {}
+            sub = " · ".join(x for x in (f"“{cos['nickname']}”" if cos.get("nickname") else "", cos.get("badge") or "") if x)
+            cards += f"""
+        <a href="{fighter_url(uid)}" class="spot {stagger(i)}">
+          {avatar_html(ctx, uid, name, 'av av-xl')}
+          <span class="spot-meta"><span class="eyebrow">SPOTLIGHT</span><span class="d spot-name">{esc(name)}</span>{f'<span class="muted">{esc(sub)}</span>' if sub else ''}</span>
+          <span class="d spot-rec">{esc(ctx.stats_record(stats) if stats else '')}</span>
+        </a>"""
+        spotlight_html = f"""
+    <section class="block" aria-label="Spotlight">
+      <div style="display:flex;flex-direction:column;gap:18px">{cards}</div>
+    </section>"""
+
     # ---------- champions ----------
     champ_cards = ""
     for i, champ in enumerate(champs):
@@ -895,6 +922,7 @@ def render_home(ctx):
 <div class="wrap">
   <section id="numbers" class="nums" aria-label="PFO in numbers">{numbers_html}</section>
   {event_html}
+  {spotlight_html}
   {champs_html}
   {results_html}
   {titles_html}
@@ -908,7 +936,10 @@ def result_row(ctx, fight, i=0, show_weight=True):
     w = fighter_name(ctx, fight["winner_id"], fight["winner_name"])
     l = fighter_name(ctx, fight["loser_id"], fight["loser_name"])
     joiner = "VS" if fight["method"] in ("DRAW", "NC") else "DEF."
-    belt = '<span class="belt" title="Title fight">TITLE</span>' if fight["title_fight"] else ""
+    if fight["title_fight"] and row_get(fight, "interim"):
+        belt = '<span class="belt" title="Interim title fight">INTERIM</span>'
+    else:
+        belt = '<span class="belt" title="Title fight">TITLE</span>' if fight["title_fight"] else ""
     weight = f'<span class="res-w">{esc((fight["division"] or "").upper())}</span>' if show_weight else ""
     award_fn = getattr(ctx, "awards_for_fight", None)
     awards = ""
@@ -1253,14 +1284,24 @@ def render_fighter(ctx, user_id):
     handle_html = (f'<span class="handle l-up"><span class="handle-l">DISCORD</span>@{esc(username)}</span>'
                    if username else "")
 
+    # Shop items: nickname, badge, quote and website style
+    cos_fn = getattr(ctx, "get_cosmetics", None)
+    cosmetics = cos_fn(ctx.gid, user_id) if cos_fn else {}
+    nick_html = f'<span class="fnick l-up">“{esc(cosmetics["nickname"])}”</span>' if cosmetics.get("nickname") else ""
+    quote_html = f'<blockquote class="fquote l-up">“{esc(cosmetics["quote"])}”</blockquote>' if cosmetics.get("quote") else ""
+    badge_html = f'<span class="fshopbadge">{esc(cosmetics["badge"].upper())}</span>' if cosmetics.get("badge") else ""
+    style_cls = f' fstyle-{esc(cosmetics["style"])}' if cosmetics.get("style") else ""
+
     hero = f"""
-<section class="fhero" aria-label="{esc(name)}">
+<section class="fhero{style_cls}" aria-label="{esc(name)}">
   <div class="fhero-mark s-mark" aria-hidden="true">{esc(last or first)}</div>
   <div class="wrap fhero-in s-fhero">
     <div class="fhero-main">
-      <div class="fhero-top l-badge">{avatar_html(ctx, user_id, name, 'av av-hero')}<span class="fbadge">{esc(badge)}</span></div>
+      <div class="fhero-top l-badge">{avatar_html(ctx, user_id, name, 'av av-hero')}<span class="fbadge">{esc(badge)}</span>{badge_html}</div>
       <h1 class="d fhero-name l-title">{esc(first)}{'<br>' + esc(last) if last else ''}</h1>
+      {nick_html}
       {handle_html}
+      {quote_html}
       <p class="muted l-up">{esc(' · '.join(meta))}</p>
       {leaderboard_badges(ctx, user_id)}
     </div>
@@ -1354,7 +1395,7 @@ def render_fighter(ctx, user_id):
             opp_id, opp_saved = fight["loser_id"], fight["loser_name"]
         else:
             opp_id, opp_saved = fight["winner_id"], fight["winner_name"]
-        method = method_short(ctx, fight) + (" · TITLE" if fight["title_fight"] else "")
+        method = method_short(ctx, fight) + ((" · INTERIM" if row_get(fight, "interim") else " · TITLE") if fight["title_fight"] else "")
         if rival_ids_for_rows and opp_id in rival_ids_for_rows:
             method += " · RIVALRY"
         rows += f"""
@@ -1380,14 +1421,14 @@ def render_fighter(ctx, user_id):
             if reign["user_id"] != user_id:
                 continue
             won = reign["won_fight"]
-            opp = fighter_name(ctx, won["loser_id"], won["loser_name"])
+            opp = fighter_name(ctx, won["loser_id"], won["loser_name"]) if won else None
             days = ctx.reign_days(reign)
             current = reign["end"] is None
             d = reign["defences"]
             reign_tiles += f"""
         <div class="reign{' reign-now' if current else ''} rv2">
           <span class="reign-tag">{esc(weight.upper())} · {'CURRENT' if current else 'FORMER'}</span>
-          <span class="d reign-t">Won vs {esc(opp)}</span>
+          <span class="d reign-t">{f"Won vs {esc(opp)}" if opp else "Became champion"}</span>
           <span class="muted">{esc(short_day(reign['start']))} · {d} defence{'s' if d != 1 else ''}{f' · {days} days' if days is not None else ''}</span>
         </div>"""
 
@@ -1601,7 +1642,9 @@ def render_titles(ctx):
             number = len(reigns) - i
             won = reign["won_fight"]
             name = fighter_name(ctx, reign["user_id"], reign["name"])
-            opp = fighter_name(ctx, won["loser_id"], won["loser_name"])
+            opp = fighter_name(ctx, won["loser_id"], won["loser_name"]) if won else None
+            how = (f"Won {esc(short_day(reign['start']))} vs {esc(opp)} · {esc(ctx.fight_method_text(won))}" if won
+                   else f"Became champion {esc(short_day(reign['start']))}")
             days = ctx.reign_days(reign)
             current = reign["end"] is None
             d = reign["defences"]
@@ -1611,7 +1654,7 @@ def render_titles(ctx):
             {avatar_html(ctx, reign['user_id'], name, 'av av-sm' + (' av-gold' if current else ''))}
             <span class="lin-t">
               {name_link(ctx, reign['user_id'], name, 'd lin-name')}
-              <span class="muted">Won {esc(short_day(reign['start']))} vs {esc(opp)} · {esc(ctx.fight_method_text(won))}</span>
+              <span class="muted">{how}</span>
             </span>
             <span class="lin-r">{'<span class="badge badge-gold">CURRENT</span>' if current else ''}<span class="muted">{d} def. · {days if days is not None else '–'} days</span></span>
           </li>"""
@@ -2104,6 +2147,21 @@ img{max-width:100%}
 .award{display:inline-block;margin-left:8px;padding:3px 8px;border-radius:999px;font:700 10px var(--ui,Inter);letter-spacing:.14em;border:1px solid rgba(201,162,74,.5);color:var(--gold2);background:rgba(201,162,74,.08)}
 .award-kotn{border-color:rgba(240,122,126,.5);color:#F5A3A6;background:rgba(240,122,126,.08)}
 .award-potn{border-color:rgba(127,176,255,.45);color:#A9C8FF;background:rgba(127,176,255,.08)}
+.fnick{display:block;margin-top:6px;font:700 italic 24px var(--d);letter-spacing:.04em;color:var(--gold2)}
+.fquote{margin:14px 0 0;padding-left:16px;border-left:3px solid var(--gold);font-size:17px;font-style:italic;color:#D7D7DC;max-width:560px}
+.fshopbadge{margin-left:10px;border:1px solid rgba(201,162,74,.5);background:rgba(201,162,74,.1);color:var(--gold2);padding:6px 12px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.18em}
+.fstyle-gold .av-hero{box-shadow:0 0 0 3px var(--gold),0 0 0 9px rgba(201,162,74,.18)}
+.fstyle-glow .fhero-name{text-shadow:0 0 28px rgba(226,194,122,.55)}
+.fstyle-glow .av-hero{box-shadow:0 0 40px rgba(226,194,122,.45)}
+.fstyle-crimson{background:radial-gradient(70% 90% at 15% 30%,rgba(229,72,77,.18),rgba(8,8,10,0) 60%)}
+.fstyle-crimson .fhero-name{color:#FFE4E5}
+.fstyle-ice{background:radial-gradient(70% 90% at 15% 30%,rgba(127,176,255,.18),rgba(8,8,10,0) 60%)}
+.fstyle-ice .fhero-name{color:#E6F0FF}
+.spot{display:flex;flex-wrap:wrap;align-items:center;gap:22px 32px;padding:30px 34px;border:1px solid #3A311B;border-radius:20px;color:var(--text);background:radial-gradient(120% 120% at 0% 0%,rgba(201,162,74,.16),rgba(8,8,10,0) 55%),var(--panel);transition:border-color .35s,transform .35s var(--ease)}
+.spot:hover{color:var(--text);border-color:#5A4A22;transform:translateY(-3px)}
+.spot-name{font-size:48px;line-height:.9}
+.spot-meta{display:flex;flex-direction:column;gap:8px;flex:1;min-width:200px}
+.spot-rec{font-size:34px;color:var(--muted)}
 .hof-wrap{padding-top:64px;padding-bottom:120px;display:flex;flex-direction:column;gap:28px}
 .hof-feature{position:relative;overflow:hidden;display:flex;flex-wrap:wrap;gap:40px;padding:48px;border:1px solid #3A311B;border-radius:22px;color:var(--text);background:radial-gradient(120% 120% at 0% 0%,rgba(201,162,74,.18),rgba(8,8,10,0) 55%),var(--panel);transition:border-color .35s,transform .35s var(--ease)}
 .hof-feature:hover{color:var(--text);border-color:#5A4A22;transform:translateY(-3px)}
