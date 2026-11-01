@@ -397,6 +397,7 @@ def setup_database():
     setup_weekly_post_table()
     setup_fantasy_price_table()
     setup_upset_table()
+    setup_slip_share_table()
     setup_loot_tables()
     setup_checklist_tables()
     setup_fantasy_tables()
@@ -15696,6 +15697,7 @@ class BetSlipView(
         self.legs = {}          # position -> (pick, method)
         self.chosen = None      # fight picked in the first dropdown
         self.stake = 100
+        self.last_bet = None    # the bet just placed (for Share my slip)
         self.rebuild()
 
     def bouts(self):
@@ -15825,6 +15827,15 @@ class BetSlipView(
         for item in (place, remove, clear):
             self.add_item(item)
 
+        if self.last_bet and not slip_shared(self.last_bet):
+            share = discord.ui.Button(label="Share my slip", emoji="📣", style=discord.ButtonStyle.blurple, row=4)
+            share.callback = self.share_last
+            self.add_item(share)
+
+    async def share_last(self, interaction):
+        message = await share_slip(interaction, self.last_bet)
+        await self.redraw(interaction, message)
+
     async def redraw(self, interaction, note: str = None):
         self.rebuild()
         await interaction.response.edit_message(embed=self.embed(note), view=self)
@@ -15925,6 +15936,7 @@ class BetSlipView(
 
         self.legs = {}
         self.chosen = None
+        self.last_bet = bet_id
         await self.redraw(
             interaction,
             f"✅ **Bet placed:** {COIN} {coins_text(self.stake)} on {summary} @ **{total:.2f}** "
@@ -15970,7 +15982,127 @@ class SportsbookView(
     async def my_bets(self, interaction):
         await interaction.response.send_message(
             embed=my_bets_embed(interaction.guild, interaction.user.id),
+            view=MyBetsView(interaction.guild, interaction.user.id),
             ephemeral=True
+        )
+
+
+# ------------------------------------------------------------
+# Sharing a bet slip in the channel
+# ------------------------------------------------------------
+
+def setup_slip_share_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS shared_slips (
+            bet_id INTEGER PRIMARY KEY,
+            channel_id INTEGER,
+            message_id INTEGER,
+            shared_at TEXT NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def slip_shared(bet_id: int):
+    try:
+        return bool(discipline_query("SELECT 1 FROM shared_slips WHERE bet_id = ?", (bet_id,)))
+    except sqlite3.OperationalError:
+        return False
+
+
+def slip_share_embed(guild: discord.Guild, bet, member):
+
+    legs = discipline_query("""
+        SELECT bet_legs.*, bet_fights.name_a, bet_fights.name_b FROM bet_legs
+        JOIN bet_fights ON bet_fights.market_id = ? AND bet_fights.position = bet_legs.position
+        WHERE bet_legs.bet_id = ? ORDER BY bet_legs.position
+    """, (bet["market_id"], bet["id"]))
+    market = get_market(bet["market_id"])
+    icons = {"pending": "⏳", "won": "✅", "lost": "❌", "void": "🤝"}
+
+    lines = [f"{icons[leg['status']]} **{pick_label(leg, leg['pick'], leg['method'])}** @ {leg['odds']:.2f}" for leg in legs]
+    kind = "Single" if len(legs) == 1 else f"{len(legs)}-fold accumulator"
+    returns = round(bet["stake"] * bet["odds"])
+
+    if bet["status"] == "won":
+        result, colour = f"🟢 Won {COIN} **{coins_text(bet['payout'])}**", 0x3DD68C
+    elif bet["status"] == "lost":
+        result, colour = "🔴 Lost", 0xE5484D
+    elif bet["status"] == "void":
+        result, colour = "⚪ Refunded", 0x9CA3AF
+    else:
+        result, colour = f"🟡 To return {COIN} **{coins_text(returns)}**", PFO_GOLD
+
+    embed = discord.Embed(
+        title=f"🧾 {kind}",
+        description="\n".join(lines) + f"\n\n**Stake** {COIN} {coins_text(bet['stake'])} · **Odds** {bet['odds']:.2f}\n{result}",
+        color=colour,
+        timestamp=discord.utils.utcnow()
+    )
+    name = name_without_record(member.display_name) if member else "Someone"
+    avatar = getattr(getattr(member, "display_avatar", None), "url", None)
+    embed.set_author(name=f"{name}'s bet slip", icon_url=avatar or asset_url(LOGO_FILE))
+    embed.set_footer(text=f"{market['event'] if market else 'PFO Sportsbook'} • place yours on the sportsbook post",
+                     icon_url=asset_url(LOGO_FILE))
+    return embed
+
+
+async def share_slip(interaction: discord.Interaction, bet_id: int):
+    """Posts the bet slip in the channel. Returns a note for the bettor."""
+
+    rows = discipline_query("SELECT * FROM bets WHERE id = ?", (bet_id,))
+    if not rows or rows[0]["user_id"] != interaction.user.id:
+        return "❌ That isn't your bet."
+    if slip_shared(bet_id):
+        return "📣 You've already shared that slip."
+
+    channel = interaction.channel
+    try:
+        message = await channel.send(embed=slip_share_embed(interaction.guild, rows[0], interaction.user))
+    except Exception:
+        return "❌ I can't post in this channel."
+
+    discipline_query("INSERT OR IGNORE INTO shared_slips (bet_id, channel_id, message_id, shared_at) VALUES (?, ?, ?, ?)",
+                     (bet_id, channel.id, message.id, now_utc()), write=True)
+    return f"📣 Slip shared in {channel.mention}."
+
+
+class MyBetsView(
+    discord.ui.View
+):
+    """Under 'Your bets': pick a bet to share in the channel."""
+
+    def __init__(self, guild: discord.Guild, user_id: int):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.user_id = user_id
+        bets = discipline_query(
+            "SELECT * FROM bets WHERE guild_id = ? AND user_id = ? ORDER BY id DESC LIMIT 15", (guild.id, user_id)
+        )
+        options = []
+        for bet in bets:
+            if slip_shared(bet["id"]):
+                continue
+            legs = discipline_query("SELECT COUNT(*) AS n FROM bet_legs WHERE bet_id = ?", (bet["id"],))[0]["n"]
+            state = {"open": "🟡", "won": "🟢", "lost": "🔴", "void": "⚪"}.get(bet["status"], "")
+            options.append(discord.SelectOption(
+                label=f"{'Single' if legs == 1 else f'{legs}-fold'} · {coins_text(bet['stake'])} @ {bet['odds']:.2f}"[:100],
+                value=str(bet["id"]), emoji=state or None
+            ))
+        if options:
+            menu = discord.ui.Select(placeholder="📣 Share a bet slip in this channel…", options=options[:25])
+            menu.callback = self.share
+            self.add_item(menu)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    async def share(self, interaction):
+        note = await share_slip(interaction, int(interaction.data["values"][0]))
+        await interaction.response.edit_message(
+            content=note, embed=my_bets_embed(self.guild, self.user_id), view=MyBetsView(self.guild, self.user_id)
         )
 
 
@@ -16114,7 +16246,8 @@ class CoinsView(
 
     async def bets(self, interaction):
         await interaction.response.send_message(
-            embed=my_bets_embed(self.guild, interaction.user.id), ephemeral=True
+            embed=my_bets_embed(self.guild, interaction.user.id),
+            view=MyBetsView(self.guild, interaction.user.id), ephemeral=True
         )
 
 
@@ -26339,6 +26472,7 @@ async def setup_hook():
     setup_weekly_post_table()
     setup_fantasy_price_table()
     setup_upset_table()
+    setup_slip_share_table()
     setup_loot_tables()
     setup_checklist_tables()
     setup_fantasy_tables()
