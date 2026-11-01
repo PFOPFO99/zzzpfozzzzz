@@ -391,6 +391,10 @@ def setup_database():
     setup_title_change_table()
     setup_shop_tables()
     setup_shop_board_table()
+    setup_task_tables()
+    setup_backup_table()
+    setup_fantasy_bonus_table()
+    setup_weekly_post_table()
     setup_fantasy_tables()
 
 
@@ -8795,6 +8799,18 @@ async def vote_closer():
     except Exception as error:
         print(f"Shop check error: {error}")
 
+    # Bets of the Week in fighter-news (Sunday evening).
+    try:
+        await check_bets_of_the_week()
+    except Exception as error:
+        print(f"Bets of the week error: {error}")
+
+    # Weekly database backup in pfo-bot (Sunday evening).
+    try:
+        await check_weekly_backup()
+    except Exception as error:
+        print(f"Backup check error: {error}")
+
     # Fantasy: open rounds for new cards, save teams at the lock.
     try:
         await check_fantasy_rounds()
@@ -14686,6 +14702,14 @@ class RecapBuilderView(
             "Changed something? Edit and press **Post recap** again."
         )
 
+        # Fantasy: the top scorer on this card gets the event bonus (once).
+        bonus_note = await award_fantasy_event_bonus(self.guild, [fight["id"] for fight in self.fights], self.event)
+        if bonus_note:
+            try:
+                await interaction.followup.send(bonus_note, ephemeral=True)
+            except Exception:
+                pass
+
     async def close(self, interaction):
         self.stop()
         await interaction.response.edit_message(
@@ -16001,7 +16025,7 @@ def coins_embed(guild: discord.Guild, member, note: str = None):
         embed.set_thumbnail(url=avatar.url)
 
     embed.set_footer(
-        text="Earn coins: daily bonus, correct /mainvote picks, fighting and winning bets",
+        text="Earn coins: daily bonus, weekly /tasks, fantasy, fighting and winning bets",
         icon_url=asset_url(LOGO_FILE)
     )
 
@@ -16021,8 +16045,17 @@ class CoinsView(
         daily.callback = self.daily
         bets = discord.ui.Button(label="My bets", emoji="🧾", style=discord.ButtonStyle.grey)
         bets.callback = self.bets
+        tasks_button = discord.ui.Button(label="Weekly tasks", emoji="📋", style=discord.ButtonStyle.grey)
+        tasks_button.callback = self.weekly_tasks
         self.add_item(daily)
         self.add_item(bets)
+        self.add_item(tasks_button)
+
+    async def weekly_tasks(self, interaction):
+        await interaction.response.send_message(
+            embed=tasks_embed(self.guild, interaction.user),
+            view=TasksView(self.guild, interaction.user.id), ephemeral=True
+        )
 
     async def daily(self, interaction):
 
@@ -23459,6 +23492,9 @@ def fantasy_rules_embed():
         f"`+{p['award']}` each FOTN / POTN / KOTN\n`+{p['draw']}` draw"
     ), inline=False)
     embed.add_field(name="Captain", value="⭐ Your captain scores **double**. Change them any time before the lock.", inline=False)
+    embed.add_field(name="Top scorer bonus",
+                    value=f"🏆 Whoever scores the most points on a card wins {COIN} **{coins_text(FANTASY_EVENT_BONUS)}** coins.",
+                    inline=False)
     return embed
 
 
@@ -23817,6 +23853,825 @@ async def fantasyoverview(
     view = FantasyOverviewView(interaction.guild, interaction.user.id)
     embed = fantasy_player_embed(interaction.guild, member.id) if member else fantasy_overview_embed(interaction.guild)[0]
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ============================================================
+# /help  the commands you can use
+#
+# Shows the commands for your role (Everyone, Fighter, Helper,
+# Moderator, Head Moderator+), each with what it does. Pick another
+# role from the menu to see theirs. Descriptions come from the
+# commands themselves, so they're always up to date, and any new
+# staff command not listed below still shows under "Other".
+# ============================================================
+
+HELP_LEVELS = ["everyone", "fighter", "helper", "moderator", "senior"]
+
+HELP_LEVEL_NAMES = {
+    "everyone": "Everyone",
+    "fighter": "Fighters",
+    "helper": "Helper",
+    "moderator": "Moderator",
+    "senior": "Head Moderator, Vice President & Owner",
+}
+
+# level: [(section, [commands])]
+HELP_SECTIONS = {
+    "everyone": [
+        ("For everyone", ["help", "coins", "tasks", "shop", "fantasy", "myawards", "halloffame"]),
+    ],
+    "fighter": [
+        ("For fighters", ["profile"]),
+    ],
+    "helper": [
+        ("Sign-ups", ["fnsignup", "livesignup", "signuptimes", "signupclose", "signuppaste", "inactive"]),
+        ("Building cards", ["matchmaking", "createfights", "viewcard", "dmfightnight", "dmlivecard", "livecheckin",
+                            "listpaste", "addfighter", "removefighter"]),
+        ("Results & records", ["result", "fights", "editfight", "removefight", "addstrikes", "awards", "recap",
+                               "setrecord", "editrecord", "resetrecord", "syncnicknames"]),
+        ("Importing old fights", ["importtemplate", "importfights", "scanresults"]),
+        ("Rankings & titles", ["rankingsp", "rankingsu", "rankingsr", "rankingsclearunknown", "rankingsupdate",
+                               "belt", "titlehistory"]),
+        ("Betting & coins", ["openbets", "lockbets", "cancelfight", "givecoins"]),
+        ("Posts & media", ["mainvote", "leaderboard", "taleofthetape", "interview", "interviews"]),
+        ("Discipline", ["warn", "removewarning", "unsuspend", "warnings"]),
+    ],
+    "moderator": [
+        ("Moderator+", ["editstats", "transferfighter", "halloffame", "shopadmin", "shoppost"]),
+    ],
+    "senior": [
+        ("Head Moderator+", ["admincoin", "betoverview", "fantasyoverview", "backup"]),
+    ],
+}
+
+# Short notes where a command does more at a higher level.
+HELP_NOTES = {
+    ("everyone", "halloffame"): "See the Hall of Fame list or one inductee",
+    ("moderator", "halloffame"): "Add, edit or remove Hall of Fame inductees",
+    ("everyone", "help"): "This list",
+}
+
+
+HELP_FUNCTION_NAMES = {"warnings": "warnings_command", "help": "help_command", "tasks": "tasks_command"}
+
+
+def help_level_for(interaction: discord.Interaction):
+    if is_senior_staff(interaction):
+        return "senior"
+    if is_moderator_plus(interaction):
+        return "moderator"
+    if is_staff(interaction):
+        return "helper"
+    if has_any_role(interaction.user, FIGHTER_ROLE_NAMES):
+        return "fighter"
+    return "everyone"
+
+
+def help_description(level: str, name: str):
+    if (level, name) in HELP_NOTES:
+        return HELP_NOTES[(level, name)]
+    command = None
+    try:
+        command = bot.tree.get_command(name)
+    except Exception:
+        pass
+    if command is None:
+        command = globals().get(HELP_FUNCTION_NAMES.get(name, name))
+    text = getattr(command, "description", None) or ""
+    if not isinstance(text, str):
+        text = ""
+    # Take off "(Moderator+)" style endings, the section already says it.
+    text = re.sub(r"\s*\((?:Moderator\+|Head Moderator\+|senior staff)\)\.?$", "", text).strip()
+    text = re.sub(r"\s*Head Mod\+ only\.?$", "", text).strip()
+    return text
+
+
+def help_listed_commands():
+    return {name for sections in HELP_SECTIONS.values() for _, names in sections for name in names}
+
+
+def help_unlisted_commands():
+    """Commands that exist but aren't in HELP_SECTIONS (shown to staff as 'Other')."""
+    listed = help_listed_commands()
+    try:
+        names = [command.name for command in bot.tree.get_commands()]
+    except Exception:
+        names = []
+    return sorted(name for name in names if name not in listed)
+
+
+def help_embed(level: str, own_level: str = None, max_desc: int = None):
+
+    upto = HELP_LEVELS.index(level)
+    embed = discord.Embed(
+        title=f"PFO Bot commands · {HELP_LEVEL_NAMES[level]}",
+        description=(
+            ("These are the commands you can use." if level == own_level else
+             f"Commands for **{HELP_LEVEL_NAMES[level]}**.")
+            + "\n-# Each role can also use everything in the roles below it."
+        ),
+        color=PFO_GOLD
+    )
+    embed.set_author(name="PFO • HELP", icon_url=asset_url(LOGO_FILE))
+
+    seen = set()
+    for step in HELP_LEVELS[:upto + 1]:
+        for section, names in HELP_SECTIONS.get(step, []):
+            lines = []
+            for name in names:
+                text = help_description(step, name)
+                if max_desc and len(text) > max_desc:
+                    text = text[:max_desc - 1].rstrip() + "…"
+                lines.append(f"`/{name}` {text}".rstrip())
+                seen.add(name)
+            # Fields hold 1024 characters: split long sections.
+            chunk = []
+            for line in lines:
+                if sum(len(item) + 1 for item in chunk) + len(line) > 1000:
+                    embed.add_field(name=section, value="\n".join(chunk), inline=False)
+                    section = f"{section} (more)"
+                    chunk = []
+                chunk.append(line)
+            if chunk:
+                embed.add_field(name=section, value="\n".join(chunk), inline=False)
+
+    if upto >= HELP_LEVELS.index("helper"):
+        others = help_unlisted_commands()
+        if others:
+            embed.add_field(name="Other", value="\n".join(f"`/{name}` {help_description('helper', name)}" for name in others)[:1024],
+                            inline=False)
+            seen.update(others)
+
+    # Discord allows 6000 characters per embed: shorten the descriptions if needed.
+    size = len(embed.title or "") + len(embed.description or "") + sum(len(field.name) + len(field.value) for field in embed.fields)
+    if size > 5700 and (max_desc or 999) > 30:
+        return help_embed(level, own_level, (max_desc or 90) - 15)
+
+    total = len(seen)
+    embed.set_footer(text=f"{total} commands • pick another role below to see theirs", icon_url=asset_url(LOGO_FILE))
+    return embed
+
+
+class HelpView(
+    discord.ui.View
+):
+
+    def __init__(self, user_id: int, level: str, own_level: str):
+        super().__init__(timeout=600)
+        self.user_id = user_id
+        self.own_level = own_level
+        menu = discord.ui.Select(
+            placeholder="See another role's commands…",
+            options=[
+                discord.SelectOption(label=HELP_LEVEL_NAMES[key][:100], value=key, default=key == level,
+                                     description="Your role" if key == own_level else None)
+                for key in HELP_LEVELS
+            ]
+        )
+        menu.callback = self.pick
+        self.add_item(menu)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    async def pick(self, interaction):
+        level = interaction.data["values"][0]
+        await interaction.response.edit_message(
+            embed=help_embed(level, self.own_level), view=HelpView(self.user_id, level, self.own_level)
+        )
+
+
+@bot.tree.command(
+    name="help",
+    description="See the commands you can use (or pick a role to see theirs)."
+)
+@app_commands.describe(role="Which role's commands to show (default: yours)")
+@app_commands.choices(role=[app_commands.Choice(name=HELP_LEVEL_NAMES[key][:100], value=key) for key in HELP_LEVELS])
+async def help_command(
+    interaction: discord.Interaction,
+    role: app_commands.Choice[str] = None
+):
+
+    own = help_level_for(interaction) if interaction.guild else "everyone"
+    level = role.value if role else own
+    await interaction.response.send_message(embed=help_embed(level, own), view=HelpView(interaction.user.id, level, own),
+                                            ephemeral=True)
+
+
+# ============================================================
+# WEEKLY COIN TASKS
+#
+# Small jobs that pay coins, reset every Monday 00:00 UK time.
+# Progress is worked out from what people already do (daily bonus,
+# bets, fantasy, the shop, fights), so nothing extra
+# has to be logged. Open with /tasks or the Weekly tasks button on
+# /coins, then press Claim for anything finished.
+# ============================================================
+
+# key: (emoji, task, how many, reward)
+WEEKLY_TASKS = {
+    "daily":   ("🎁", "Claim your daily bonus on 5 days", 5, 300),
+    "bets":    ("🎯", "Place 3 bets", 3, 250),
+    "bet_win": ("💸", "Win a bet", 1, 300),
+    "fantasy": ("🏆", "Have a full fantasy team (4 fighters)", 1, 200),
+    "shop":    ("🛒", "Buy something from the shop", 1, 100),
+    "fight":   ("🥊", "Fight on a PFO card", 1, 300),
+}
+WEEKLY_BONUS_TASKS = 5        # finish this many in a week for the bonus
+WEEKLY_BONUS = 500
+
+
+def setup_task_tables():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS coin_task_claims (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            week TEXT NOT NULL,
+            task TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY(guild_id, user_id, week, task)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def task_week():
+    """(week key, start unix, end unix): Monday 00:00 to Monday 00:00, UK time."""
+    today = uk_now().date()
+    monday = today - timedelta(days=today.weekday())
+    start = to_utc(datetime.combine(monday, datetime.min.time()))
+    end = to_utc(datetime.combine(monday + timedelta(days=7), datetime.min.time()))
+    return monday.isoformat(), int(start.timestamp()), int(end.timestamp())
+
+
+def task_progress(guild_id: int, user_id: int):
+    """{task: count so far this week}"""
+
+    _, start, end = task_week()
+    start_iso = datetime.fromtimestamp(start, timezone.utc).isoformat()
+    end_iso = datetime.fromtimestamp(end, timezone.utc).isoformat()
+    progress = {key: 0 for key in WEEKLY_TASKS}
+
+    def count(sql, params):
+        try:
+            return discipline_query(sql, params)[0]["n"] or 0
+        except sqlite3.OperationalError:
+            return 0
+
+    progress["daily"] = count(
+        "SELECT COUNT(DISTINCT substr(created_at, 1, 10)) AS n FROM coin_ledger "
+        "WHERE guild_id = ? AND user_id = ? AND reason = 'daily' AND created_at >= ? AND created_at < ?",
+        (guild_id, user_id, start_iso, end_iso)
+    )
+    progress["bets"] = count(
+        "SELECT COUNT(*) AS n FROM bets WHERE guild_id = ? AND user_id = ? AND created_at >= ? AND created_at < ? "
+        "AND status != 'void'", (guild_id, user_id, start_iso, end_iso)
+    )
+    progress["bet_win"] = count(
+        "SELECT COUNT(*) AS n FROM bets WHERE guild_id = ? AND user_id = ? AND status = 'won' "
+        "AND created_at >= ? AND created_at < ?", (guild_id, user_id, start_iso, end_iso)
+    )
+    try:
+        progress["fantasy"] = 1 if len(fantasy_team(guild_id, user_id)) >= FANTASY_TEAM_SIZE else 0
+    except Exception:
+        progress["fantasy"] = 0
+    progress["shop"] = count(
+        "SELECT COUNT(*) AS n FROM shop_items WHERE guild_id = ? AND user_id = ? AND created_at >= ? AND created_at < ?",
+        (guild_id, user_id, start, end)
+    )
+    progress["fight"] = count(
+        "SELECT COUNT(*) AS n FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?) "
+        "AND source = 'result' AND created_at >= ? AND created_at < ?",
+        (guild_id, user_id, user_id, start_iso, end_iso)
+    )
+    return progress
+
+
+def task_claims(guild_id: int, user_id: int, week: str):
+    try:
+        return {row["task"] for row in discipline_query(
+            "SELECT task FROM coin_task_claims WHERE guild_id = ? AND user_id = ? AND week = ?", (guild_id, user_id, week)
+        )}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def task_status(guild_id: int, user_id: int):
+    """(week, end unix, [(key, emoji, text, done, needed, reward, finished, claimed)], bonus ready, bonus claimed)"""
+
+    week, _, end = task_week()
+    progress = task_progress(guild_id, user_id)
+    claimed = task_claims(guild_id, user_id, week)
+    rows = []
+    for key, (emoji, text, needed, reward) in WEEKLY_TASKS.items():
+        done = min(progress.get(key, 0), needed)
+        rows.append((key, emoji, text, done, needed, reward, done >= needed, key in claimed))
+    finished = sum(1 for row in rows if row[6])
+    return week, end, rows, finished >= WEEKLY_BONUS_TASKS, "bonus" in claimed
+
+
+def claim_tasks(guild_id: int, user_id: int):
+    """Pays every finished task not claimed yet. Returns (total, [names])."""
+
+    week, _, rows, bonus_ready, bonus_claimed = task_status(guild_id, user_id)
+    total = 0
+    names = []
+
+    payouts = [(key, reward, text) for key, _, text, _, _, reward, finished, claimed in rows if finished and not claimed]
+    if bonus_ready and not bonus_claimed:
+        payouts.append(("bonus", WEEKLY_BONUS, "Weekly bonus"))
+
+    for key, reward, text in payouts:
+        try:
+            discipline_query(
+                "INSERT INTO coin_task_claims (guild_id, user_id, week, task, amount, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (guild_id, user_id, week, key, reward, now_utc()), write=True
+            )
+        except sqlite3.IntegrityError:
+            continue        # already claimed (double click)
+        add_coins(guild_id, user_id, reward, f"task:{week}:{key}")
+        total += reward
+        names.append(text)
+
+    return total, names
+
+
+def tasks_embed(guild: discord.Guild, member, note: str = None):
+
+    week, end, rows, bonus_ready, bonus_claimed = task_status(guild.id, member.id)
+    lines = []
+    if note:
+        lines += [note, ""]
+
+    finished = 0
+    for key, emoji, text, done, needed, reward, is_done, claimed in rows:
+        finished += 1 if is_done else 0
+        bar = "🟩" * done + "⬛" * (needed - done) if needed > 1 else ("🟩" if is_done else "⬛")
+        state = "✅ claimed" if claimed else ("🎉 **ready to claim**" if is_done else f"{done}/{needed}")
+        lines.append(f"{emoji} **{text}** · {COIN} {coins_text(reward)}\n-# {bar}  {state}")
+
+    bonus_state = "✅ claimed" if bonus_claimed else ("🎉 **ready to claim**" if bonus_ready else f"{min(finished, WEEKLY_BONUS_TASKS)}/{WEEKLY_BONUS_TASKS}")
+    lines += ["", f"⭐ **Finish {WEEKLY_BONUS_TASKS} tasks** · {COIN} {coins_text(WEEKLY_BONUS)} bonus\n-# {bonus_state}",
+              "", f"🔄 New tasks <t:{end}:R>"]
+
+    embed = discord.Embed(title=f"Weekly tasks · {name_without_record(member.display_name)}",
+                          description="\n".join(lines)[:4000], color=PFO_GOLD)
+    embed.set_author(name="PFO • COINS", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text="Resets every Monday 00:00 UK time • coins are points only", icon_url=asset_url(LOGO_FILE))
+    return embed
+
+
+def tasks_ready(guild_id: int, user_id: int):
+    _, _, rows, bonus_ready, bonus_claimed = task_status(guild_id, user_id)
+    return any(row[6] and not row[7] for row in rows) or (bonus_ready and not bonus_claimed)
+
+
+class TasksView(
+    discord.ui.View
+):
+
+    def __init__(self, guild: discord.Guild, user_id: int):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.user_id = user_id
+        claim = discord.ui.Button(label="Claim rewards", emoji="🎉", style=discord.ButtonStyle.green,
+                                  disabled=not tasks_ready(guild.id, user_id))
+        claim.callback = self.claim
+        self.add_item(claim)
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ These are someone else's tasks. Use /tasks for yours.", ephemeral=True)
+            return False
+        return True
+
+    async def claim(self, interaction):
+        total, names = claim_tasks(self.guild.id, self.user_id)
+        note = (f"🎉 **+{coins_text(total)} coins!** " + ", ".join(names)) if total else "Nothing new to claim yet."
+        await interaction.response.edit_message(
+            embed=tasks_embed(self.guild, interaction.user, note), view=TasksView(self.guild, self.user_id)
+        )
+
+
+@bot.tree.command(
+    name="tasks",
+    description="Your weekly coin tasks: progress and rewards (reset every Monday)."
+)
+async def tasks_command(
+    interaction: discord.Interaction
+):
+
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Use this in the PFO server.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        embed=tasks_embed(interaction.guild, interaction.user),
+        view=TasksView(interaction.guild, interaction.user.id), ephemeral=True
+    )
+
+
+# ============================================================
+# WEEKLY DATABASE BACKUP
+#
+# Every Sunday (21:00 UK time by default) the bot posts a copy of its
+# database in pfo-bot, zipped. /backup posts one straight away
+# (Head Moderator+). To restore: unzip it and put it back as the
+# database file on the Railway volume (DATABASE_FILE).
+# Change the time with BACKUP_TIME in Railway, e.g. 18:00.
+# ============================================================
+
+BACKUP_TIME = os.getenv("BACKUP_TIME", "21:00").strip()
+
+
+def setup_backup_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS backup_log (
+            guild_id INTEGER NOT NULL,
+            day TEXT NOT NULL,
+            posted_at TEXT NOT NULL,
+            PRIMARY KEY(guild_id, day)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def make_backup_bytes():
+    """A consistent copy of the database (safe while the bot is running), gzipped."""
+
+    import gzip
+    import tempfile
+
+    handle, path = tempfile.mkstemp(suffix=".db")
+    os.close(handle)
+    try:
+        source = sqlite3.connect(DATABASE_FILE)
+        target = sqlite3.connect(path)
+        with target:
+            source.backup(target)
+        target.close()
+        source.close()
+        with open(path, "rb") as file:
+            raw = file.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    return gzip.compress(raw, compresslevel=9), len(raw)
+
+
+def backup_summary(guild_id: int):
+    def count(sql):
+        try:
+            return discipline_query(sql, (guild_id,))[0]["n"]
+        except Exception:
+            return 0
+    return [
+        f"🥊 Fights: **{count('SELECT COUNT(*) AS n FROM fights WHERE guild_id = ?'):,}**",
+        f"🪙 Wallets: **{count('SELECT COUNT(*) AS n FROM coin_wallets WHERE guild_id = ?'):,}**",
+        f"🎯 Bets: **{count('SELECT COUNT(*) AS n FROM bets WHERE guild_id = ?'):,}**",
+        f"🏆 Fantasy picks: **{count('SELECT COUNT(*) AS n FROM fantasy_picks WHERE guild_id = ?'):,}**",
+    ]
+
+
+async def post_backup(guild: discord.Guild, channel=None, reason: str = "Weekly backup"):
+    """Posts the backup. Returns (ok, message)."""
+
+    channel = channel or find_suggestions_channel(guild)
+    if not channel:
+        return False, "I couldn't find the pfo-bot channel."
+
+    try:
+        data, raw_size = make_backup_bytes()
+    except Exception as error:
+        print(f"Backup failed: {error}")
+        return False, f"Couldn't make the backup ({type(error).__name__})."
+
+    day = uk_now().strftime("%Y-%m-%d")
+    limit = getattr(guild, "filesize_limit", 10 * 1024 * 1024) or 10 * 1024 * 1024
+
+    embed = discord.Embed(
+        title=f"🗄️ {reason}",
+        description="\n".join(
+            backup_summary(guild.id)
+            + ["", f"Size: **{raw_size / 1024 / 1024:.1f} MB** ({len(data) / 1024 / 1024:.1f} MB zipped)",
+               "-# To restore: unzip it and upload it as the database file on the Railway volume. Keep this channel staff only."]
+        ),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    embed.set_author(name="PFO • BACKUP", icon_url=asset_url(LOGO_FILE))
+
+    if len(data) > limit:
+        embed.description += f"\n\n⚠️ The file is too big for Discord ({len(data) / 1024 / 1024:.1f} MB), so it wasn't attached."
+        await channel.send(embed=embed)
+        return False, "The backup was too big to attach."
+
+    await channel.send(embed=embed, file=discord.File(io.BytesIO(data), filename=f"pfo_backup_{day}.db.gz"))
+    return True, f"Backup posted in {channel.mention}."
+
+
+async def check_weekly_backup():
+    """Sunday at BACKUP_TIME (UK time), once per Sunday."""
+
+    now = uk_now()
+    if now.weekday() != 6:
+        return
+
+    try:
+        hour, minute = (int(part) for part in BACKUP_TIME.split(":")[:2])
+    except ValueError:
+        hour, minute = 21, 0
+
+    if (now.hour, now.minute) < (hour, minute):
+        return
+
+    day = now.strftime("%Y-%m-%d")
+    for guild in list(getattr(bot, "guilds", [])):
+        if discipline_query("SELECT 1 FROM backup_log WHERE guild_id = ? AND day = ?", (guild.id, day)):
+            continue
+        discipline_query("INSERT OR IGNORE INTO backup_log (guild_id, day, posted_at) VALUES (?, ?, ?)",
+                         (guild.id, day, now_utc()), write=True)
+        try:
+            await post_backup(guild)
+        except Exception as error:
+            print(f"Weekly backup post failed: {error}")
+
+
+@bot.tree.command(
+    name="backup",
+    description="Post a copy of the bot's database in pfo-bot right now (Head Moderator+)."
+)
+async def backup(
+    interaction: discord.Interaction
+):
+
+    if not is_senior_staff(interaction):
+        await interaction.response.send_message(f"❌ {SENIOR_ONLY_TEXT} can make a backup.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    ok, message = await post_backup(interaction.guild, reason=f"Backup by {name_without_record(interaction.user.display_name)}")
+    await interaction.followup.send(("✅ " if ok else "❌ ") + message, ephemeral=True)
+
+
+# ============================================================
+# FANTASY EVENT BONUS
+#
+# When a recap is posted (/recap → Post recap), the fantasy player who
+# scored the most points on that card gets FANTASY_EVENT_BONUS coins,
+# and it's posted in fighter-news. Paid once per card (posting the
+# recap again doesn't pay again). A tie: everyone tied gets it.
+# ============================================================
+
+FANTASY_EVENT_BONUS = int(os.getenv("FANTASY_EVENT_BONUS", "400"))
+
+
+def setup_fantasy_bonus_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS fantasy_round_awards (
+            round_id INTEGER PRIMARY KEY,
+            guild_id INTEGER NOT NULL,
+            winners TEXT NOT NULL,
+            points INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            awarded_at TEXT NOT NULL
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def fantasy_round_scores(guild_id: int, round_id: int):
+    """({user_id: points on this card}, [fights], round row)"""
+
+    fights_by_round, rounds = round_fights(guild_id)
+    row = next((item for item in rounds if item["id"] == round_id), None)
+    fights = fights_by_round.get(round_id, [])
+    players = {}
+
+    if not row or not row["snapshotted"] or not fights:
+        return players, fights, row
+
+    fight_points = {}
+    for fight in fights:
+        for fighter_id in (fight["winner_id"], fight["loser_id"]):
+            fight_points[fighter_id] = fight_points.get(fighter_id, 0) + fantasy_fight_points(guild_id, fight, fighter_id)
+
+    for snap in discipline_query("SELECT * FROM fantasy_snapshots WHERE round_id = ?", (round_id,)):
+        value = fight_points.get(snap["fighter_id"], 0) * (2 if snap["captain"] else 1)
+        players[snap["user_id"]] = players.get(snap["user_id"], 0) + value
+
+    return players, fights, row
+
+
+def round_for_fights(guild_id: int, fight_ids):
+    """The fantasy round most of these fights belong to."""
+
+    wanted = set(fight_ids)
+    fights_by_round, _ = round_fights(guild_id)
+    best, best_count = None, 0
+    for round_id, fights in fights_by_round.items():
+        count = sum(1 for fight in fights if fight["id"] in wanted)
+        if count > best_count:
+            best, best_count = round_id, count
+    return best
+
+
+async def award_fantasy_event_bonus(guild: discord.Guild, fight_ids, event: str = None):
+    """Called after a recap is posted. Returns a short note for staff, or None."""
+
+    try:
+        round_id = round_for_fights(guild.id, fight_ids)
+        if round_id is None:
+            return None
+        if discipline_query("SELECT 1 FROM fantasy_round_awards WHERE round_id = ?", (round_id,)):
+            return None
+
+        players, fights, row = fantasy_round_scores(guild.id, round_id)
+        if not players:
+            return None
+
+        top = max(players.values())
+        if top <= 0:
+            return None
+
+        winners = [user_id for user_id, points in players.items() if points == top]
+        discipline_query(
+            "INSERT INTO fantasy_round_awards (round_id, guild_id, winners, points, amount, awarded_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (round_id, guild.id, json.dumps(winners), top, FANTASY_EVENT_BONUS, now_utc()), write=True
+        )
+        for user_id in winners:
+            add_coins(guild.id, user_id, FANTASY_EVENT_BONUS, f"fantasy_bonus:{round_id}")
+
+        event_name = event or row["event"] or "the card"
+        ranked = sorted(players.items(), key=lambda item: item[1], reverse=True)
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for place, (user_id, points) in enumerate(ranked[:3]):
+            lines.append(f"{medals[place]} {mention_or_name(guild, user_id)} · **{points}** pts")
+
+        names = " & ".join(mention_or_name(guild, user_id) for user_id in winners)
+        embed = discord.Embed(
+            title="🏆 Fantasy: top scorer",
+            description=(
+                f"{names} scored the most fantasy points on **{event_name}** "
+                f"and {'win' if len(winners) > 1 else 'wins'} {COIN} **{coins_text(FANTASY_EVENT_BONUS)}** coins"
+                + (" each" if len(winners) > 1 else "") + "!\n\n" + "\n".join(lines)
+                + "\n\n-# Make or change your team with /fantasy"
+            ),
+            color=PFO_GOLD,
+            timestamp=discord.utils.utcnow()
+        )
+        embed.set_author(name="PFO • FANTASY", icon_url=asset_url(LOGO_FILE))
+
+        channel = find_rankings_update_channel(guild)
+        if channel:
+            await channel.send(embed=embed)
+            return f"🏆 Fantasy bonus paid to {', '.join(fantasy_member_name(guild, uid) for uid in winners)} and posted in {channel.mention}."
+        return f"🏆 Fantasy bonus paid to {', '.join(fantasy_member_name(guild, uid) for uid in winners)} (no fighter-news channel found to post it)."
+
+    except Exception as error:
+        print(f"Fantasy event bonus failed: {error}")
+        return None
+
+
+def mention_or_name(guild: discord.Guild, user_id: int):
+    return f"<@{user_id}>" if guild.get_member(user_id) else f"User {user_id}"
+
+
+# ============================================================
+# BETS OF THE WEEK
+#
+# Every Sunday (20:30 UK time by default, BETS_WEEK_TIME in Railway)
+# the top 3 biggest bet winners of the week are posted in
+# fighter-news: coins won from bets minus coins staked, Monday to
+# Sunday. Plus the biggest single win. Nothing is posted if nobody
+# made a profit.
+# ============================================================
+
+BETS_WEEK_TIME = os.getenv("BETS_WEEK_TIME", "20:30").strip()
+
+
+def setup_weekly_post_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_posts (
+            guild_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            day TEXT NOT NULL,
+            posted_at TEXT NOT NULL,
+            PRIMARY KEY(guild_id, kind, day)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def bets_of_the_week(guild_id: int):
+    """([(user_id, profit, won_count)] best first, biggest single win row or None)"""
+
+    _, start, end = task_week()
+    start_iso = datetime.fromtimestamp(start, timezone.utc).isoformat()
+    end_iso = datetime.fromtimestamp(end, timezone.utc).isoformat()
+
+    rows = discipline_query(
+        "SELECT user_id, SUM(amount) AS profit FROM coin_ledger WHERE guild_id = ? "
+        "AND (reason LIKE 'bet:%' OR reason LIKE 'stake:%') AND created_at >= ? AND created_at < ? "
+        "GROUP BY user_id HAVING SUM(amount) > 0 ORDER BY profit DESC",
+        (guild_id, start_iso, end_iso)
+    )
+
+    winners = []
+    for row in rows:
+        won = discipline_query(
+            "SELECT COUNT(DISTINCT reason) AS n FROM coin_ledger WHERE guild_id = ? AND user_id = ? "
+            "AND reason LIKE 'bet:%' AND amount > 0 AND created_at >= ? AND created_at < ?",
+            (guild_id, row["user_id"], start_iso, end_iso)
+        )[0]["n"]
+        winners.append((row["user_id"], row["profit"], won))
+
+    biggest = None
+    for row in discipline_query(
+        "SELECT reason FROM coin_ledger WHERE guild_id = ? AND reason LIKE 'bet:%' AND amount > 0 "
+        "AND created_at >= ? AND created_at < ?", (guild_id, start_iso, end_iso)
+    ):
+        try:
+            bet = discipline_query("SELECT * FROM bets WHERE id = ?", (int(row["reason"].split(":")[1]),))[0]
+        except (IndexError, ValueError):
+            continue
+        if bet["status"] == "won" and (biggest is None or bet["payout"] - bet["stake"] > biggest["payout"] - biggest["stake"]):
+            biggest = bet
+
+    return winners, biggest
+
+
+def bets_of_the_week_embed(guild: discord.Guild):
+
+    winners, biggest = bets_of_the_week(guild.id)
+    if not winners:
+        return None
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for place, (user_id, profit, won) in enumerate(winners[:3]):
+        lines.append(f"{medals[place]} {mention_or_name(guild, user_id)} · **+{coins_text(profit)}** {COIN}"
+                     f"\n-# {won} winning bet{'s' if won != 1 else ''}")
+
+    if biggest:
+        legs = discipline_query("SELECT COUNT(*) AS n FROM bet_legs WHERE bet_id = ?", (biggest["id"],))[0]["n"]
+        kind = "single" if legs <= 1 else f"{legs}-fold accumulator"
+        lines += ["", f"💥 **Biggest win:** {mention_or_name(guild, biggest['user_id'])} turned "
+                      f"{coins_text(biggest['stake'])} into **{coins_text(biggest['payout'])}** "
+                      f"({kind} at {biggest['odds']:.2f})"]
+
+    embed = discord.Embed(
+        title="💸 Bets of the Week",
+        description="The biggest winners in the PFO sportsbook this week.\n\n" + "\n".join(lines),
+        color=PFO_GOLD,
+        timestamp=discord.utils.utcnow()
+    )
+    apply_branding(embed, banner_file=SPORTSBOOK_BANNER, author_text="PFO • SPORTSBOOK")
+    embed.set_footer(text="Profit = coins won from bets minus coins staked, Monday to Sunday", icon_url=asset_url(LOGO_FILE))
+    return embed
+
+
+async def check_bets_of_the_week():
+    """Sunday at BETS_WEEK_TIME (UK time), once per Sunday."""
+
+    now = uk_now()
+    if now.weekday() != 6:
+        return
+
+    try:
+        hour, minute = (int(part) for part in BETS_WEEK_TIME.split(":")[:2])
+    except ValueError:
+        hour, minute = 20, 30
+
+    if (now.hour, now.minute) < (hour, minute):
+        return
+
+    day = now.strftime("%Y-%m-%d")
+    for guild in list(getattr(bot, "guilds", [])):
+        if discipline_query("SELECT 1 FROM weekly_posts WHERE guild_id = ? AND kind = 'bets_week' AND day = ?", (guild.id, day)):
+            continue
+        discipline_query("INSERT OR IGNORE INTO weekly_posts (guild_id, kind, day, posted_at) VALUES (?, 'bets_week', ?, ?)",
+                         (guild.id, day, now_utc()), write=True)
+        embed = bets_of_the_week_embed(guild)
+        channel = find_rankings_update_channel(guild)
+        if embed and channel:
+            try:
+                await channel.send(embed=embed)
+            except Exception as error:
+                print(f"Bets of the week post failed: {error}")
 
 
 # ============================================================
@@ -24495,6 +25350,10 @@ async def setup_hook():
     setup_title_change_table()
     setup_shop_tables()
     setup_shop_board_table()
+    setup_task_tables()
+    setup_backup_table()
+    setup_fantasy_bonus_table()
+    setup_weekly_post_table()
     setup_fantasy_tables()
 
     # Buttons first, so they work even if the sync below fails.
