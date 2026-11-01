@@ -55,7 +55,7 @@ except ImportError:  # only when testing without discord.py installed
 DISCORD_INVITE = os.getenv("DISCORD_INVITE", "").strip()
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "12"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "13"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -319,11 +319,56 @@ NAV = [
     ("rankings", "/rankings", "Rankings"),
     ("fighters", "/fighters", "Fighters"),
     ("results", "/results", "Results"),
-    ("leaderboards", "/leaderboards", "Leaderboards"),
-    ("play", "/sportsbook", "Bets & Fantasy"),
-    ("titles", "/titles", "Titles"),
-    ("halloffame", "/hall-of-fame", "Hall of Fame"),
+    ("Bets & Fantasy", [
+        ("sportsbook", "/sportsbook", "Sportsbook", "Live odds and betting boards"),
+        ("fantasy", "/fantasy", "Fantasy", "Standings, teams and prices"),
+    ]),
+    ("Stats", [
+        ("leaderboards", "/leaderboards", "Leaderboards", "Top 10 in every category"),
+        ("titles", "/titles", "Titles", "Every champion, every division"),
+        ("halloffame", "/hall-of-fame", "Hall of Fame", "PFO legends"),
+        ("compare", "/compare", "Head to head", "Compare any two fighters"),
+    ]),
 ]
+
+
+def nav_html(active, live=False):
+    """Main links, two dropdowns, and the phone menu (same links)."""
+    out = []
+    for item in NAV:
+        if isinstance(item[1], list):
+            label, children = item
+            current = any(key == active for key, *_ in children)
+            links = "".join(
+                f'<a href="{href}"' + (' aria-current="page"' if key == active else '') +
+                f'><span class="nd-t">{esc(text)}</span><span class="nd-s">{esc(sub)}</span></a>'
+                for key, href, text, sub in children
+            )
+            out.append(
+                f'<details class="ndrop{" is-current" if current else ""}"><summary>{esc(label)}'
+                f'<svg aria-hidden="true" width="10" height="6" viewBox="0 0 10 6"><path d="M1 1l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>'
+                f'</summary><div class="ndrop-menu">{links}</div></details>'
+            )
+        else:
+            key, href, label = item
+            dot = '<span class="nlive" aria-label="on now"></span>' if key == "live" and live else ""
+            out.append(f'<a class="nlink" href="{href}"' + (' aria-current="page"' if key == active else '') + f'>{dot}{esc(label)}</a>')
+    return "".join(out)
+
+
+def card_is_live(ctx):
+    try:
+        notice = live_notice(ctx)
+        if not notice:
+            return False
+        logged, total = ctx.notice_fights(ctx.gid, notice)
+        raw = str(row_get(notice, "event_date" if notice["kind"] == "live_card" else "deadline", ""))
+        started = bool(logged) or (raw.isdigit() and int(raw) <= time.time())
+        return started and len(logged) < total
+    except Exception:
+        return False
+
+
 
 
 def logo_html(ctx, size_class="logo"):
@@ -345,10 +390,7 @@ def page(ctx, title, active, body, description=None, solid_nav=True):
     description = description or "Rankings, fighters, results and champions of the Prestige Fighting Organisation, a UFC 6 league on Discord."
     logo = ctx.asset_url(ctx.LOGO_FILE)
 
-    links = "".join(
-        '<a href="' + href + '"' + (' aria-current="page"' if key == active else '') + '>' + label + '</a>'
-        for key, href, label in NAV
-    )
+    links = nav_html(active, card_is_live(ctx))
 
     return f"""<!doctype html>
 <html lang="en">
@@ -373,8 +415,9 @@ def page(ctx, title, active, body, description=None, solid_nav=True):
 <header class="nav">
   <nav class="wrap nav-in" aria-label="Main">
     <a class="brand" href="/" aria-label="PFO home">{logo_html(ctx, 'logo-sm')}<span>PFO</span></a>
-    <div class="nav-links">{links}</div>
-    {discord_button()}
+    <div class="nav-links" id="navlinks">{links}</div>
+    {discord_button(extra="nav-cta")}
+    <button class="nav-burger" type="button" aria-label="Menu" aria-expanded="false" aria-controls="navlinks"><span></span><span></span><span></span></button>
   </nav>
 </header>
 <main id="main">
@@ -1597,6 +1640,8 @@ def fight_odds(ctx, fight):
 
 
 def chip(label, value, cls=""):
+    if len(re.sub(r"<[^>]+>", "", str(value))) > 14:
+        cls += " evchip-sm"
     return f'<div class="evchip {cls}"><span class="evchip-l">{esc(label)}</span><span class="d evchip-v">{value}</span></div>'
 
 
@@ -1958,7 +2003,7 @@ def render_compare(ctx, a=None, b=None):
 
     body = page_hero("ANY TWO FIGHTERS, SIDE BY SIDE", "HEAD TO HEAD", "VS") + f'<div class="wrap"><section class="block cmp-pick">{form}</section>{content}</div>'
     title = f"{fighter_name(ctx, a)} vs {fighter_name(ctx, b)}" if a and b and a != b else "Head to head"
-    return page(ctx, title, "fighters", body, "Compare any two PFO fighters side by side.")
+    return page(ctx, title, "compare", body, "Compare any two PFO fighters side by side.")
 
 
 # ============================================================
@@ -2168,7 +2213,7 @@ def render_sportsbook(ctx):
     hero = page_hero("LIVE ODDS, STRAIGHT FROM THE DISCORD", "SPORTSBOOK", "ODDS",
                      play_tabs("sportsbook") + f'<div class="evchips l-up">{strip}</div>' + cta)
     body = hero + f'<div class="wrap">{cards}{boards}{last}</div>'
-    return page(ctx, "Sportsbook", "play", body, "Live PFO betting odds, the biggest winners and the upsets.")
+    return page(ctx, "Sportsbook", "sportsbook", body, "Live PFO betting odds, the biggest winners and the upsets.")
 
 
 def render_fantasy(ctx):
@@ -2332,7 +2377,7 @@ def render_fantasy(ctx):
 
     hero = page_hero("ONE TEAM, THE WHOLE SEASON", "FANTASY", "PTS", play_tabs("fantasy") + f'<div class="evchips l-up">{strip}</div>')
     body = hero + f'<div class="wrap">{standings_html}{boards}{prices}{rules}</div>'
-    return page(ctx, "Fantasy", "play", body, "Fantasy PFO standings, teams, prices and price movers.")
+    return page(ctx, "Fantasy", "fantasy", body, "Fantasy PFO standings, teams, prices and price movers.")
 
 
 # ============================================================
@@ -2666,11 +2711,42 @@ img{max-width:100%}
 .logo-sm{width:38px;height:38px;border-radius:50%;display:grid;place-items:center}
 .logo-xs{width:28px;height:28px;border-radius:50%;display:inline-grid;place-items:center}
 .logo-text{background:#16161A;border:1px solid var(--gold);color:var(--gold);font:700 11px var(--d);letter-spacing:.05em}
-.nav-links{display:flex;gap:2px 28px;flex:1 1 auto;font-size:13px;font-weight:600;letter-spacing:.12em;text-transform:uppercase;overflow-x:auto;scrollbar-width:none}
-.nav-links::-webkit-scrollbar{display:none}
-.nav-links a{color:var(--muted);padding:12px 0;white-space:nowrap;transition:color .2s}
-.nav-links a:hover{color:var(--text)}
-.nav-links a[aria-current]{color:var(--text);box-shadow:inset 0 -2px 0 var(--gold)}
+.nav-links{display:flex;align-items:center;gap:2px 26px;flex:1 1 auto;font-size:13px;font-weight:600;letter-spacing:.12em;text-transform:uppercase}
+.nlink,.ndrop summary{color:var(--muted);padding:12px 0;white-space:nowrap;transition:color .2s;cursor:pointer}
+.nlink:hover,.ndrop summary:hover,.ndrop[open] summary{color:var(--text)}
+.nlink[aria-current],.ndrop.is-current summary{color:var(--text);box-shadow:inset 0 -2px 0 var(--gold)}
+.nlive{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--redc);margin:0 8px 2px 0;animation:blink 1.4s ease-in-out infinite}
+.ndrop{position:relative}
+.ndrop summary{list-style:none;display:flex;align-items:center;gap:8px}
+.ndrop summary::-webkit-details-marker{display:none}
+.ndrop summary svg{transition:transform .2s;opacity:.7}
+.ndrop[open] summary svg{transform:rotate(180deg)}
+.ndrop-menu{position:absolute;top:calc(100% + 10px);left:-18px;min-width:250px;padding:8px;border:1px solid var(--line2);border-radius:14px;background:rgba(12,12,15,.98);box-shadow:0 20px 50px rgba(0,0,0,.55);display:flex;flex-direction:column;text-transform:none;letter-spacing:0;z-index:40}
+.ndrop-menu a{display:flex;flex-direction:column;gap:2px;padding:10px 12px;border-radius:10px;color:var(--text)}
+.ndrop-menu a:hover{background:var(--panel2)}
+.ndrop-menu a[aria-current]{background:rgba(201,162,74,.1)}
+.nd-t{font-size:14px;font-weight:700}
+.ndrop-menu a[aria-current] .nd-t{color:var(--gold2)}
+.nd-s{font-size:12px;font-weight:500;color:var(--dim)}
+.nav-burger{display:none;margin-left:auto;width:44px;height:44px;border:1px solid var(--line2);border-radius:12px;background:transparent;cursor:pointer;flex-direction:column;align-items:center;justify-content:center;gap:5px}
+.nav-burger span{display:block;width:18px;height:2px;border-radius:2px;background:var(--text);transition:transform .25s,opacity .2s}
+.nav-open .nav-burger span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+.nav-open .nav-burger span:nth-child(2){opacity:0}
+.nav-open .nav-burger span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+@media (max-width:1080px){
+  .nav-in{flex-wrap:wrap;gap:10px 16px}
+  .nav-burger{display:flex}
+  .nav-cta{margin-left:auto}
+  .nav-cta + .nav-burger{margin-left:0}
+  .nav-links{display:none;order:5;flex-basis:100%;flex-direction:column;align-items:stretch;gap:0;padding:6px 0 10px;border-top:1px solid var(--line2);max-height:calc(100vh - 80px);overflow-y:auto}
+  .nav-open .nav-links{display:flex}
+  .nav-open{background:rgba(8,8,10,.98)!important;border-color:var(--line2)!important}
+  .nlink,.ndrop summary{padding:14px 2px;border-bottom:1px solid var(--line);font-size:14px}
+  .nlink[aria-current],.ndrop.is-current summary{box-shadow:none;color:var(--gold2)}
+  .ndrop summary{justify-content:space-between}
+  .ndrop-menu{position:static;min-width:0;border:0;box-shadow:none;background:transparent;padding:4px 0 8px 10px}
+  .ndrop-menu a{padding:10px 8px}
+}
 
 /* buttons */
 .btn{display:inline-flex;align-items:center;gap:10px;font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;padding:13px 22px;border-radius:999px;min-height:44px;transition:background .25s,color .25s,border-color .25s,transform .25s var(--ease);white-space:nowrap}
@@ -3085,10 +3161,8 @@ img{max-width:100%}
   .tabs{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;-webkit-mask:linear-gradient(90deg,#000 85%,transparent);mask:linear-gradient(90deg,#000 85%,transparent);padding-right:40px}
   .tabs::-webkit-scrollbar{display:none}
   .wrap{padding-left:16px;padding-right:16px}
-  .nav-in{gap:6px 18px;flex-wrap:wrap}
-  .nav-links{order:3;flex-basis:100%;gap:2px 22px}
-  .nav .btn{padding:9px 14px;min-height:40px;font-size:12px;margin-left:auto}
-  .over-hero main{margin-top:-116px}
+  .nav .btn{padding:9px 14px;min-height:40px;font-size:12px}
+  .over-hero main{margin-top:-68px}
   .block{padding:72px 0}
   #event{padding-top:80px}
   .corner{padding:32px 24px}
@@ -3277,6 +3351,7 @@ img{max-width:100%}
 .evchip-l{font-size:10px;font-weight:700;letter-spacing:.22em;color:var(--dim)}
 .evchip-v{font-size:30px;line-height:1}
 .evchip.gold .evchip-v{color:var(--gold)}
+.evchip-sm .evchip-v{font-size:20px;line-height:1.15;padding-top:4px}
 .evchip.red .evchip-v{color:var(--red)}
 .ev-notes-lg{font-size:16px;max-width:760px;margin:48px 0 0;color:var(--muted)}
 .ev-card{padding-top:56px}
@@ -3433,6 +3508,31 @@ img{max-width:100%}
   .trow-pts{font-size:26px}
 }
 """
+
+NAV_JS = r"""
+(function () {
+  var nav = document.querySelector('.nav');
+  var burger = document.querySelector('.nav-burger');
+  if (burger && nav) burger.addEventListener('click', function () {
+    var open = nav.classList.toggle('nav-open');
+    burger.setAttribute('aria-expanded', open ? 'true' : 'false');
+  });
+  var drops = [].slice.call(document.querySelectorAll('.ndrop'));
+  drops.forEach(function (d) {
+    d.addEventListener('toggle', function () {
+      if (d.open && window.innerWidth > 1080) drops.forEach(function (o) { if (o !== d) o.open = false; });
+    });
+  });
+  document.addEventListener('click', function (e) {
+    if (window.innerWidth <= 1080) return;
+    drops.forEach(function (d) { if (d.open && !d.contains(e.target)) d.open = false; });
+  });
+  document.addEventListener('keydown', function (e) {
+    if (e.key === 'Escape') drops.forEach(function (d) { d.open = false; });
+  });
+})();
+"""
+
 
 EXTRA_JS = r"""
 (function () {
@@ -3604,6 +3704,7 @@ SITE_JS = r"""
 
 
 SITE_JS += EXTRA_JS
+SITE_JS += NAV_JS
 
 
 # ============================================================
