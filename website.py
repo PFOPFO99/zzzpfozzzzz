@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "18"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "19"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -1406,6 +1406,16 @@ def render_fighter(ctx, user_id):
     handle_html = (f'<span class="handle l-up"><span class="handle-l">DISCORD</span>@{esc(username)}</span>'
                    if username else "")
 
+    # Former UFC 6 fighters they used
+    former_html = ""
+    try:
+        former = ctx.former_fighters(ctx.gid, user_id, member.display_name if member else name)
+        if former:
+            former_html = ('<p class="fformer l-up"><span class="fformer-l">FORMER FIGHTERS</span>'
+                           + "".join(f'<span class="fformer-n">{esc(ctx.short_fighter(n))}</span>' for n in former[-8:]) + '</p>')
+    except Exception:
+        former_html = ""
+
     # Shop items: nickname, badge, quote and website style
     cos_fn = getattr(ctx, "get_cosmetics", None)
     cosmetics = cos_fn(ctx.gid, user_id) if cos_fn else {}
@@ -1423,6 +1433,7 @@ def render_fighter(ctx, user_id):
       <h1 class="d fhero-name l-title">{esc(first)}{'<br>' + esc(last) if last else ''}</h1>
       {nick_html}
       {handle_html}
+      {former_html}
       {quote_html}
       <p class="muted l-up">{esc(' · '.join(meta))}</p>
       {leaderboard_badges(ctx, user_id)}
@@ -3612,6 +3623,9 @@ img{max-width:100%}
 .nu-head b{font-size:15px;line-height:1.25;word-break:break-word}
 .nu-head span{font-size:12px;color:var(--muted)}
 .logged-in .nav-cta{display:none}
+.fformer{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:12px 0 0;font-size:13px}
+.fformer-l{font-weight:700;letter-spacing:.16em;font-size:11px;color:var(--dim);margin-right:4px}
+.fformer-n{padding:4px 10px;border:1px solid var(--line2);border-radius:999px;color:var(--muted);font-weight:600}
 @media (max-width:1080px){
   .nav-user{margin-left:auto;position:static}
   .nav-cta + .nav-user{margin-left:0}
