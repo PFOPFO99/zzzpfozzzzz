@@ -4285,6 +4285,8 @@ async def create_profile_embed(
 
     description = []
 
+    if len(champion_of) >= 2:
+        description.append(f"👑👑 **{ {2: 'Double', 3: 'Triple'}.get(len(champion_of), str(len(champion_of)) + 'x') } Champ**")
     for weight in champion_of:
         description.append(f"👑 **{weight} Champion**")
 
@@ -4294,7 +4296,7 @@ async def create_profile_embed(
             f"win{'s' if stats['title_wins'] != 1 else ''}"
         )
 
-    if is_prospect(stats):
+    if is_prospect(stats) and not champion_of:
         fights_so_far = stats["wins"] + stats["losses"] + stats["draws"]
         description.append(f"🌱 **Prospect** · unbeaten in their first {fights_so_far} fight{'s' if fights_so_far != 1 else ''}")
 
@@ -22003,6 +22005,17 @@ def open_bounty_total(guild_id: int, target_id: int):
 
 def is_any_champion(guild_id: int, user_id: int):
     return any(row["rank"] == 0 and row["weight"] != P4P_WEIGHT for row in get_user_rankings(guild_id, user_id))
+
+
+def champion_divisions(guild_id: int, user_id: int):
+    """Every division where they hold the real (undisputed) belt."""
+    return [row["weight"] for row in get_user_rankings(guild_id, user_id) if row["rank"] == 0 and row["weight"] != P4P_WEIGHT]
+
+
+def champ_tag(guild_id: int, user_id: int):
+    """'DOUBLE CHAMP', 'TRIPLE CHAMP' etc., or None for 0 or 1 belt."""
+    count = len(champion_divisions(guild_id, user_id))
+    return {2: "DOUBLE CHAMP", 3: "TRIPLE CHAMP"}.get(count, f"{count}x CHAMP" if count > 3 else None)
 
 
 def last_person_who_beat(guild_id: int, user_id: int):
