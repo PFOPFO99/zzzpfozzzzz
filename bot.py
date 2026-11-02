@@ -426,6 +426,7 @@ def setup_database():
     setup_twitch_table()
     setup_social_tables()
     setup_week_post_table()
+    setup_former_name_table()
     setup_fantasy_tables()
 
 
@@ -4295,6 +4296,13 @@ async def create_profile_embed(
             f"🏆 {stats['title_wins']} title fight "
             f"win{'s' if stats['title_wins'] != 1 else ''}"
         )
+
+    try:
+        former = former_fighters(guild.id, member.id, member.display_name) if member.id else []
+        if former:
+            description.append("🥊 **Former fighters:** " + " · ".join(short_fighter(n) for n in former[-8:]))
+    except Exception as error:
+        print(f"Profile former fighters failed: {error}")
 
     if is_prospect(stats) and not champion_of:
         fights_so_far = stats["wins"] + stats["losses"] + stats["draws"]
@@ -8925,6 +8933,10 @@ async def vote_closer():
     except Exception as error:
         print(f"Twitch check error: {error}")
         note_error("Scheduled: Twitch", error)
+    try:
+        await check_former_names()
+    except Exception as error:
+        print(f"Former names error: {error}")
     try:
         if uk_now().minute == 3:
             await post_week_recap()
@@ -15735,6 +15747,11 @@ async def coins_after_result(guild: discord.Guild, fight, pay_fighters: bool = T
         for market_id in settle_bets_for_fight(guild.id, fight):
             _markets_to_refresh.add(market_id)
         await claim_bounties(guild, fight)
+        try:
+            for side in ("winner", "loser"):
+                note_fighter_names(guild.id, fight[f"{side}_id"], fight[f"{side}_name"], "fight", fight["fight_date"] or fight["created_at"])
+        except Exception as error:
+            print(f"Former names after result failed: {error}")
         if pay_fighters:
             await underdog_alert(guild, fight)
             await check_milestones(guild, fight)
@@ -20070,6 +20087,21 @@ class FightStatsView(
         self.stop()
         replaced = save_fight_stats(self.draft)
 
+        try:
+            log = stats_preview_embed(self.draft)
+            fight = self.draft.fight()
+            log.title = "📊 Fight stats added" + (" (replaced the old stats)" if replaced else "")
+            where = ""
+            if fight:
+                where = f" · fight #{fight['id']}" + (f" · {fight['event']}" if fight["event"] else "")
+            source = "read from a screenshot" if getattr(self.draft, "source", None) == "ai" else "typed in"
+            log.description = (f"{interaction.user.mention} added stats for {self.draft.left_member.mention} vs "
+                               f"{self.draft.right_member.mention}{where} · {source}\n\n" + (log.description or ""))[:4000]
+            log.set_author(name="PFO • FIGHT STATS", icon_url=asset_url(LOGO_FILE))
+            await post_staff_log(interaction.guild, log)
+        except Exception as error:
+            print(f"Fight stats log failed: {error}")
+
         embed = stats_preview_embed(self.draft)
         embed.title = "Fight stats saved"
         embed.set_footer(text="Saved • replaced the stats already stored for this fight" if replaced else "Saved")
@@ -24380,7 +24412,7 @@ HELP_SECTIONS = {
         ("Betting & coins", ["openbets", "lockbets", "cancelfight", "givecoins"]),
         ("Posts & media", ["mainvote", "leaderboard", "taleofthetape", "interview", "interviews"]),
         ("Discipline", ["warn", "removewarning", "unsuspend", "warnings"]),
-        ("Staff tools", ["rating", "fightername", "health", "staffreport"]),
+        ("Staff tools", ["rating", "fightername", "formername", "health", "staffreport"]),
     ],
     "moderator": [
         ("Moderator+", ["editstats", "transferfighter", "halloffame", "shopadmin", "shoppost", "lootdrop"]),
@@ -26725,6 +26757,7 @@ async def setup_hook():
     setup_twitch_table()
     setup_social_tables()
     setup_week_post_table()
+    setup_former_name_table()
     setup_fantasy_tables()
 
     # Buttons first, so they work even if the sync below fails.
@@ -28183,6 +28216,280 @@ def restore_social_buttons():
             bot.add_view(SocialPostView(row["id"]))
     except Exception as error:
         print(f"Could not restore social buttons: {error}")
+
+
+# ============================================================
+# FORMER FIGHTERS
+#
+# Members change their UFC 6 fighter over time. The bot keeps the
+# names they've fought under (from every logged fight, and from
+# nickname changes) and shows them as "Former fighters" on /profile
+# and the website. Only real UFC 6 fighters count: names are checked
+# against the game's roster below (EA's UFC 6 ratings hub).
+# Staff: /formername add | remove | list
+# Railway variable EXTRA_UFC6_FIGHTERS (comma separated full names)
+# adds fighters EA puts in the game later.
+# ============================================================
+
+UFC6_ROSTER = [
+    # Heavyweight
+    "Jon Jones", "Tom Aspinall", "Stipe Miocic", "Ciryl Gane", "Curtis Blaydes", "Derrick Lewis", "Alexander Volkov",
+    "Jailton Almeida", "Waldo Cortes-Acosta", "Shamil Gaziev", "Valter Walker", "Josh Hokit", "Fedor Emelianenko",
+    "Antonio Rodrigo Nogueira", "Frank Mir", "Tank Abbott",
+    # Light heavyweight
+    "Alex Pereira", "Magomed Ankalaev", "Jiri Prochazka", "Jan Blachowicz", "Aleksandar Rakic", "Carlos Ulberg",
+    "Dominick Reyes", "Glover Teixeira", "Bogdan Guskov", "Daniel Cormier", "Chuck Liddell", "Alexander Gustafsson",
+    "Tito Ortiz", "Randy Couture",
+    # Middleweight
+    "Dricus Du Plessis", "Khamzat Chimaev", "Israel Adesanya", "Sean Strickland", "Robert Whittaker", "Paulo Costa",
+    "Nassourdine Imavov", "Caio Borralho", "Reinier De Ridder", "Anthony Hernandez", "Bo Nickal", "Gregory Rodrigues",
+    "Anderson Silva", "Vitor Belfort", "Dan Henderson", "Chris Weidman", "Nick Diaz", "Yoel Romero", "Rich Franklin",
+    "Ken Shamrock",
+    # Welterweight
+    "Belal Muhammad", "Jack Della Maddalena", "Leon Edwards", "Kamaru Usman", "Shavkat Rakhmonov", "Ian Machado Garry",
+    "Sean Brady", "Joaquin Buckley", "Kevin Holland", "Michael Page", "Vicente Luque", "Stephen Thompson",
+    "Gabriel Bonfim", "Uros Medic", "Georges St Pierre", "Robbie Lawler", "Jorge Masvidal", "Tyron Woodley", "Matt Hughes",
+    "Rafael Dos Anjos",
+    # Lightweight
+    "Islam Makhachev", "Arman Tsarukyan", "Charles Oliveira", "Justin Gaethje", "Dustin Poirier", "Michael Chandler",
+    "Mateusz Gamrot", "Beneil Dariush", "Rafael Fiziev", "Dan Hooker", "Renato Moicano", "King Green", "Grant Dawson",
+    "Ignacio Bahamondes", "Jalin Turner", "Mauricio Ruffy", "Benoit Saint Denis", "Quillan Salkilld", "Clay Guida",
+    "Edson Barboza", "Tony Ferguson", "Khabib Nurmagomedov", "Donald Cerrone", "Frankie Edgar", "Benson Henderson",
+    "Conor McGregor",
+    # Featherweight
+    "Alexander Volkanovski", "Ilia Topuria", "Max Holloway", "Diego Lopes", "Movsar Evloev", "Lerone Murphy",
+    "Yair Rodriguez", "Brian Ortega", "Jean Silva", "Aljamain Sterling", "Youssef Zalal", "David Onama",
+    "Patricio Pitbull", "Aaron Pico", "Kevin Vallejos", "Jose Aldo", "Chan Sung Jung",
+    # Bantamweight
+    "Merab Dvalishvili", "Petr Yan", "Sean O'Malley", "Umar Nurmagomedov", "Cory Sandhagen", "Song Yadong",
+    "Deiveson Figueiredo", "Marlon Vera", "Mario Bautista", "Aiemann Zahabi", "Pedro Munhoz", "Henry Cejudo",
+    "Cody Garbrandt", "Dominick Cruz", "TJ Dillashaw",
+    # Flyweight
+    "Alexandre Pantoja", "Joshua Van", "Brandon Royval", "Brandon Moreno", "Amir Albazi", "Kai Asakura", "Manel Kape",
+    "Tatsuro Taira", "Asu Almabayev", "Charles Johnson", "Tim Elliott", "Lone'er Kavanagh", "Kyoji Horiguchi",
+    "Demetrious Johnson",
+    # Women
+    "Valentina Shevchenko", "Zhang Weili", "Kayla Harrison", "Julianna Pena", "Raquel Pennington", "Norma Dumont",
+    "Ketlen Vieira", "Macy Chiasson", "Yana Santos", "Ailin Perez", "Joselyne Edwards", "Amanda Nunes", "Ronda Rousey",
+    "Holly Holm", "Alexa Grasso", "Manon Fiorot", "Erin Blanchfield", "Natalia Silva", "Maycee Barber", "Rose Namajunas",
+    "Miranda Maverick", "Jasmine Jasudavicius", "Tatiana Suarez", "Yan Xiaonan", "Amanda Lemos", "Jessica Andrade",
+    "Virna Jandiroba", "Mackenzie Dern", "Iasmin Lucindo", "Carla Esparza", "Joanna Jedrzejczyk",
+]
+UFC6_ROSTER += [n.strip() for n in os.getenv("EXTRA_UFC6_FIGHTERS", "").split(",") if n.strip()]
+
+# Names people use instead of the surname.
+UFC6_ALIASES = {
+    "gsp": "Georges St Pierre", "khabib": "Khabib Nurmagomedov", "conor": "Conor McGregor", "izzy": "Israel Adesanya",
+    "poatan": "Alex Pereira", "volk": "Alexander Volkanovski", "bones": "Jon Jones", "jjj": "Joanna Jedrzejczyk",
+    "dc": "Daniel Cormier", "dj": "Demetrious Johnson", "mighty mouse": "Demetrious Johnson", "cowboy": "Donald Cerrone",
+    "korean zombie": "Chan Sung Jung", "tkz": "Chan Sung Jung", "jdm": "Jack Della Maddalena", "bsd": "Benoit Saint Denis",
+    "suga": "Sean O'Malley", "chito": "Marlon Vera", "do bronx": "Charles Oliveira", "the diamond": "Dustin Poirier",
+    "borz": "Khamzat Chimaev", "rdr": "Reinier De Ridder", "ddp": "Dricus Du Plessis", "venom": "Michael Page",
+    "big ben": "Ben Rothwell", "bigi boy": "Ciryl Gane", "pitbull": "Patricio Pitbull", "minotauro": "Antonio Rodrigo Nogueira",
+    "rampage": None,
+}
+# Surnames that are also everyday words or nicknames: only count with the first name too.
+UFC6_FULL_NAME_ONLY = {"green", "page", "van", "king", "jones", "lewis", "holland", "silva", "johnson", "henderson",
+                       "edwards", "nurmagomedov", "diaz", "cruz", "costa", "lopes", "mir", "reyes", "santos", "jung"}
+
+
+def _plain(text: str):
+    import unicodedata
+    text = unicodedata.normalize("NFKD", text or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch)).lower()
+    text = text.replace("ł", "l").replace("ø", "o").replace("đ", "d")
+    return " ".join(re.findall(r"[a-z0-9]+", text.replace("'", "")))
+
+
+def _ufc6_index():
+    full, surname = {}, {}
+    for name in UFC6_ROSTER:
+        plain = _plain(name)
+        full[plain] = name
+        parts = plain.split()
+        if len(parts) >= 2:
+            key = " ".join(parts[1:])
+            surname.setdefault(key, []).append(name)
+    return full, surname
+
+
+_UFC6 = None
+
+
+def ufc6_matches(text: str):
+    """Real UFC 6 fighters named in a nickname, e.g. 'Strickland / Topuria (5-1-0)' -> ['Sean Strickland', 'Ilia Topuria']."""
+    global _UFC6
+    if _UFC6 is None:
+        _UFC6 = _ufc6_index()
+    full, surname = _UFC6
+    text = name_without_record(text or "")
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", text)
+    found = []
+    for chunk in re.split(r"[/|&,+]|\bvs\b", text, flags=re.IGNORECASE):
+        plain = " " + _plain(chunk) + " "
+        if not plain.strip():
+            continue
+        hit = None
+        for key, name in full.items():                       # full name first ("Jean Silva")
+            if f" {key} " in plain:
+                hit = name
+                break
+        if not hit:
+            for alias, name in UFC6_ALIASES.items():
+                if name and f" {_plain(alias)} " in plain and name in UFC6_ROSTER:
+                    hit = name
+                    break
+        if not hit:
+            for key, names in sorted(surname.items(), key=lambda item: -len(item[0])):
+                if f" {key} " in plain and len(names) == 1 and key not in UFC6_FULL_NAME_ONLY and len(key) >= 4:
+                    hit = names[0]
+                    break
+        if hit and hit not in found:
+            found.append(hit)
+    return found
+
+
+def setup_former_name_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS former_names (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            source TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            added_by INTEGER,
+            PRIMARY KEY(guild_id, user_id, name)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def note_fighter_names(guild_id: int, user_id: int, text: str, source: str, when: str = None, added_by: int = None):
+    """Saves any UFC 6 fighters found in a name. Returns the names found."""
+    if not user_id:
+        return []
+    names = ufc6_matches(text)
+    for name in names:
+        discipline_query(
+            "INSERT OR IGNORE INTO former_names (guild_id, user_id, name, source, first_seen, added_by) VALUES (?, ?, ?, ?, ?, ?)",
+            (guild_id, user_id, name, source, when or now_utc(), added_by), write=True
+        )
+    return names
+
+
+def scan_former_names(guild_id: int):
+    """Goes through every logged fight and saves the fighter names used. Safe to run again."""
+    found = 0
+    for fight in discipline_query("SELECT * FROM fights WHERE guild_id = ? ORDER BY id", (guild_id,)):
+        for side in ("winner", "loser"):
+            found += len(note_fighter_names(guild_id, fight[f"{side}_id"], fight[f"{side}_name"], "fight",
+                                            fight["fight_date"] or fight["created_at"]))
+    return found
+
+
+def former_fighters(guild_id: int, user_id: int, current_name: str = None):
+    """UFC 6 fighters they used before (not the one(s) they use now), oldest first."""
+    now = set(ufc6_matches(current_name or ""))
+    rows = discipline_query(
+        "SELECT name FROM former_names WHERE guild_id = ? AND user_id = ? AND hidden = 0 ORDER BY first_seen, name",
+        (guild_id, user_id)
+    )
+    return [row["name"] for row in rows if row["name"] not in now]
+
+
+def short_fighter(name: str):
+    """'Alexander Volkanovski' -> 'Volkanovski' (keeps both names when two roster fighters share a surname)."""
+    parts = name.split()
+    if len(parts) < 2:
+        return name
+    rest = " ".join(parts[1:])
+    same = [n for n in UFC6_ROSTER if " ".join(n.split()[1:]).lower() == rest.lower()]
+    return name if len(same) > 1 else rest
+
+
+@bot.listen("on_member_update")
+async def remember_old_fighter(before, after):
+    try:
+        if before.display_name != after.display_name and not after.bot:
+            note_fighter_names(after.guild.id, after.id, before.display_name, "nickname")
+    except Exception as error:
+        print(f"Former name check failed: {error}")
+
+
+_former_scanned = set()
+
+
+async def check_former_names():
+    for guild in list(getattr(bot, "guilds", [])):
+        if guild.id not in _former_scanned:
+            _former_scanned.add(guild.id)
+            scan_former_names(guild.id)
+            for member in getattr(guild, "members", []):
+                if not member.bot:
+                    note_fighter_names(guild.id, member.id, member.display_name, "nickname")
+
+
+FORMER_ACTIONS = [
+    app_commands.Choice(name="Add a former fighter", value="add"),
+    app_commands.Choice(name="Remove (hide) a former fighter", value="remove"),
+    app_commands.Choice(name="List their fighter names", value="list"),
+]
+
+
+@bot.tree.command(name="formername", description="Staff: add, remove or list a member's former UFC 6 fighters.")
+@app_commands.describe(action="What to do", member="The member", fighter="UFC 6 fighter, e.g. Volkanovski (for add / remove)")
+@app_commands.choices(action=FORMER_ACTIONS)
+async def formername(interaction: discord.Interaction, action: app_commands.Choice[str], member: discord.Member, fighter: str = None):
+
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can change former fighters.", ephemeral=True)
+        return
+
+    guild_id = interaction.guild.id
+
+    if action.value == "list":
+        rows = discipline_query("SELECT * FROM former_names WHERE guild_id = ? AND user_id = ? ORDER BY first_seen", (guild_id, member.id))
+        now = ufc6_matches(member.display_name)
+        lines = [f"**Now:** {' / '.join(now) if now else 'no UFC 6 fighter in their name'}"]
+        for row in rows:
+            source = {"fight": "from a logged fight", "nickname": "from a name change", "staff": f"added by <@{row['added_by']}>"}.get(row["source"], row["source"])
+            lines.append(f"{'~~' if row['hidden'] else ''}{row['name']}{'~~ (hidden)' if row['hidden'] else ''} · {source}")
+        embed = discord.Embed(title=f"🥊 {name_without_record(member.display_name)}: fighter names", description="\n".join(lines)[:4000], color=PFO_GOLD)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    matches = ufc6_matches(fighter or "")
+    if not matches:
+        await interaction.response.send_message(
+            f"❌ **{fighter or 'That'}** isn't a UFC 6 fighter. Use their real name, e.g. `Volkanovski` or `Alexander Volkanovski`.",
+            ephemeral=True
+        )
+        return
+    name = matches[0]
+
+    if action.value == "add":
+        discipline_query(
+            "INSERT INTO former_names (guild_id, user_id, name, source, first_seen, added_by) VALUES (?, ?, ?, 'staff', ?, ?) "
+            "ON CONFLICT(guild_id, user_id, name) DO UPDATE SET hidden = 0",
+            (guild_id, member.id, name, now_utc(), interaction.user.id), write=True
+        )
+        text = f"✅ Added **{name}** to {member.mention}'s former fighters."
+    else:
+        discipline_query(
+            "INSERT INTO former_names (guild_id, user_id, name, source, first_seen, hidden, added_by) VALUES (?, ?, ?, 'staff', ?, 1, ?) "
+            "ON CONFLICT(guild_id, user_id, name) DO UPDATE SET hidden = 1",
+            (guild_id, member.id, name, now_utc(), interaction.user.id), write=True
+        )
+        text = f"🗑️ **{name}** won't show as one of {member.mention}'s former fighters."
+
+    await interaction.response.send_message(text, ephemeral=True)
+    try:
+        await post_staff_log(interaction.guild, staff_log_embed("🥊 Former fighters", [f"{interaction.user.mention}: {text[2:]}"]))
+    except Exception:
+        pass
 
 
 # ============================================================
