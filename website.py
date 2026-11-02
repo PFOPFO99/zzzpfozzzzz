@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "16"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "18"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -3612,6 +3612,12 @@ img{max-width:100%}
 .nu-head b{font-size:15px;line-height:1.25;word-break:break-word}
 .nu-head span{font-size:12px;color:var(--muted)}
 .logged-in .nav-cta{display:none}
+@media (max-width:1080px){
+  .nav-user{margin-left:auto;position:static}
+  .nav-cta + .nav-user{margin-left:0}
+  .logged-in .nav-user{margin-left:auto}
+  .nav-user + .nav-burger{margin-left:0}
+}
 @media (max-width:1320px){.nu-chip{max-width:160px}}
 .badge-double{background:linear-gradient(90deg,var(--gold),var(--gold2));color:var(--bg)}
 .brand{flex-shrink:0}
@@ -3624,6 +3630,11 @@ img{max-width:100%}
 .nu-menu a:hover,.nu-menu button:hover{background:var(--panel2)}
 .nu-menu .nd-t{font-size:14px;font-weight:700}
 .nu-sep{height:1px;background:var(--line2);margin:6px 4px}
+.nu-menu{background:#0E0E12!important;z-index:60;isolation:isolate}
+@media (max-width:1080px){
+  .nu-menu{left:max(16px,env(safe-area-inset-left,0px));right:max(16px,env(safe-area-inset-right,0px));top:calc(100% + 6px);
+    min-width:0;max-width:none;max-height:calc(100vh - 110px);overflow-y:auto}
+}
 @media (max-width:600px){.nu-name{display:none}.nu-chip{padding-right:8px}}
 .pfo-toast{position:fixed;left:50%;bottom:max(20px,env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:80;max-width:min(92vw,520px);padding:12px 18px;border-radius:12px;background:#16161B;border:1px solid var(--line2);color:var(--text);font-weight:600;box-shadow:0 14px 40px rgba(0,0,0,.5)}
 .pfo-toast.bad{border-color:rgba(229,72,77,.6)}
@@ -3901,7 +3912,17 @@ ACCOUNT_JS = r"""
         document.body.classList.add('logged-in');
         slot.innerHTML = '<button type="button" class="nu-chip" aria-expanded="false" aria-haspopup="true" title="' + P.esc(me.name) + '">' + av + '<span class="nu-name">' + P.esc(me.name) + '</span></button><div class="nu-menu" hidden>' + head + links + '</div>';
         var chip = slot.querySelector('.nu-chip'), menu = slot.querySelector('.nu-menu');
-        chip.addEventListener('click', function (e) { e.stopPropagation(); menu.hidden = !menu.hidden; chip.setAttribute('aria-expanded', !menu.hidden); });
+        chip.addEventListener('click', function (e) {
+          e.stopPropagation();
+          menu.hidden = !menu.hidden;
+          chip.setAttribute('aria-expanded', !menu.hidden);
+          if (!menu.hidden) {
+            var navEl = document.querySelector('.nav'), burgerEl = document.querySelector('.nav-burger');
+            if (navEl && navEl.classList.contains('nav-open')) { navEl.classList.remove('nav-open'); if (burgerEl) burgerEl.setAttribute('aria-expanded', 'false'); }
+          }
+        });
+        var burgerBtn = document.querySelector('.nav-burger');
+        if (burgerBtn) burgerBtn.addEventListener('click', function () { menu.hidden = true; chip.setAttribute('aria-expanded', 'false'); });
         document.addEventListener('click', function (e) { if (!slot.contains(e.target)) { menu.hidden = true; chip.setAttribute('aria-expanded', 'false'); } });
         slot.querySelectorAll('[data-out]').forEach(function (b) {
           b.addEventListener('click', function () {
