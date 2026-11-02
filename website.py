@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "15"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "16"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -231,6 +231,12 @@ def rank_label(rank):
     if rank is None:
         return None
     return "Champion" if rank == 0 else f"#{rank}"
+
+
+def champ_tag_for(ctx, user_id):
+    """DOUBLE CHAMP / TRIPLE CHAMP, or None."""
+    belts = sum(1 for r in ctx.get_user_rankings(ctx.gid, user_id) if r["rank"] == 0 and r["weight"] != ctx.P4P_WEIGHT)
+    return {2: "DOUBLE CHAMP", 3: "TRIPLE CHAMP"}.get(belts, f"{belts}x CHAMP" if belts > 3 else None)
 
 
 def all_fighter_ids(ctx):
@@ -1122,7 +1128,7 @@ def render_rankings(ctx, selected=None):
                 days = ctx.reign_days(reign) if reign else None
                 champ_html = f"""
       <a href="{fighter_url(uid)}" class="feature rv" data-rank-uid="{uid}" data-rank-w="{esc(weight)}" data-rank="0">
-        <span class="eyebrow">{esc(weight.upper())} CHAMPION</span>
+        <span class="eyebrow">{esc(weight.upper())} CHAMPION{(" · " + champ_tag_for(ctx, uid)) if champ_tag_for(ctx, uid) else ""}</span>
         {avatar_html(ctx, uid, name, 'av av-xl')}
         <span class="d feature-name">{esc(first)}<br>{esc(last)}</span>
         <span class="feature-stats">
@@ -1259,7 +1265,10 @@ def render_fighters(ctx):
         division = e["division"]
         rank = e["ranks"].get(division) if division else None
         badge = ""
-        if rank == 0:
+        multi = champ_tag_for(ctx, e["id"])
+        if multi:
+            badge = f'<span class="badge badge-gold badge-double">{multi}</span>'
+        elif rank == 0:
             badge = '<span class="badge badge-gold">CHAMPION</span>'
         elif rank:
             badge = f'<span class="badge">#{rank}</span>'
@@ -1281,7 +1290,8 @@ def render_fighters(ctx):
     )
 
     grid = "".join(card(e, i) for i, e in enumerate(current)) or '<p class="empty">No fighters yet.</p>'
-    prospects = [e for e in current if getattr(ctx, "is_prospect", None) and ctx.is_prospect(e["stats"])]
+    prospects = [e for e in current if getattr(ctx, "is_prospect", None) and ctx.is_prospect(e["stats"])
+                 and not any(rank == 0 for w, rank in e["ranks"].items() if w != ctx.P4P_WEIGHT)]
     prospect_html = ""
     if prospects:
         prospect_html = f"""
@@ -1339,6 +1349,9 @@ def render_fighter(ctx, user_id):
 
     # Badge line
     badge_bits = []
+    multi = champ_tag_for(ctx, user_id)
+    if multi:
+        badge_bits.append(multi)
     for weight in ctx.DIVISION_NAMES:
         if ranks.get(weight) == 0:
             badge_bits.append(f"{weight.upper()} CHAMPION")
@@ -1351,7 +1364,7 @@ def render_fighter(ctx, user_id):
     if not member:
         badge_bits.append("FORMER FIGHTER")
     try:
-        if ctx.is_prospect(stats):
+        if ctx.is_prospect(stats) and not any(r == 0 for w, r in ranks.items() if w != ctx.P4P_WEIGHT):
             badge_bits.append("🌱 PROSPECT")
     except Exception:
         pass
@@ -3592,10 +3605,20 @@ img{max-width:100%}
 .nav-user{position:relative;display:flex;align-items:center}
 .nav-user:empty{display:none}
 .nu-login{display:inline-flex;align-items:center;gap:8px}
-.nu-chip{display:flex;align-items:center;gap:8px;padding:5px 12px 5px 5px;border:1px solid var(--line2);border-radius:999px;background:transparent;color:var(--text);font:700 13px Inter,sans-serif;cursor:pointer;min-height:40px}
+.nu-chip{display:flex;align-items:center;gap:8px;padding:5px 14px 5px 5px;border:1px solid var(--line2);border-radius:999px;background:transparent;color:var(--text);font:700 13px Inter,sans-serif;cursor:pointer;min-height:40px;max-width:220px;white-space:nowrap}
+.nu-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.nu-chip img,.nu-av{flex-shrink:0}
+.nu-head{display:flex;flex-direction:column;gap:2px;padding:10px 12px 12px;border-bottom:1px solid var(--line2);margin-bottom:6px}
+.nu-head b{font-size:15px;line-height:1.25;word-break:break-word}
+.nu-head span{font-size:12px;color:var(--muted)}
+.logged-in .nav-cta{display:none}
+@media (max-width:1320px){.nu-chip{max-width:160px}}
+.badge-double{background:linear-gradient(90deg,var(--gold),var(--gold2));color:var(--bg)}
+.brand{flex-shrink:0}
+.nav-links{min-width:0}
 .nu-chip[aria-expanded="true"]{border-color:var(--gold)}
 .nu-chip img,.nu-av{width:30px;height:30px;border-radius:50%;object-fit:cover;background:var(--panel2);display:grid;place-items:center;font-size:11px;color:var(--gold)}
-.nu-menu{position:absolute;right:0;top:calc(100% + 10px);min-width:230px;padding:8px;border:1px solid var(--line2);border-radius:14px;background:rgba(12,12,15,.98);box-shadow:0 20px 50px rgba(0,0,0,.55);display:flex;flex-direction:column;z-index:45}
+.nu-menu{position:absolute;right:0;top:calc(100% + 10px);min-width:240px;max-width:min(320px,calc(100vw - 32px));padding:8px;border:1px solid var(--line2);border-radius:14px;background:rgba(12,12,15,.98);box-shadow:0 20px 50px rgba(0,0,0,.55);display:flex;flex-direction:column;z-index:45}
 .nu-menu[hidden]{display:none}
 .nu-menu a,.nu-menu button{display:flex;flex-direction:column;gap:2px;padding:10px 12px;border-radius:10px;color:var(--text);background:none;border:0;text-align:left;font:inherit;cursor:pointer}
 .nu-menu a:hover,.nu-menu button:hover{background:var(--panel2)}
@@ -3874,7 +3897,9 @@ ACCOUNT_JS = r"""
         if (me.levels.staff) links += '<a href="/staff"><span class="nd-t">Staff dashboard</span><span class="nd-s">Helper and above</span></a>';
         if (me.levels.senior) links += '<a href="/stats"><span class="nd-t">Site stats</span><span class="nd-s">Head Moderator+</span></a>';
         links += '<div class="nu-sep"></div><button type="button" data-out="0"><span class="nd-t">Log out</span></button><button type="button" data-out="1"><span class="nd-t">Log out everywhere</span><span class="nd-s">Every phone and computer</span></button>';
-        slot.innerHTML = '<button type="button" class="nu-chip" aria-expanded="false" aria-haspopup="true">' + av + '<span class="nu-name">' + P.esc(me.name) + '</span></button><div class="nu-menu" hidden>' + links + '</div>';
+        var head = '<div class="nu-head"><b>' + P.esc(me.name) + '</b><span>' + Number(me.coins || 0).toLocaleString('en-GB') + ' coins</span></div>';
+        document.body.classList.add('logged-in');
+        slot.innerHTML = '<button type="button" class="nu-chip" aria-expanded="false" aria-haspopup="true" title="' + P.esc(me.name) + '">' + av + '<span class="nu-name">' + P.esc(me.name) + '</span></button><div class="nu-menu" hidden>' + head + links + '</div>';
         var chip = slot.querySelector('.nu-chip'), menu = slot.querySelector('.nu-menu');
         chip.addEventListener('click', function (e) { e.stopPropagation(); menu.hidden = !menu.hidden; chip.setAttribute('aria-expanded', !menu.hidden); });
         document.addEventListener('click', function (e) { if (!slot.contains(e.target)) { menu.hidden = true; chip.setAttribute('aria-expanded', 'false'); } });
@@ -5785,7 +5810,7 @@ def render_me(ctx, viewer, query):
     if division:
         chips += chip(division.upper(), esc(rank_label(rank)) if rank is not None else "UNRANKED")
     try:
-        if ctx.is_prospect(stats):
+        if ctx.is_prospect(stats) and not ctx.is_any_champion(gid, uid):
             chips += chip("TAG", "🌱 PROSPECT")
     except Exception:
         pass
