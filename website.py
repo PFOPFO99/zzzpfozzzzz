@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "20"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "21"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -2331,7 +2331,7 @@ def render_sportsbook(ctx):
                      play_tabs("sportsbook") + f'<div class="evchips l-up">{strip}</div>' + cta)
     mine = ('<section class="block bt" id="mybets" aria-labelledby="mybets-h" hidden><div class="head-t rv"><span class="eyebrow">ONLY YOU CAN SEE THIS</span>'
             '<h2 id="mybets-h" class="d h-m">MY BETS</h2></div><div data-mybets></div></section>')
-    slip = ('<aside class="slip" id="slip" hidden aria-label="Bet slip"><div class="slip-head"><span class="d">BET SLIP</span><span class="muted" id="slipodds"></span>'
+    slip = (f'<aside class="slip" id="slip" hidden aria-label="Bet slip" data-cap="{getattr(ctx, "MAX_BET_ODDS", 0) or 0}"><div class="slip-head"><span class="d">BET SLIP</span><span class="muted" id="slipodds"></span>'
             '<button type="button" class="slip-x" id="slipclear" aria-label="Clear the slip">CLEAR</button></div><ol class="slip-legs" id="sliplegs"></ol>'
             '<div class="slip-foot"><label>Stake <input type="number" id="slipstake" min="1" step="1" inputmode="numeric" placeholder="Coins"></label>'
             '<span class="muted" id="slipret"></span><button type="button" class="btn btn-gold btn-sm" id="slipgo">PLACE BET</button></div>'
@@ -4382,7 +4382,9 @@ V2_JS = r"""
         var l = slip.legs[k]; var o = currentOdds(slip.market, k, l.pick, l.method); total *= o;
         return '<li><span>' + esc(l.label) + '</span><span class="tab">' + o.toFixed(2) + '</span><button type="button" data-unpick="' + k + '" aria-label="Remove">✕</button></li>';
       }).join('');
-      $('#slipodds').textContent = keys.length ? (keys.length > 1 ? keys.length + '-fold @ ' : 'Single @ ') + total.toFixed(2) + ' · ' + slip.event : '';
+      var cap = parseFloat(box.getAttribute('data-cap')) || 0, capped = cap && total > cap;
+      if (capped) total = cap;
+      $('#slipodds').textContent = keys.length ? (keys.length > 1 ? keys.length + '-fold @ ' : 'Single @ ') + total.toFixed(2) + (capped ? ' (max)' : '') + ' · ' + slip.event : '';
       var stake = parseInt($('#slipstake').value, 10) || 0;
       $('#slipret').textContent = stake ? 'Returns ' + num(Math.round(stake * total)) : '';
       document.body.classList.toggle('has-slip', !!keys.length);
