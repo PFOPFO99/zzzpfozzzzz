@@ -427,6 +427,7 @@ def setup_database():
     setup_social_tables()
     setup_week_post_table()
     setup_former_name_table()
+    setup_cancelled_bout_table()
     setup_fantasy_tables()
 
 
@@ -3074,11 +3075,10 @@ async def rankingsp(
                 existing_message.id
             )
 
+            board_embed, board_file = await ranking_post(interaction.guild, weight)
             await existing_message.edit(
-                embed=await create_ranking_embed(
-                    interaction.guild,
-                    weight
-                ),
+                embed=board_embed,
+                attachments=[board_file] if board_file else [],
                 allowed_mentions=discord.AllowedMentions(
                     users=True
                 )
@@ -3090,12 +3090,11 @@ async def rankingsp(
         # Create a new message only if none exists.
         # ----------------------------------------------------
 
-        message = await interaction.channel.send(
-            embed=await create_ranking_embed(
-                interaction.guild,
-                weight
-            )
-        )
+        board_embed, board_file = await ranking_post(interaction.guild, weight)
+        if board_file:
+            message = await interaction.channel.send(embed=board_embed, file=board_file)
+        else:
+            message = await interaction.channel.send(embed=board_embed)
 
         save_ranking_message(
             interaction.guild.id,
@@ -3487,11 +3486,10 @@ async def refresh_ranking_message(
             saved_message["message_id"]
         )
 
+        board_embed, board_file = await ranking_post(guild, weight)
         await message.edit(
-            embed=await create_ranking_embed(
-                guild,
-                weight
-            ),
+            embed=board_embed,
+            attachments=[board_file] if board_file else [],
             allowed_mentions=discord.AllowedMentions(
                 users=True
             )
@@ -16543,27 +16541,597 @@ async def admincoin(
         ))
 
 
+# ============================================================
+# RANKINGS AS IMAGES (the website's look, in Discord)
+#
+# Every rankings post (each division and P4P) is a picture drawn
+# by the bot: champion card on the left (with interim / BMF / WMF
+# under it), contenders #1-#15 with profile pictures, records and
+# movement on the right. Redrawn whenever the rankings change.
+# Needs Pillow, and the fonts in the bot's "fonts" folder
+# (falls back to a plain font if they're missing).
+# Railway variable RANKING_IMAGES=off goes back to the text boards.
+# ============================================================
+
+RANKING_IMAGES = os.getenv("RANKING_IMAGES", "on").strip().lower() not in ("off", "no", "false", "0")
+RANK_FONT_DIRS = [os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts"), "/usr/share/fonts/opentype/inter"]
+_rank_font_cache = {}
+_avatar_cache = {}
+
+R_BG = (8, 8, 10); R_LINE = (36, 36, 42); R_TEXT = (244, 244, 245); R_MUTED = (161, 161, 170); R_DIM = (110, 110, 120)
+R_GOLD = (201, 162, 74); R_GOLD2 = (226, 194, 122); R_GREEN = (61, 214, 140); R_RED = (240, 122, 126)
+
+
+def rank_font(name: str, size: int):
+    """name: 'display' (big headings), 'display_bold', 'bold', 'semibold', 'medium'."""
+    from PIL import ImageFont
+    key = (name, size)
+    if key in _rank_font_cache:
+        return _rank_font_cache[key]
+    files = {
+        "display": ["BarlowCondensed-ExtraBold.ttf", "InterDisplay-Black.otf", "Inter-Black.otf"],
+        "display_bold": ["InterDisplay-Bold.otf", "Inter-Bold.otf"],
+        "bold": ["Inter-Bold.otf"],
+        "semibold": ["Inter-SemiBold.otf", "Inter-Bold.otf"],
+        "medium": ["Inter-Medium.otf", "Inter-Regular.otf"],
+    }[name]
+    font = None
+    for folder in RANK_FONT_DIRS:
+        for file in files:
+            path = os.path.join(folder, file)
+            if os.path.exists(path):
+                try:
+                    font = ImageFont.truetype(path, size)
+                    break
+                except Exception:
+                    continue
+        if font:
+            break
+    if font is None:
+        try:
+            font = ImageFont.load_default(size)
+        except TypeError:
+            font = ImageFont.load_default()
+    _rank_font_cache[key] = font
+    return font
+
+
+def _fit_font(draw, text, name, size, max_w, minimum=18):
+    while size > minimum:
+        font = rank_font(name, size)
+        if draw.textlength(text, font=font) <= max_w:
+            return font
+        size -= 2
+    return rank_font(name, minimum)
+
+
+def _tracked(draw, xy, text, font, fill, track=0):
+    x, y = xy
+    for ch in text:
+        draw.text((x, y), ch, font=font, fill=fill)
+        x += draw.textlength(ch, font=font) + track
+    return x
+
+
+def _tracked_width(draw, text, font, track):
+    return sum(draw.textlength(ch, font=font) + track for ch in text) - track
+
+
+def _round_avatar(size, name, picture_bytes=None, ring=None):
+    from PIL import Image, ImageDraw
+    import io as _io
+    face = None
+    if picture_bytes:
+        try:
+            face = Image.open(_io.BytesIO(picture_bytes)).convert("RGB").resize((size, size))
+        except Exception:
+            face = None
+    if face is None:
+        face = Image.new("RGB", (size, size), (22, 22, 27))
+        d = ImageDraw.Draw(face)
+        initials = "".join(p[0] for p in name.replace("/", " ").split()[:2]).upper() or "?"
+        font = rank_font("display_bold", max(10, int(size * .36)))
+        w = d.textlength(initials, font=font)
+        d.text(((size - w) / 2, size * .3), initials, font=font, fill=R_GOLD2)
+    mask = Image.new("L", (size * 4, size * 4), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
+    mask = mask.resize((size, size), Image.LANCZOS)
+    tile = Image.new("RGBA", (size, size))
+    tile.paste(face, (0, 0), mask)
+    if ring:
+        big = Image.new("RGBA", (size * 4, size * 4))
+        ImageDraw.Draw(big).ellipse((4, 4, size * 4 - 5, size * 4 - 5), outline=ring + (255,), width=10)
+        tile.alpha_composite(big.resize((size, size), Image.LANCZOS))
+    return tile
+
+
+def _move_marker(draw, x_right, y, move, size=26):
+    """Draws ▲ 2 / ▼ 1 / NEW / — right-aligned at x_right."""
+    font = rank_font("bold", size)
+    if move and move.startswith(("up", "down")):
+        up = move.startswith("up")
+        number = move[2:] if up else move[4:]
+        colour = R_GREEN if up else R_RED
+        tw = draw.textlength(number, font=font) if number else 0
+        tx = x_right - tw
+        if number:
+            draw.text((tx, y), number, font=font, fill=colour)
+        s = int(size * .75)
+        ax = tx - s - (int(size * .3) if number else 0)
+        cy = y + size * .62
+        if up:
+            draw.polygon([(ax, cy + s / 2), (ax + s, cy + s / 2), (ax + s / 2, cy - s / 2)], fill=colour)
+        else:
+            draw.polygon([(ax, cy - s / 2), (ax + s, cy - s / 2), (ax + s / 2, cy + s / 2)], fill=colour)
+    elif move == "new":
+        draw.text((x_right - draw.textlength("NEW", font=font), y), "NEW", font=font, fill=R_GOLD2)
+    else:
+        draw.text((x_right - draw.textlength("—", font=font), y), "—", font=font, fill=R_DIM)
+
+
+def draw_rankings_image(division: str, champion, contenders, belts, unranked, updated_text: str, logo_bytes=None, p4p=False):
+    """
+    One tall column, sized so it still reads well when Discord shrinks it on a phone.
+    champion: {name, record, defences, days, picture} or None. Ignored for P4P.
+    contenders: [{rank, name, record, move, picture}]
+    belts: [(label, name, record, picture)] e.g. ("INTERIM CHAMPION", ...)
+    unranked: [name]
+    Returns PNG bytes.
+    """
+    from PIL import Image, ImageDraw, ImageFilter
+    import io as _io
+
+    W, pad = 760, 40
+    row_h = 88
+    head_h = 214
+    champ_h = 0 if p4p else 286
+    belts_h = 0 if p4p else len(belts) * 84
+    list_head = 56
+    list_h = row_h * max(len(contenders), 1)
+    unranked_h = (64 + 46 * ((len(unranked) + 1) // 2)) if unranked else 0
+    H = head_h + champ_h + belts_h + list_head + list_h + unranked_h + 96
+
+    img = Image.new("RGBA", (W, H), R_BG + (255,))
+    d = ImageDraw.Draw(img)
+    for x in range(0, W, 60):
+        d.line([(x, 0), (x, H)], fill=(14, 14, 17))
+    for y in range(0, H, 60):
+        d.line([(0, y), (W, y)], fill=(14, 14, 17))
+    glow = Image.new("RGBA", (W, H))
+    ImageDraw.Draw(glow).ellipse((-260, -260, 520, 380), fill=R_GOLD + (42,))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(110)))
+    d = ImageDraw.Draw(img)
+
+    # ---------- header ----------
+    if logo_bytes:
+        img.alpha_composite(_round_avatar(60, "PFO", logo_bytes), (W - pad - 60, 26))
+        d = ImageDraw.Draw(img)
+    d.ellipse((pad, 50, pad + 12, 62), fill=R_GREEN)
+    _tracked(d, (pad + 24, 42), f"PFO RANKINGS · {updated_text}".upper(), rank_font("bold", 22), R_GOLD, 3)
+    title = "POUND FOR POUND" if p4p else division.upper()
+    d.text((pad - 3, 84), title, font=_fit_font(d, title, "display", 104, W - pad * 2), fill=R_TEXT)
+    y = head_h
+
+    # ---------- champion ----------
+    if not p4p:
+        x0, x1 = pad, W - pad
+        card = Image.new("RGBA", (W, H))
+        ImageDraw.Draw(card).rounded_rectangle((x0, y, x1, y + 262), 26, fill=(17, 15, 12, 255), outline=R_GOLD + (180,), width=3)
+        img.alpha_composite(card)
+        g2 = Image.new("RGBA", (W, H))
+        ImageDraw.Draw(g2).ellipse((x0 - 20, y - 20, x0 + 300, y + 260), fill=R_GOLD + (40,))
+        img.alpha_composite(g2.filter(ImageFilter.GaussianBlur(55)))
+        d = ImageDraw.Draw(img)
+        if champion:
+            img.alpha_composite(_round_avatar(176, champion["name"], champion.get("picture"), ring=R_GOLD), (x0 + 30, y + 43))
+            d = ImageDraw.Draw(img)
+            tx = x0 + 236
+            _tracked(d, (tx, y + 34), "CHAMPION", rank_font("bold", 22), R_GOLD, 3)
+            parts = champion["name"].upper().split()
+            first, last = (parts[0], " ".join(parts[1:])) if len(parts) > 1 else (parts[0] if parts else "", "")
+            nf = _fit_font(d, max(first, last, key=len), "display", 56, x1 - tx - 30)
+            d.text((tx, y + 66), first, font=nf, fill=R_TEXT)
+            if last:
+                d.text((tx, y + 66 + nf.size * 1.02), last, font=nf, fill=R_GOLD2)
+            stats = [(champion["record"] or "–", "RECORD"), (str(champion.get("defences", 0)), "DEF.")]
+            if champion.get("days") is not None:
+                stats.append((str(champion["days"]), "DAYS"))
+            vf, lf = rank_font("display", 36), rank_font("bold", 16)
+            sx, sy = tx, y + 196
+            for value, label in stats:
+                d.text((sx, sy), value, font=vf, fill=R_TEXT)
+                vw = d.textlength(value, font=vf)
+                _tracked(d, (sx + vw + 8, sy + 16), label, lf, R_MUTED, 2)
+                sx += vw + 8 + _tracked_width(d, label, lf, 2) + 26
+        else:
+            d.ellipse((x0 + 30, y + 34, x0 + 206, y + 210), outline=R_LINE, width=3)
+            d.text((x0 + 100, y + 80), "?", font=rank_font("display", 72), fill=R_DIM)
+            tx = x0 + 236
+            _tracked(d, (tx, y + 34), "CHAMPION", rank_font("bold", 22), R_GOLD, 3)
+            d.text((tx, y + 72), "VACANT", font=rank_font("display", 64), fill=R_TEXT)
+            d.text((tx, y + 156), "The belt is up for grabs.", font=rank_font("medium", 26), fill=R_MUTED)
+        y += champ_h
+
+        for label, name, record, picture in belts:
+            box = Image.new("RGBA", (W, H))
+            ImageDraw.Draw(box).rounded_rectangle((x0, y, x1, y + 72), 18, fill=(15, 15, 19, 255), outline=R_LINE + (255,), width=2)
+            img.alpha_composite(box)
+            img.alpha_composite(_round_avatar(48, name, picture), (x0 + 16, y + 12))
+            d = ImageDraw.Draw(img)
+            _tracked(d, (x0 + 80, y + 10), label, rank_font("bold", 16), R_GOLD, 2)
+            rf = rank_font("semibold", 26)
+            rw = d.textlength(record, font=rf)
+            d.text((x1 - 20 - rw, y + 22), record, font=rf, fill=R_MUTED)
+            d.text((x0 + 80, y + 30), name, font=_fit_font(d, name, "display_bold", 30, x1 - 20 - rw - 30 - (x0 + 80)), fill=R_TEXT)
+            y += 84
+
+    # ---------- contenders ----------
+    lx0, lx1 = pad, W - pad
+    hf = rank_font("bold", 18)
+    _tracked(d, (lx0, y + 14), "RANKED" if p4p else "CONTENDERS", hf, R_DIM, 3)
+    label = "RECORD · MOVE"
+    _tracked(d, (lx1 - _tracked_width(d, label, hf, 3), y + 14), label, hf, R_DIM, 3)
+    d.line([(lx0, y + 48), (lx1, y + 48)], fill=R_LINE, width=2)
+    y += list_head
+    if not contenders:
+        d.text((lx0, y + 24), "Nobody ranked here yet.", font=rank_font("medium", 30), fill=R_MUTED)
+    move_w = 70
+    for c in contenders:
+        if c["rank"] == 1:
+            hl = Image.new("RGBA", (W, H))
+            ImageDraw.Draw(hl).rectangle((lx0, y, lx1, y + row_h - 2), fill=R_GOLD + (18,))
+            img.alpha_composite(hl)
+            d = ImageDraw.Draw(img)
+        num = str(c["rank"])
+        nf = rank_font("display", 44)
+        d.text((lx0 + 4, y + 16), num, font=nf, fill=R_GOLD if c["rank"] == 1 else R_DIM)
+        img.alpha_composite(_round_avatar(58, c["name"], c.get("picture")), (lx0 + 70, y + 15))
+        d = ImageDraw.Draw(img)
+        _move_marker(d, lx1, y + 28, c.get("move") or "", 26)
+        rf = rank_font("semibold", 28)
+        rw = d.textlength(c["record"], font=rf)
+        d.text((lx1 - move_w - 14 - rw, y + 26), c["record"], font=rf, fill=R_MUTED)
+        name_x = lx0 + 144
+        name_font = _fit_font(d, c["name"], "display_bold", 38, lx1 - move_w - 14 - rw - 24 - name_x, 22)
+        d.text((name_x, y + row_h / 2), c["name"], font=name_font, fill=R_TEXT, anchor="lm")
+        d.line([(lx0, y + row_h - 1), (lx1, y + row_h - 1)], fill=(26, 26, 31), width=2)
+        y += row_h
+
+    # ---------- unranked ----------
+    if unranked:
+        y += 26
+        _tracked(d, (lx0, y), "UNRANKED", hf, R_DIM, 3)
+        uf = rank_font("semibold", 26)
+        col_w = (lx1 - lx0) / 2
+        for k, name in enumerate(unranked):
+            x = lx0 + (k % 2) * col_w
+            yy = y + 38 + (k // 2) * 46
+            text = name
+            while d.textlength(text, font=uf) > col_w - 20 and len(text) > 3:
+                text = text[:-2] + "…"
+            d.text((x, yy), text, font=uf, fill=R_MUTED)
+
+    # ---------- footer ----------
+    fy = H - 66
+    d.line([(pad, fy - 16), (W - pad, fy - 16)], fill=R_LINE, width=2)
+    site = (BOT_SITE_URL.replace("https://", "").replace("http://", "") + "/rankings") if BOT_SITE_URL else ""
+    d.text((pad, fy + 2), "Moves since the last update", font=rank_font("medium", 20), fill=R_DIM)
+    if site:
+        sf = _fit_font(d, site, "bold", 22, W - pad * 2 - 330, 14)
+        d.text((W - pad - d.textlength(site, font=sf), fy + 1), site, font=sf, fill=R_GOLD2)
+
+    out = _io.BytesIO()
+    img.convert("RGB").save(out, "PNG", optimize=True)
+    return out.getvalue()
+
+
+async def _avatar_bytes(member):
+    if member is None:
+        return None
+    try:
+        asset = member.display_avatar.replace(size=128, static_format="png")
+        url = str(asset.url)
+        if url in _avatar_cache:
+            return _avatar_cache[url]
+        data = await asset.read()
+        if len(_avatar_cache) > 400:
+            _avatar_cache.clear()
+        _avatar_cache[url] = data
+        return data
+    except Exception:
+        return None
+
+
+_logo_bytes = None
+
+
+async def _logo():
+    global _logo_bytes
+    if _logo_bytes is not None:
+        return _logo_bytes or None
+    _logo_bytes = b""
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", LOGO_FILE)
+        if os.path.exists(path):
+            from PIL import Image
+            import io as _io
+            frame = Image.open(path).convert("RGB")
+            out = _io.BytesIO(); frame.save(out, "PNG"); _logo_bytes = out.getvalue()
+        elif asset_url(LOGO_FILE):
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(asset_url(LOGO_FILE), timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    if response.status == 200:
+                        from PIL import Image
+                        import io as _io
+                        frame = Image.open(_io.BytesIO(await response.read())).convert("RGB")
+                        out = _io.BytesIO(); frame.save(out, "PNG"); _logo_bytes = out.getvalue()
+    except Exception as error:
+        print(f"Rankings logo failed: {error}")
+    return _logo_bytes or None
+
+
+def _board_name(guild, user_id, fallback=None):
+    member = guild.get_member(user_id)
+    name = name_without_record(member.display_name) if member else (fallback or "Former fighter")
+    return re.sub(r"\s*\[[^\[\]]*\]", "", name).strip() or name
+
+
+def _board_record(guild_id, user_id):
+    try:
+        return stats_record(get_fighter_stats(guild_id, user_id))
+    except Exception:
+        return ""
+
+
+async def ranking_image_file(guild: discord.Guild, weight: str):
+    """discord.File with this board drawn as a picture, or None (no Pillow, or turned off)."""
+    if not RANKING_IMAGES:
+        return None
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        return None
+
+    gid = guild.id
+    rows = get_division_rankings(gid, weight)
+    p4p = weight == P4P_WEIGHT
+
+    # Movement: since the last rankings update post (like the website), else the last change.
+    before = None
+    try:
+        settings = update_settings(gid)
+        if settings and settings["snapshot_at"]:
+            before = saved_rankings(gid).get(weight, {})
+    except Exception:
+        before = None
+
+    def move(row):
+        uid, rank = row["discord_user_id"], row["rank"]
+        if before is not None:
+            old = before.get(uid)
+            if old is None:
+                return "new"
+            if old == 0 and rank != 0:
+                return f"down{rank}"
+            diff = (old or 0) - rank
+            return f"up{diff}" if diff > 0 else f"down{-diff}" if diff < 0 else ""
+        m = row["movement"] or 0
+        return "up" if m > 0 else "down" if m < 0 else ""
+
+    contenders = []
+    for row in rows:
+        if row["rank"] < 1:
+            continue
+        member = guild.get_member(row["discord_user_id"])
+        contenders.append({
+            "rank": row["rank"], "name": _board_name(guild, row["discord_user_id"]), "record": _board_record(gid, row["discord_user_id"]),
+            "move": move(row), "picture": await _avatar_bytes(member),
+        })
+
+    champion = None
+    belts, unranked = [], []
+    if not p4p:
+        champ_row = next((r for r in rows if r["rank"] == 0), None)
+        if champ_row:
+            uid = champ_row["discord_user_id"]
+            defences, days = 0, None
+            try:
+                reigns = title_lineage(gid, weight)[0]
+                reign = reigns[-1] if reigns and reigns[-1]["user_id"] == uid else None
+                if reign:
+                    defences = reign["defences"]
+                    days = reign_days(reign)
+            except Exception:
+                pass
+            champion = {"name": _board_name(guild, uid), "record": _board_record(gid, uid), "defences": defences, "days": days,
+                        "picture": await _avatar_bytes(guild.get_member(uid))}
+        try:
+            for key, label in (("interim", "INTERIM CHAMPION"), ("bmf", "BMF"), ("wmf", "WMF")):
+                uid = get_division_belts(gid, weight).get(key)
+                if uid:
+                    belts.append((label, _board_name(guild, uid), _board_record(gid, uid), await _avatar_bytes(guild.get_member(uid))))
+        except Exception as error:
+            print(f"Ranking image belts failed: {error}")
+        try:
+            unranked = [_board_name(guild, uid) for uid in unranked_in_division(guild, weight)][:30]
+        except Exception:
+            unranked = []
+
+    now = uk_now()
+    updated = f"Updated {now.day} {now:%b}"
+    logo = await _logo()
+    png = await asyncio.to_thread(draw_rankings_image, weight, champion, contenders, belts, unranked, updated, logo, p4p)
+    slug = "p4p" if p4p else weight.lower().replace(" ", "_")
+    return discord.File(io.BytesIO(png), filename=f"rankings_{slug}.png")
+
+
+async def ranking_post(guild: discord.Guild, weight: str):
+    """(embed, file): the picture board, or the text board if pictures are off or can't be drawn."""
+    file = None
+    try:
+        file = await ranking_image_file(guild, weight)
+    except Exception as error:
+        print(f"Ranking image failed for {weight}: {error}")
+        file = None
+    if not file:
+        return await create_ranking_embed(guild, weight), None
+    embed = discord.Embed(color=PFO_GOLD, timestamp=discord.utils.utcnow())
+    logo = asset_url(LOGO_FILE)
+    if logo:
+        embed.set_author(name=ranking_author_text(weight), icon_url=logo)
+    else:
+        embed.set_author(name=ranking_author_text(weight))
+    embed.set_image(url=f"attachment://{file.filename}")
+    embed.set_footer(text=RANKING_FOOTER, icon_url=logo) if logo else embed.set_footer(text=RANKING_FOOTER)
+    return embed, file
+
+
+# ============================================================
+# CANCELLED FIGHTS ON A CARD
+#
+# When /cancelfight calls off a fight that's on a DMed card, the card
+# remembers it: the website's live card shows it as cancelled, it
+# drops out of "your next fight" in My PFO and on the home page, and
+# the event checklist stops waiting for its result. Undo brings it back.
+# ============================================================
+
+def setup_cancelled_bout_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS cancelled_bouts (
+            guild_id INTEGER NOT NULL,
+            event_key TEXT NOT NULL,
+            fighter_low INTEGER NOT NULL,
+            fighter_high INTEGER NOT NULL,
+            market_id INTEGER,
+            position INTEGER,
+            cancelled_at INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, event_key, fighter_low, fighter_high)
+        )
+    """)
+    try:
+        db.execute("ALTER TABLE bet_markets ADD COLUMN notice_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    db.commit()
+    db.close()
+
+
+def market_event_key(market):
+    """The card a betting event belongs to: the linked DMed card if there is one, else its name."""
+    try:
+        notice_id = market["notice_id"]
+    except (IndexError, KeyError):
+        notice_id = None
+    if notice_id:
+        notice = get_notice(notice_id)
+        if notice and notice["event"]:
+            return event_key(notice["event"])
+    return event_key(market["event"])
+
+
+def mark_bout_cancelled(guild_id: int, market_id: int, position: int, cancelled: bool):
+    market = get_market(market_id)
+    bout = discipline_query("SELECT * FROM bet_fights WHERE market_id = ? AND position = ?", (market_id, position))
+    if not market or not bout:
+        return
+    low, high = sorted((bout[0]["fighter_a"], bout[0]["fighter_b"]))
+    key = market_event_key(market)
+    if cancelled:
+        discipline_query(
+            "INSERT OR REPLACE INTO cancelled_bouts (guild_id, event_key, fighter_low, fighter_high, market_id, position, cancelled_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)", (guild_id, key, low, high, market_id, position, int(time.time())), write=True
+        )
+    else:
+        discipline_query("DELETE FROM cancelled_bouts WHERE guild_id = ? AND event_key = ? AND fighter_low = ? AND fighter_high = ?",
+                         (guild_id, key, low, high), write=True)
+
+
+def cancelled_pairs(guild_id: int, event: str):
+    """{frozenset((a, b))} of fights called off on this event."""
+    try:
+        return {frozenset((row["fighter_low"], row["fighter_high"])) for row in discipline_query(
+            "SELECT fighter_low, fighter_high FROM cancelled_bouts WHERE guild_id = ? AND event_key = ?", (guild_id, event_key(event or "")))}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def active_layout(notice):
+    """notice_layout without the fights that were cancelled."""
+    gone = cancelled_pairs(notice["guild_id"], notice["event"]) if notice["event"] else set()
+    return [(a, b, spot) for a, b, spot in notice_layout(notice) if frozenset((a, b)) not in gone]
+
+
+async def card_notice_autocomplete(interaction: discord.Interaction, current: str):
+    choices = []
+    for notice in discipline_query("SELECT * FROM card_notices WHERE guild_id = ? ORDER BY id DESC LIMIT 25", (interaction.guild.id,)):
+        name = notice["event"] or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
+        try:
+            count = len(notice_layout(notice))
+        except Exception:
+            count = 0
+        day = str(notice["created_at"])[:10]
+        label = f"{name} · {count} fight{'s' if count != 1 else ''} · DMed {day[8:10]}/{day[5:7]}"
+        if current.lower() in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=str(notice["id"])))
+    return choices[:25]
+
+
 @bot.tree.command(
     name="openbets",
     description="Open betting on a card with live odds (the sportsbook post)."
 )
 @app_commands.describe(
-    event="Event name, e.g. PFO Fight Night 16",
-    closes="When betting closes, UK time, e.g. 31/10/2026 19:00",
-    fighters="Fights in order: @Joe @Dan @Tom @Ben = Joe v Dan, Tom v Ben. Empty = last saved card"
+    card="A card you DMed: fills in the event, every fight and the Main Card / Prelims order",
+    event="Event name, e.g. PFO Fight Night 16 (not needed if you pick a card)",
+    closes="When betting closes, UK time, e.g. 31/10/2026 19:00 (empty = when the card starts)",
+    fighters="Or type the fights in order: @Joe @Dan @Tom @Ben = Joe v Dan, Tom v Ben. Empty = last saved card"
 )
+@app_commands.autocomplete(card=card_notice_autocomplete)
 async def openbets(
     interaction: discord.Interaction,
-    event: str,
-    closes: str,
-    fighters: str = None
+    event: str = None,
+    closes: str = None,
+    fighters: str = None,
+    card: str = None
 ):
 
     if not is_staff(interaction):
         await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can open betting.", ephemeral=True)
         return
 
-    moment = parse_event_datetime(closes)
+    notice = None
+    card_pairs = None
+    if card:
+        notice = get_notice(int(card)) if str(card).isdigit() else None
+        if not notice or notice["guild_id"] != interaction.guild.id:
+            await interaction.response.send_message("❌ Pick a card from the list.", ephemeral=True)
+            return
+        layout = active_layout(notice)
+        if not layout:
+            await interaction.response.send_message("❌ That card has no fights left on it.", ephemeral=True)
+            return
+        # Prelims first and the Main Event last, so it reads like the recaps.
+        card_pairs = [(a, b) for a, b, _ in reversed(layout)]
+        event = event or notice["event"] or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
+        if not closes:
+            raw = str((notice["event_date"] if notice["kind"] == "live_card" else notice["deadline"]) or "")
+            if raw.isdigit() and int(raw) > time.time() + 60:
+                closes = datetime.fromtimestamp(int(raw), timezone.utc)
+
+    if not event:
+        await interaction.response.send_message("❌ Pick a **card** you DMed, or type an **event** name.", ephemeral=True)
+        return
+
+    if not closes:
+        await interaction.response.send_message(
+            "❌ Add when betting **closes**, e.g. **31/10/2026 19:00** (UK time). It fills in by itself when the card has a start time.",
+            ephemeral=True
+        )
+        return
+
+    moment = closes if isinstance(closes, datetime) else parse_event_datetime(closes)
 
     if not moment:
         await interaction.response.send_message(
@@ -16576,7 +17144,9 @@ async def openbets(
         await interaction.response.send_message("❌ That time has already passed.", ephemeral=True)
         return
 
-    if fighters and MENTION_PATTERN.search(fighters):
+    if card_pairs:
+        pairs = card_pairs
+    elif fighters and MENTION_PATTERN.search(fighters):
         pairs = parse_fight_pairs(fighters)
     else:
         card = get_latest_fight_card(interaction.guild.id)
@@ -16607,6 +17177,8 @@ async def openbets(
         "INSERT INTO bet_markets (guild_id, event, closes_at, status, created_by, created_at) VALUES (?, ?, ?, 'open', ?, ?)",
         (interaction.guild.id, event.strip(), int(moment.timestamp()), interaction.user.id, now_utc()), write=True
     )
+    if notice:
+        discipline_query("UPDATE bet_markets SET notice_id = ? WHERE id = ?", (notice["id"], market_id), write=True)
 
     for position, (a, b) in enumerate(pairs, start=1):
         weight = auto_weight(interaction.guild.id, a, b)
@@ -17085,6 +17657,11 @@ def cancel_bet_fight(guild_id: int, market_id: int, position: int):
 
     bets = bets_on_bout(market_id, position)
 
+    try:
+        mark_bout_cancelled(guild_id, market_id, position, True)
+    except Exception as error:
+        print(f"Could not mark the fight cancelled on the card: {error}")
+
     discipline_query(
         "UPDATE bet_fights SET result = 'void', method = 'CANCELLED' WHERE market_id = ? AND position = ?",
         (market_id, position), write=True
@@ -17124,6 +17701,11 @@ def uncancel_bet_fight(guild_id: int, market_id: int, position: int):
 
     if not bout or bout[0]["method"] != "CANCELLED":
         return False
+
+    try:
+        mark_bout_cancelled(guild_id, market_id, position, False)
+    except Exception as error:
+        print(f"Could not un-cancel the fight on the card: {error}")
 
     discipline_query(
         "UPDATE bet_fights SET result = NULL, method = NULL WHERE market_id = ? AND position = ?",
@@ -25777,8 +26359,8 @@ def setup_checklist_tables():
 
 
 def notice_fights(guild_id: int, notice):
-    """Fights logged with /result for this card's pairs since it was DMed."""
-    pairs = {frozenset((a, b)) for a, b, _ in notice_layout(notice)}
+    """Fights logged with /result for this card's pairs since it was DMed (cancelled fights don't count)."""
+    pairs = {frozenset((a, b)) for a, b, _ in active_layout(notice)}
     created = notice["created_at"]
     found = []
     for fight in discipline_query("SELECT * FROM fights WHERE guild_id = ? AND created_at >= ? ORDER BY id", (guild_id, created)):
@@ -26758,6 +27340,7 @@ async def setup_hook():
     setup_social_tables()
     setup_week_post_table()
     setup_former_name_table()
+    setup_cancelled_bout_table()
     setup_fantasy_tables()
 
     # Buttons first, so they work even if the sync below fails.
