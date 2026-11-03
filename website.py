@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "19"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "20"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -531,6 +531,8 @@ def next_event(ctx):
                 continue
             name = row_get(notice, "event") or ("Live Card" if kind == "live_card" else "Fight Night")
             layout = layout_fn(notice)
+            gone = card_cancelled(ctx, notice)
+            layout = [x for x in layout if frozenset((x[0], x[1])) not in gone]
             if not layout:
                 continue
             if row_get(notice, "event") and len(ctx.event_fights(ctx.gid, name)) >= len(layout):
@@ -566,6 +568,8 @@ def next_event(ctx):
                     bouts.append((row["user_id"], row["opponent_id"], None))
             bouts = [(a, b, ctx.auto_weight(ctx.gid, a, b)) for a, b, _ in bouts]
 
+        gone = card_cancelled(ctx, notice)
+        bouts = [x for x in bouts if frozenset((x[0], x[1])) not in gone]
         return {"name": name, "when": int(when), "bouts": bouts}
 
     # 2) The last saved card, if none of its fights have been logged yet.
@@ -590,6 +594,8 @@ def next_event(ctx):
                         when = poll["deadline"]
                         break
             bouts = [(b["fighter_a"], b["fighter_b"], row_get(b, "weight")) for b in ctx.get_fight_card_bouts(card["id"])]
+            gone = ctx.cancelled_pairs(ctx.gid, card["event"]) if getattr(ctx, "cancelled_pairs", None) else set()
+            bouts = [x for x in bouts if frozenset((x[0], x[1])) not in gone]
             if bouts:
                 return {"name": card["event"], "when": when if when and when > now - 4 * 3600 else None, "bouts": bouts}
 
@@ -1846,6 +1852,17 @@ def render_event(ctx, slug):
 # LIVE CARD  /live
 # ============================================================
 
+def card_cancelled(ctx, notice):
+    """Fights called off on this card with /cancelfight."""
+    fn = getattr(ctx, "cancelled_pairs", None)
+    if not fn or not row_get(notice, "event"):
+        return set()
+    try:
+        return fn(ctx.gid, notice["event"])
+    except Exception:
+        return set()
+
+
 def live_notice(ctx):
     """The card on now or next: the newest DMed card from the last 3 days that isn't finished
     (or finished less than 6 hours ago)."""
@@ -1918,6 +1935,7 @@ def render_live(ctx):
 
     name = row_get(notice, "event") or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
     layout = ctx.notice_layout(notice)
+    called_off = card_cancelled(ctx, notice)
     logged, total = ctx.notice_fights(ctx.gid, notice) if getattr(ctx, "notice_fights", None) else ([], len(layout))
     by_pair = {}
     for f in logged:
@@ -1926,12 +1944,13 @@ def render_live(ctx):
     raw = str(row_get(notice, "event_date" if notice["kind"] == "live_card" else "deadline", ""))
     when = int(raw) if raw.isdigit() else None
     now = time.time()
-    done = len(by_pair) >= len(layout) and layout
+    on_card = [x for x in layout if frozenset((x[0], x[1])) not in called_off]
+    done = len(by_pair) >= len(on_card) and on_card
     started = bool(by_pair) or (when is not None and when <= now)
     status = "FINISHED" if done else ("LIVE NOW" if started else "UP NEXT")
 
     # The next fight to happen: the lowest one on the card without a result (cards run bottom up).
-    pending = [i for i, (a, b, _) in enumerate(layout) if frozenset((a, b)) not in by_pair]
+    pending = [i for i, (a, b, _) in enumerate(layout) if frozenset((a, b)) not in by_pair and frozenset((a, b)) not in called_off]
     up_next = pending[-1] if pending and started and not done else None
 
     cache = {}
@@ -1944,7 +1963,10 @@ def render_live(ctx):
             rows += f'<h3 class="sec-h rv">{esc(group)}</h3>'
             last_spot = group
         fight = by_pair.get(frozenset((a, b)))
-        if fight:
+        cancelled = not fight and frozenset((a, b)) in called_off
+        if cancelled:
+            middle = '<span class="lv-cancel">CANCELLED</span>'
+        elif fight:
             middle = f'<span class="lv-res {method_class(fight["method"])}">{esc(method_short(ctx, fight))}</span>'
         elif i == up_next:
             middle = '<span class="lv-next"><span class="dot dot-red" aria-hidden="true"></span>UP NEXT</span>'
@@ -1952,7 +1974,7 @@ def render_live(ctx):
             middle = '<span class="lv-vs d">VS</span>'
         tag = f'<span class="lv-spot">{esc(label)}</span>' if label in ("MAIN EVENT", "CO-MAIN EVENT") else ""
         rows += f"""
-  <div class="lvbout{' lvbout-done' if fight else ''}{' lvbout-next' if i == up_next else ''} {stagger(i)}">
+  <div class="lvbout{' lvbout-done' if fight else ''}{' lvbout-cancel' if cancelled else ''}{' lvbout-next' if i == up_next else ''} {stagger(i)}">
     {tag}
     {live_side(ctx, a, fight, cache)}
     <div class="lv-mid">{middle}</div>
@@ -1960,7 +1982,8 @@ def render_live(ctx):
   </div>"""
 
     extra = (f'<div class="evchips l-up">{chip("STATUS", esc(status), "red" if status == "LIVE NOW" else "gold")}'
-             f'{chip("RESULTS IN", f"{len(by_pair)}/{len(layout)}")}'
+             f'{chip("RESULTS IN", f"{len(by_pair)}/{len(on_card)}")}'
+             + (chip("CANCELLED", str(len(layout) - len(on_card)), "red") if len(on_card) < len(layout) else "")
              + (chip("STARTS" if not started else "STARTED", when_html(when)) if when else "") + '</div>')
     refresh = '' if done else '<script>setTimeout(function(){location.reload()},60000)</script>'
     body = page_hero(status, name.upper(), "LIVE", extra) + f"""
@@ -3623,6 +3646,8 @@ img{max-width:100%}
 .nu-head b{font-size:15px;line-height:1.25;word-break:break-word}
 .nu-head span{font-size:12px;color:var(--muted)}
 .logged-in .nav-cta{display:none}
+.lv-cancel{font:700 11px Inter,sans-serif;letter-spacing:.16em;color:var(--red);border:1px solid rgba(229,72,77,.5);padding:4px 10px;border-radius:999px}
+.lvbout-cancel .lv-side{opacity:.4;text-decoration:line-through;text-decoration-color:rgba(229,72,77,.6)}
 .fformer{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:12px 0 0;font-size:13px}
 .fformer-l{font-weight:700;letter-spacing:.16em;font-size:11px;color:var(--dim);margin-right:4px}
 .fformer-n{padding:4px 10px;border:1px solid var(--line2);border-radius:999px;color:var(--muted);font-weight:600}
@@ -5788,7 +5813,7 @@ def find_next_fight(ctx, user_id):
                 continue
             logged, _ = ctx.notice_fights(ctx.gid, notice)
             done = {frozenset((f["winner_id"], f["loser_id"])) for f in logged}
-            for a, b, spot in ctx.notice_layout(notice):
+            for a, b, spot in ctx.active_layout(notice):
                 if user_id in (a, b) and frozenset((a, b)) not in done:
                     raw = str(row_get(notice, "event_date" if notice["kind"] == "live_card" else "deadline", ""))
                     name = row_get(notice, "event") or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
