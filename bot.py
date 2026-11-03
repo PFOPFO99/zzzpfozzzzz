@@ -16671,7 +16671,7 @@ def _move_marker(draw, x_right, y, move, size=26):
 
 def draw_rankings_image(division: str, champion, contenders, belts, unranked, updated_text: str, logo_bytes=None, p4p=False):
     """
-    One tall column, sized so it still reads well when Discord shrinks it on a phone.
+    A 4:3 picture, so it fills the whole width of the Discord post on a computer and a phone.
     champion: {name, record, defences, days, picture} or None. Ignored for P4P.
     contenders: [{rank, name, record, move, picture}]
     belts: [(label, name, record, picture)] e.g. ("INTERIM CHAMPION", ...)
@@ -16681,16 +16681,7 @@ def draw_rankings_image(division: str, champion, contenders, belts, unranked, up
     from PIL import Image, ImageDraw, ImageFilter
     import io as _io
 
-    W, pad = 760, 40
-    row_h = 88
-    head_h = 214
-    champ_h = 0 if p4p else 286
-    belts_h = 0 if p4p else len(belts) * 84
-    list_head = 56
-    list_h = row_h * max(len(contenders), 1)
-    unranked_h = (64 + 46 * ((len(unranked) + 1) // 2)) if unranked else 0
-    H = head_h + champ_h + belts_h + list_head + list_h + unranked_h + 96
-
+    W, H, pad = 1200, 900, 40
     img = Image.new("RGBA", (W, H), R_BG + (255,))
     d = ImageDraw.Draw(img)
     for x in range(0, W, 60):
@@ -16698,127 +16689,157 @@ def draw_rankings_image(division: str, champion, contenders, belts, unranked, up
     for y in range(0, H, 60):
         d.line([(0, y), (W, y)], fill=(14, 14, 17))
     glow = Image.new("RGBA", (W, H))
-    ImageDraw.Draw(glow).ellipse((-260, -260, 520, 380), fill=R_GOLD + (42,))
-    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(110)))
+    ImageDraw.Draw(glow).ellipse((-260, -280, 560, 420), fill=R_GOLD + (44,))
+    img.alpha_composite(glow.filter(ImageFilter.GaussianBlur(120)))
     d = ImageDraw.Draw(img)
 
     # ---------- header ----------
     if logo_bytes:
-        img.alpha_composite(_round_avatar(60, "PFO", logo_bytes), (W - pad - 60, 26))
+        img.alpha_composite(_round_avatar(76, "PFO", logo_bytes), (W - pad - 76, 34))
         d = ImageDraw.Draw(img)
-    d.ellipse((pad, 50, pad + 12, 62), fill=R_GREEN)
-    _tracked(d, (pad + 24, 42), f"PFO RANKINGS · {updated_text}".upper(), rank_font("bold", 22), R_GOLD, 3)
+    d.ellipse((pad, 46, pad + 12, 58), fill=R_GREEN)
+    _tracked(d, (pad + 24, 38), f"PFO RANKINGS · {updated_text}".upper(), rank_font("bold", 22), R_GOLD, 3)
     title = "POUND FOR POUND" if p4p else division.upper()
-    d.text((pad - 3, 84), title, font=_fit_font(d, title, "display", 104, W - pad * 2), fill=R_TEXT)
-    y = head_h
+    d.text((pad - 3, 74), title, font=_fit_font(d, title, "display", 96, W - pad * 2 - 110), fill=R_TEXT)
+    top = 196
+    bottom = H - 70
 
-    # ---------- champion ----------
+    # ---------- champion column ----------
     if not p4p:
-        x0, x1 = pad, W - pad
+        x0, x1 = pad, 410
+        card_bottom = bottom - len(belts) * 78
         card = Image.new("RGBA", (W, H))
-        ImageDraw.Draw(card).rounded_rectangle((x0, y, x1, y + 262), 26, fill=(17, 15, 12, 255), outline=R_GOLD + (180,), width=3)
+        ImageDraw.Draw(card).rounded_rectangle((x0, top, x1, card_bottom), 26, fill=(17, 15, 12, 255), outline=R_GOLD + (180,), width=3)
         img.alpha_composite(card)
         g2 = Image.new("RGBA", (W, H))
-        ImageDraw.Draw(g2).ellipse((x0 - 20, y - 20, x0 + 300, y + 260), fill=R_GOLD + (40,))
-        img.alpha_composite(g2.filter(ImageFilter.GaussianBlur(55)))
+        ImageDraw.Draw(g2).ellipse((x0 + 20, top - 10, x1 - 20, top + 320), fill=R_GOLD + (40,))
+        img.alpha_composite(g2.filter(ImageFilter.GaussianBlur(60)))
         d = ImageDraw.Draw(img)
+        cx = (x0 + x1) // 2
+        _tracked(d, (x0 + 28, top + 26), "CHAMPION", rank_font("bold", 22), R_GOLD, 3)
+        space = card_bottom - top
+        av = max(100, min(190, space - 340))
         if champion:
-            img.alpha_composite(_round_avatar(176, champion["name"], champion.get("picture"), ring=R_GOLD), (x0 + 30, y + 43))
+            img.alpha_composite(_round_avatar(av, champion["name"], champion.get("picture"), ring=R_GOLD), (cx - av // 2, top + 68))
             d = ImageDraw.Draw(img)
-            tx = x0 + 236
-            _tracked(d, (tx, y + 34), "CHAMPION", rank_font("bold", 22), R_GOLD, 3)
             parts = champion["name"].upper().split()
             first, last = (parts[0], " ".join(parts[1:])) if len(parts) > 1 else (parts[0] if parts else "", "")
-            nf = _fit_font(d, max(first, last, key=len), "display", 56, x1 - tx - 30)
-            d.text((tx, y + 66), first, font=nf, fill=R_TEXT)
+            nf = _fit_font(d, max(first, last, key=len), "display", 50, x1 - x0 - 56)
+            ny = top + 68 + av + 18
+            d.text((cx, ny), first, font=nf, fill=R_TEXT, anchor="ma")
             if last:
-                d.text((tx, y + 66 + nf.size * 1.02), last, font=nf, fill=R_GOLD2)
-            stats = [(champion["record"] or "–", "RECORD"), (str(champion.get("defences", 0)), "DEF.")]
+                d.text((cx, ny + nf.size * 1.02), last, font=nf, fill=R_GOLD2, anchor="ma")
+            stats = [(champion["record"] or "–", "RECORD"), (str(champion.get("defences", 0)), "DEF."), ]
             if champion.get("days") is not None:
                 stats.append((str(champion["days"]), "DAYS"))
-            vf, lf = rank_font("display", 36), rank_font("bold", 16)
-            sx, sy = tx, y + 196
-            for value, label in stats:
-                d.text((sx, sy), value, font=vf, fill=R_TEXT)
-                vw = d.textlength(value, font=vf)
-                _tracked(d, (sx + vw + 8, sy + 16), label, lf, R_MUTED, 2)
-                sx += vw + 8 + _tracked_width(d, label, lf, 2) + 26
+            vf, lf = rank_font("display", 36), rank_font("bold", 15)
+            sy = card_bottom - 92
+            d.line([(x0 + 26, sy - 16), (x1 - 26, sy - 16)], fill=R_LINE, width=2)
+            colw = (x1 - x0 - 40) / len(stats)
+            for k, (value, label) in enumerate(stats):
+                sx = x0 + 20 + colw * k + colw / 2
+                d.text((sx, sy), value, font=vf, fill=R_TEXT, anchor="ma")
+                d.text((sx, sy + 48), label, font=lf, fill=R_MUTED, anchor="ma")
         else:
-            d.ellipse((x0 + 30, y + 34, x0 + 206, y + 210), outline=R_LINE, width=3)
-            d.text((x0 + 100, y + 80), "?", font=rank_font("display", 72), fill=R_DIM)
-            tx = x0 + 236
-            _tracked(d, (tx, y + 34), "CHAMPION", rank_font("bold", 22), R_GOLD, 3)
-            d.text((tx, y + 72), "VACANT", font=rank_font("display", 64), fill=R_TEXT)
-            d.text((tx, y + 156), "The belt is up for grabs.", font=rank_font("medium", 26), fill=R_MUTED)
-        y += champ_h
-
+            vy = top + 68 + max(0, (space - 68 - (av + 150)) // 2)
+            d.ellipse((cx - av // 2, vy, cx + av // 2, vy + av), outline=R_LINE, width=3)
+            d.text((cx, vy + av // 2), "?", font=rank_font("display", 80), fill=R_DIM, anchor="mm")
+            d.text((cx, vy + av + 26), "VACANT", font=rank_font("display", 60), fill=R_TEXT, anchor="ma")
+            d.text((cx, vy + av + 104), "Up for grabs", font=rank_font("medium", 26), fill=R_MUTED, anchor="ma")
+        by = card_bottom + 14
         for label, name, record, picture in belts:
             box = Image.new("RGBA", (W, H))
-            ImageDraw.Draw(box).rounded_rectangle((x0, y, x1, y + 72), 18, fill=(15, 15, 19, 255), outline=R_LINE + (255,), width=2)
+            ImageDraw.Draw(box).rounded_rectangle((x0, by, x1, by + 64), 16, fill=(15, 15, 19, 255), outline=R_LINE + (255,), width=2)
             img.alpha_composite(box)
-            img.alpha_composite(_round_avatar(48, name, picture), (x0 + 16, y + 12))
+            img.alpha_composite(_round_avatar(44, name, picture), (x0 + 12, by + 10))
             d = ImageDraw.Draw(img)
-            _tracked(d, (x0 + 80, y + 10), label, rank_font("bold", 16), R_GOLD, 2)
-            rf = rank_font("semibold", 26)
+            _tracked(d, (x0 + 66, by + 8), label, rank_font("bold", 14), R_GOLD, 2)
+            rf = rank_font("semibold", 20)
             rw = d.textlength(record, font=rf)
-            d.text((x1 - 20 - rw, y + 22), record, font=rf, fill=R_MUTED)
-            d.text((x0 + 80, y + 30), name, font=_fit_font(d, name, "display_bold", 30, x1 - 20 - rw - 30 - (x0 + 80)), fill=R_TEXT)
-            y += 84
+            d.text((x1 - 14 - rw, by + 22), record, font=rf, fill=R_MUTED)
+            d.text((x0 + 66, by + 26), name, font=_fit_font(d, name, "display_bold", 24, x1 - 14 - rw - 16 - (x0 + 66), 14), fill=R_TEXT)
+            by += 78
+        lx0 = 440
+    else:
+        lx0 = pad
+    lx1 = W - pad
 
     # ---------- contenders ----------
-    lx0, lx1 = pad, W - pad
-    hf = rank_font("bold", 18)
-    _tracked(d, (lx0, y + 14), "RANKED" if p4p else "CONTENDERS", hf, R_DIM, 3)
-    label = "RECORD · MOVE"
-    _tracked(d, (lx1 - _tracked_width(d, label, hf, 3), y + 14), label, hf, R_DIM, 3)
-    d.line([(lx0, y + 48), (lx1, y + 48)], fill=R_LINE, width=2)
-    y += list_head
+    n = len(contenders)
+    columns = 1 if n <= 10 else 2
+    per_col = n if columns == 1 else (n + 1) // 2
+    gap = 28
+    col_w = (lx1 - lx0 - gap * (columns - 1)) / columns
+    unranked_line = bool(unranked) and n <= 12
+    area_top = top + 40
+    area_bottom = bottom - (40 if unranked_line else 0)
+    row_h = min(96, (area_bottom - area_top) / max(per_col, 1))
+    scale = min(row_h / 80, 1.15 if columns == 1 else 0.95)
+    hf = rank_font("bold", 16)
+    for c in range(columns):
+        cx0 = lx0 + c * (col_w + gap)
+        cx1 = cx0 + col_w
+        if c == 0:
+            _tracked(d, (cx0, top + 6), "RANKED" if p4p else "CONTENDERS", hf, R_DIM, 3)
+        if c == columns - 1:
+            label = "RECORD · MOVE"
+            _tracked(d, (cx1 - _tracked_width(d, label, hf, 3), top + 6), label, hf, R_DIM, 3)
+        d.line([(cx0, top + 34), (cx1, top + 34)], fill=R_LINE, width=2)
     if not contenders:
-        d.text((lx0, y + 24), "Nobody ranked here yet.", font=rank_font("medium", 30), fill=R_MUTED)
-    move_w = 70
-    for c in contenders:
-        if c["rank"] == 1:
+        d.text((lx0, area_top + 20), "Nobody ranked here yet.", font=rank_font("medium", 30), fill=R_MUTED)
+    for i, cont in enumerate(contenders):
+        c = 0 if columns == 1 else (0 if i < per_col else 1)
+        r = i if c == 0 else i - per_col
+        cx0 = lx0 + c * (col_w + gap)
+        cx1 = cx0 + col_w
+        y = area_top + r * row_h
+        mid = y + row_h / 2
+        if cont["rank"] == 1:
             hl = Image.new("RGBA", (W, H))
-            ImageDraw.Draw(hl).rectangle((lx0, y, lx1, y + row_h - 2), fill=R_GOLD + (18,))
+            ImageDraw.Draw(hl).rectangle((cx0, y + 2, cx1, y + row_h - 2), fill=R_GOLD + (18,))
             img.alpha_composite(hl)
             d = ImageDraw.Draw(img)
-        num = str(c["rank"])
-        nf = rank_font("display", 44)
-        d.text((lx0 + 4, y + 16), num, font=nf, fill=R_GOLD if c["rank"] == 1 else R_DIM)
-        img.alpha_composite(_round_avatar(58, c["name"], c.get("picture")), (lx0 + 70, y + 15))
-        d = ImageDraw.Draw(img)
-        _move_marker(d, lx1, y + 28, c.get("move") or "", 26)
-        rf = rank_font("semibold", 28)
-        rw = d.textlength(c["record"], font=rf)
-        d.text((lx1 - move_w - 14 - rw, y + 26), c["record"], font=rf, fill=R_MUTED)
-        name_x = lx0 + 144
-        name_font = _fit_font(d, c["name"], "display_bold", 38, lx1 - move_w - 14 - rw - 24 - name_x, 22)
-        d.text((name_x, y + row_h / 2), c["name"], font=name_font, fill=R_TEXT, anchor="lm")
-        d.line([(lx0, y + row_h - 1), (lx1, y + row_h - 1)], fill=(26, 26, 31), width=2)
-        y += row_h
+        nf = rank_font("display", int(40 * scale))
+        d.text((cx0 + 4, mid), str(cont["rank"]), font=nf, fill=R_GOLD if cont["rank"] == 1 else R_DIM, anchor="lm")
+        if columns == 1:
+            av = int(50 * scale)
+            ax = int(cx0 + 58 * scale)
+            img.alpha_composite(_round_avatar(av, cont["name"], cont.get("picture")), (ax, int(mid - av / 2)))
+            d = ImageDraw.Draw(img)
+        else:
+            av, ax = 0, int(cx0 + 52 * scale)      # two columns: no room for pictures
+        msize = int(22 * scale)
+        move_w = int(56 * scale)
+        _move_marker(d, cx1, mid - msize * .62, cont.get("move") or "", msize)
+        rf = rank_font("semibold", int((24 if columns == 1 else 20) * scale))
+        rw = d.textlength(cont["record"], font=rf)
+        d.text((cx1 - move_w - 10 - rw, mid), cont["record"], font=rf, fill=R_MUTED, anchor="lm")
+        name_x = ax + av + int(14 * scale)
+        room = cx1 - move_w - 10 - rw - 16 - name_x
+        name_font = _fit_font(d, cont["name"], "display_bold", int(34 * scale), room, 18)
+        name = cont["name"]
+        while d.textlength(name, font=name_font) > room and len(name) > 4:
+            name = name[:-2].rstrip() + "…"
+        d.text((name_x, mid), name, font=name_font, fill=R_TEXT, anchor="lm")
+        d.line([(cx0, y + row_h - 1), (cx1, y + row_h - 1)], fill=(26, 26, 31), width=2)
 
-    # ---------- unranked ----------
-    if unranked:
-        y += 26
-        _tracked(d, (lx0, y), "UNRANKED", hf, R_DIM, 3)
-        uf = rank_font("semibold", 26)
-        col_w = (lx1 - lx0) / 2
-        for k, name in enumerate(unranked):
-            x = lx0 + (k % 2) * col_w
-            yy = y + 38 + (k // 2) * 46
-            text = name
-            while d.textlength(text, font=uf) > col_w - 20 and len(text) > 3:
-                text = text[:-2] + "…"
-            d.text((x, yy), text, font=uf, fill=R_MUTED)
+    if unranked_line:
+        uf = rank_font("semibold", 20)
+        text = "UNRANKED  " + " · ".join(unranked)
+        while d.textlength(text, font=uf) > lx1 - lx0 and " · " in text:
+            text = text.rsplit(" · ", 1)[0]
+            if not text.endswith("…"):
+                text += " …"
+        d.text((lx0, bottom - 28), text, font=uf, fill=R_MUTED)
 
     # ---------- footer ----------
-    fy = H - 66
-    d.line([(pad, fy - 16), (W - pad, fy - 16)], fill=R_LINE, width=2)
+    fy = H - 52
+    d.line([(pad, fy - 12), (W - pad, fy - 12)], fill=R_LINE, width=2)
+    d.text((pad, fy + 4), "Moves since the last rankings update", font=rank_font("medium", 20), fill=R_DIM)
     site = (BOT_SITE_URL.replace("https://", "").replace("http://", "") + "/rankings") if BOT_SITE_URL else ""
-    d.text((pad, fy + 2), "Moves since the last update", font=rank_font("medium", 20), fill=R_DIM)
     if site:
-        sf = _fit_font(d, site, "bold", 22, W - pad * 2 - 330, 14)
-        d.text((W - pad - d.textlength(site, font=sf), fy + 1), site, font=sf, fill=R_GOLD2)
+        sf = rank_font("bold", 22)
+        d.text((W - pad - d.textlength(site, font=sf), fy + 2), site, font=sf, fill=R_GOLD2)
 
     out = _io.BytesIO()
     img.convert("RGB").save(out, "PNG", optimize=True)
