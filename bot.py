@@ -15018,6 +15018,14 @@ HOUSE_EDGE = 0.95
 METHOD_SHARE = {"KO/TKO": 0.45, "SUB": 0.25, "DEC": 0.30}
 METHOD_NAMES = {"KO/TKO": "KO/TKO", "SUB": "Submission", "DEC": "Decision"}
 
+# Keeping the odds sensible (Railway variables can change these):
+#   MAX_BET_ODDS        the most any bet can pay, e.g. 50 = a 500 bet returns 25,000 at most
+#   NEW_FIGHTER_FIGHTS  fighters with fewer fights than this get tamer odds (not enough stats yet)
+MAX_BET_ODDS = float(os.getenv("MAX_BET_ODDS", "50") or 50)
+NEW_FIGHTER_FIGHTS = int(os.getenv("NEW_FIGHTER_FIGHTS", "3") or 3)
+MAX_METHOD_ODDS = 15.0          # any KO / SUB / DEC pick
+NEW_FIGHTER_METHOD_ODDS = 6.0   # KO / SUB / DEC pick on a fighter with little history
+
 _markets_to_refresh = set()
 
 
@@ -15216,33 +15224,83 @@ def coin_rank(guild_id: int, user_id: int):
 # ------------------------------------------------------------
 
 def fighter_strength(guild_id: int, user_id: int, weight: str = None):
-    """Rough rating from record, streak and ranking."""
+    """
+    Rough rating for opening odds. Ranking matters most (champion vs #1
+    should be close), then win rate (not total wins, so long careers don't
+    swamp everything), then current streak.
+    """
 
     try:
         stats = get_fighter_stats(guild_id, user_id)
     except Exception:
-        stats = {"wins": 0, "losses": 0, "streak": None}
+        stats = {"wins": 0, "losses": 0, "draws": 0, "streak": None}
 
-    score = 50 + 4 * (stats["wins"] - stats["losses"])
-    streak = stats.get("streak") or ""
-
-    if len(streak) > 1 and streak[0] in "WL" and streak[1:].isdigit():
-        score += (3 if streak[0] == "W" else -3) * min(5, int(streak[1:]))
-
+    # Ranking: champion 95, #1 90 ... #15 34, unranked 25.
+    score = 25
     if weight:
         row = get_user_ranking_in_division(guild_id, user_id, weight)
         if row:
-            score += 25 if row["rank"] == 0 else max(0, 16 - row["rank"]) * 1.5
+            score = 95 if row["rank"] == 0 else max(30, 90 - 4 * (row["rank"] - 1))
+
+    # Win rate, eased towards 50% when there are only a few fights (up to ±25).
+    fights = stats["wins"] + stats["losses"] + stats.get("draws", 0)
+    win_rate = (stats["wins"] + 0.5 * stats.get("draws", 0) + 2) / (fights + 4)
+    score += (win_rate - 0.5) * 50
+
+    # Streak (up to ±10).
+    streak = stats.get("streak") or ""
+    if len(streak) > 1 and streak[0] in "WL" and streak[1:].isdigit():
+        score += (2.5 if streak[0] == "W" else -2.5) * min(4, int(streak[1:]))
 
     return score
+
+
+_rating_cache = {}
+
+
+def cached_ratings(guild_id: int):
+    hit = _rating_cache.get(guild_id)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    table = compute_ratings(guild_id)
+    _rating_cache[guild_id] = (time.time(), table)
+    return table
+
+
+def fights_on_record(guild_id: int, user_id: int):
+    try:
+        stats = get_fighter_stats(guild_id, user_id)
+        return stats["wins"] + stats["losses"] + stats["draws"]
+    except Exception:
+        return 0
+
+
+def capped_odds(odds: float):
+    """Total odds for a bet, never above MAX_BET_ODDS."""
+    return round(min(odds, MAX_BET_ODDS), 2)
 
 
 def opening_probability(guild_id: int, a: int, b: int, weight: str = None):
 
     gap = fighter_strength(guild_id, b, weight) - fighter_strength(guild_id, a, weight)
-    p = 1 / (1 + 10 ** (gap / 30))
+    p = 1 / (1 + 10 ** (gap / 50))
 
-    return min(0.88, max(0.12, p))
+    # Both have a few logged fights: mix in the skill rating (who they've actually beaten).
+    try:
+        table = cached_ratings(guild_id)
+        ea, eb = table.get(fighter_key(a, None)), table.get(fighter_key(b, None))
+        if ea and eb and ea["fights"] >= NEW_FIGHTER_FIGHTS and eb["fights"] >= NEW_FIGHTER_FIGHTS:
+            p = (p + win_chance(ea["rating"], eb["rating"])) / 2
+    except Exception as error:
+        print(f"Rating for odds failed: {error}")
+
+    # Not much history yet: pull it towards 50/50 so new fighters don't open at huge odds.
+    experience = min(fights_on_record(guild_id, a), fights_on_record(guild_id, b))
+    if experience < NEW_FIGHTER_FIGHTS:
+        trust = 0.4 + 0.6 * experience / NEW_FIGHTER_FIGHTS
+        p = 0.5 + (p - 0.5) * trust
+
+    return min(0.85, max(0.15, p))
 
 
 def fight_pools(market_id: int, position: int):
@@ -15340,7 +15398,11 @@ def pick_odds(bout, pick: str, method: str = None):
             else (bout["fighter_b"], bout["fighter_a"])
         )
         share = method_shares(market["guild_id"], winner, loser)[method]
-        odds = min(50.0, round(odds / share, 2))
+        cap = MAX_METHOD_ODDS
+        if min(fights_on_record(market["guild_id"], winner), fights_on_record(market["guild_id"], loser)) < NEW_FIGHTER_FIGHTS:
+            share = max(share, 0.25)                    # no real stats yet: no long shots on a method
+            cap = NEW_FIGHTER_METHOD_ODDS
+        odds = max(odds, min(cap, round(odds / share, 2)))
 
     return odds
 
@@ -15603,7 +15665,12 @@ def evaluate_bet(guild_id: int, bet_id: int):
         for leg in legs:
             if leg["status"] == "won":
                 odds *= leg["odds"]
-        status, payout = "won", round(bet["stake"] * odds)
+        try:
+            if bet["boosted"] and len(legs) >= 3:
+                odds *= PARLAY_BOOST
+        except (IndexError, KeyError):
+            pass
+        status, payout = "won", round(bet["stake"] * capped_odds(odds))
 
     difference = payout - bet["payout"]
 
@@ -15847,12 +15914,16 @@ class BetSlipView(
                         f"`{position:>2}` {pick_label(bout, pick, method)} · `{pick_odds(bout, pick, method):.2f}`"
                     )
 
-            odds = self.slip_odds()
+            raw = self.slip_odds()
+            odds = capped_odds(raw)
             lines += [
                 "",
-                f"Stake: {COIN} **{coins_text(self.stake)}** · Odds **{odds:.2f}**",
+                f"Stake: {COIN} **{coins_text(self.stake)}** · Odds **{odds:.2f}**"
+                + (f" (max, was {raw:,.2f})" if raw > odds else ""),
                 f"Returns: {COIN} **{coins_text(round(self.stake * odds))}** if it wins",
             ]
+            if raw > odds:
+                lines.append(f"-# Bets pay at most {MAX_BET_ODDS:g}× your stake")
         else:
             lines.append("1) Choose a fight  2) choose your pick. Add picks from other fights for an accumulator.")
 
@@ -16025,7 +16096,7 @@ class BetSlipView(
         total = 1.0
         for value in odds_each.values():
             total *= value
-        total = round(total, 2)
+        total = capped_odds(total)
 
         bet_id = discipline_query(
             "INSERT INTO bets (market_id, guild_id, user_id, stake, odds, status, payout, created_at) "
@@ -17035,6 +17106,15 @@ def setup_cancelled_bout_table():
         db.execute("ALTER TABLE bet_markets ADD COLUMN notice_id INTEGER")
     except sqlite3.OperationalError:
         pass
+    try:
+        db.execute("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        # Bets placed before the odds limit: show (and pay) the capped odds.
+        db.execute("UPDATE bets SET odds = ? WHERE status = 'open' AND odds > ?", (MAX_BET_ODDS, MAX_BET_ODDS))
+    except sqlite3.OperationalError:
+        pass
     db.commit()
     db.close()
 
@@ -17082,6 +17162,25 @@ def active_layout(notice):
     """notice_layout without the fights that were cancelled."""
     gone = cancelled_pairs(notice["guild_id"], notice["event"]) if notice["event"] else set()
     return [(a, b, spot) for a, b, spot in notice_layout(notice) if frozenset((a, b)) not in gone]
+
+
+def reprice_open_markets_once():
+    """The first start with the fairer odds: re-work the opening odds of fights still open for betting.
+    Bets already placed keep the odds they were placed at."""
+    try:
+        if discipline_query("SELECT 1 FROM bot_meta WHERE key = 'odds_model_2'"):
+            return
+        for bout in discipline_query("""
+            SELECT bet_fights.*, bet_markets.guild_id FROM bet_fights JOIN bet_markets ON bet_markets.id = bet_fights.market_id
+            WHERE bet_markets.status IN ('open', 'locked') AND bet_fights.result IS NULL
+        """):
+            p = opening_probability(bout["guild_id"], bout["fighter_a"], bout["fighter_b"], bout["weight"])
+            discipline_query("UPDATE bet_fights SET open_pa = ? WHERE market_id = ? AND position = ?",
+                             (p, bout["market_id"], bout["position"]), write=True)
+            _markets_to_refresh.add(bout["market_id"])
+        discipline_query("INSERT OR REPLACE INTO bot_meta (key, value) VALUES ('odds_model_2', ?)", (now_utc(),), write=True)
+    except Exception as error:
+        print(f"Re-pricing open betting failed: {error}")
 
 
 async def card_notice_autocomplete(interaction: discord.Interaction, current: str):
@@ -22697,7 +22796,7 @@ def use_bet_perks(guild_id: int, user_id: int, market_id: int, bet_id: int, legs
         if legs >= 3:
             boost = unused_item(guild_id, user_id, "parlay_boost")
             if boost:
-                odds = round(odds * PARLAY_BOOST, 2)
+                odds = capped_odds(odds * PARLAY_BOOST)
                 set_item(boost["id"], status="used", data={"bet_id": bet_id})
                 discipline_query("UPDATE bets SET boosted = 1, odds = ? WHERE id = ?", (odds, bet_id), write=True)
                 notes.append(f"🚀 Parlay Boost used: odds raised to **{odds:.2f}**")
@@ -27377,6 +27476,7 @@ async def setup_hook():
     bot.add_view(ShopBoardView())
     restore_loot_buttons()
     bot.add_view(WelcomeView())
+    reprice_open_markets_once()
     restore_social_buttons()
 
     if not vote_closer.is_running():
@@ -27700,7 +27800,7 @@ def place_bet(guild: discord.Guild, user_id: int, market_id: int, legs: dict, st
     total = 1.0
     for value in odds_each.values():
         total *= value
-    total = round(total, 2)
+    total = capped_odds(total)
 
     bet_id = discipline_query(
         "INSERT INTO bets (market_id, guild_id, user_id, stake, odds, status, payout, created_at) VALUES (?, ?, ?, ?, ?, 'open', 0, ?)",
@@ -27748,7 +27848,7 @@ def cashout_offer(bet_id: int):
                 return None, "Couldn't price this bet."
             current = pick_odds(bout[0], leg["pick"], leg["method"])
             value /= max(current, 1.01)
-    amount = int(value * CASHOUT_MARGIN)
+    amount = int(min(value, bet["stake"] * MAX_BET_ODDS) * CASHOUT_MARGIN)
     if amount < CASHOUT_MIN:
         return None, "The offer is too small to cash out."
     return amount, None
