@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "21"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "23"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -347,6 +347,11 @@ NAV = [
         ("shop", "/shop", "Shop", "Spend your PFO Coins"),
     ]),
     ("social", "/social", "Social"),
+    ("League", [
+        ("teams", "/teams", "Teams", "Fighter teams and team records"),
+        ("cards", "/cards", "Cards", "Every fighter's trading card"),
+        ("staffpage", "/staff", "Staff", "Who runs PFO and how to reach them"),
+    ]),
     ("Stats", [
         ("week", "/week", "The week", "Weekly recap and past weeks"),
         ("records", "/records", "Records", "All-time records and milestones"),
@@ -1018,6 +1023,7 @@ def render_home(ctx):
 <div class="wrap">
   <section id="numbers" class="nums" aria-label="PFO in numbers">{numbers_html}</section>
   {event_html}
+  {home_replay(ctx)}
   {spotlight_html}
   {champs_html}
   {results_html}
@@ -1412,6 +1418,16 @@ def render_fighter(ctx, user_id):
     handle_html = (f'<span class="handle l-up"><span class="handle-l">DISCORD</span>@{esc(username)}</span>'
                    if username else "")
 
+    # Their team
+    team_html = ""
+    try:
+        team = ctx.team_of(ctx.gid, user_id)
+        if team:
+            team_html = (f'<a class="fteam l-up" href="/team/{team["id"]}"><span class="fformer-l">TEAM</span>'
+                         f'{team_name_html(team)}{" · OWNER" if ctx.is_team_owner(team, user_id) else ""}</a>')
+    except Exception:
+        team_html = ""
+
     # Former UFC 6 fighters they used
     former_html = ""
     try:
@@ -1439,6 +1455,7 @@ def render_fighter(ctx, user_id):
       <h1 class="d fhero-name l-title">{esc(first)}{'<br>' + esc(last) if last else ''}</h1>
       {nick_html}
       {handle_html}
+      {team_html}
       {former_html}
       {quote_html}
       <p class="muted l-up">{esc(' · '.join(meta))}</p>
@@ -1611,12 +1628,33 @@ def render_fighter(ctx, user_id):
       {side_blocks}
     </aside>"""
 
+    like_html = fights_like_block(ctx, user_id, stats) if member else ""
+    has_card = bool(fights)
+    card_html = ""
+    if has_card:
+        card_html = f"""
+  <section class="block fcardsec" aria-label="Fighter card">
+    <div class="fcard-in">{fighter_card_img(user_id, name, "cardimg cardimg-lg", lazy=True)}
+      <div class="fcard-t"><span class="eyebrow">FIGHTER CARD</span><h2 class="d h-m">{esc(name.upper())}</h2>
+        <p class="muted">The tier and numbers update as they fight. Pull their card from packs in the shop.</p>
+        <div class="btns"><a class="btn btn-gold btn-sm" href="/cardimg/fighter/{user_id}.png?download=1" download="{esc(re.sub(r'[^A-Za-z0-9]+', '-', name).strip('-').lower() or 'pfo')}-card.png">DOWNLOAD</a>
+        <a class="btn btn-ghost btn-sm" href="/cards">ALL CARDS</a></div></div></div>
+  </section>"""
+    stats_panel = numbers or '<section class="block"><p class="empty">No fight stats yet. Staff add them with /addstrikes after a fight.</p></section>'
+    tabs = [("overview", "OVERVIEW"), ("stats", "STATS"), ("career", "CAREER")] + ([("card", "CARD")] if has_card else [])
+    tab_nav = ('<nav class="ftabs" data-ftabs role="tablist" aria-label="Fighter sections" hidden>'
+               + "".join(f'<button type="button" role="tab" data-ftab="{k}">{label}</button>' for k, label in tabs) + '</nav>')
     body = hero + f"""
 <div class="wrap">
+  {tab_nav}
+  <div data-fpanel="overview">
   <section class="tiles" aria-label="Career numbers">{tiles_html}</section>
+  {like_html}
   {how}
-  {numbers}
-  <div class="block bt hist-wrap">{history}{aside}</div>
+  </div>
+  <div data-fpanel="stats">{stats_panel}</div>
+  <div data-fpanel="career"><div class="block bt hist-wrap">{history}{aside}</div></div>
+  {f'<div data-fpanel="card">{card_html}</div>' if has_card else ''}
 </div>"""
 
     description = f"{name}: {ctx.stats_record(stats)} in PFO." + (f" {badge.title()}." if badge_bits else "")
@@ -1840,6 +1878,7 @@ def render_event(ctx, slug):
                      f'<div class="evchips l-up">{strip}</div>') + f"""
 <div class="wrap">
   {f'<p class="ev-notes ev-notes-lg rv">{esc(notes)}</p>' if notes else ''}
+  {replay_player(ctx, ctx.vod_for_event(ctx.gid, name), "REPLAY", show_results=False) if getattr(ctx, "vod_for_event", None) else ""}
   <section class="block ev-card" aria-label="Results">{sections}</section>
   {f'<section class="block bt" aria-labelledby="aw"><h2 id="aw" class="d h-m rv">AWARDS</h2><div class="awgrid">{award_chips}</div></section>' if award_chips else ''}
   {fantasy_html}
@@ -1854,6 +1893,12 @@ def render_event(ctx, slug):
 
 def card_cancelled(ctx, notice):
     """Fights called off on this card with /cancelfight."""
+    by_card = getattr(ctx, "notice_cancelled", None)
+    if by_card:
+        try:
+            return by_card(notice)
+        except Exception:
+            pass
     fn = getattr(ctx, "cancelled_pairs", None)
     if not fn or not row_get(notice, "event"):
         return set()
@@ -1927,7 +1972,7 @@ def render_live(ctx):
         events = ctx.recent_events(ctx.gid)
         last = (f'<a class="btn btn-gold" href="{event_url(events[0])}">LAST EVENT: {esc(events[0].upper())}</a>' if events else "")
         body = page_hero("NOTHING ON RIGHT NOW", "LIVE", "LIVE") + f"""
-<div class="wrap">{twitch_player(ctx)}<section class="block live-empty rv">
+<div class="wrap">{twitch_player(ctx) or home_replay(ctx)}<section class="block live-empty rv">
   <p class="muted">There's no PFO card on right now. When a card is sent out, it shows here and results appear as they're logged.</p>
   <div class="btns">{last}<a class="btn btn-ghost" href="/results">ALL RESULTS</a></div>
 </section></div>"""
@@ -1990,6 +2035,7 @@ def render_live(ctx):
 <div class="wrap">
   {twitch_player(ctx)}
   <section class="block live-card" aria-label="The card">{rows}</section>
+  {home_replay(ctx)}
   <p class="note">{'This page updates by itself every minute.' if not done else f'All results are in. <a href="{event_url(name)}">See the full event →</a>'}</p>
 </div>{refresh}"""
     return page(ctx, f"{name} · Live", "live", body, f"Live results from {name}.")
@@ -3646,6 +3692,22 @@ img{max-width:100%}
 .nu-head b{font-size:15px;line-height:1.25;word-break:break-word}
 .nu-head span{font-size:12px;color:var(--muted)}
 .logged-in .nav-cta{display:none}
+.tmgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px;margin-top:10px}
+.tmcard{display:flex;flex-direction:column;gap:12px;padding:22px;border:1px solid var(--line2);border-radius:18px;background:var(--panel);color:var(--text);transition:border-color .2s}
+.tmcard:hover{border-color:var(--gold);color:var(--text)}
+.tmcard-name{font-size:30px;line-height:1}
+.tm-tag{display:inline-block;font:700 12px Inter,sans-serif;letter-spacing:.14em;color:var(--bg);background:var(--gold);padding:3px 8px;border-radius:6px;margin-right:10px;vertical-align:6px}
+.tmcard-faces{display:flex;gap:4px;flex-wrap:wrap}
+.tmcard-stats{display:flex;gap:22px;border-top:1px solid var(--line);padding-top:12px}
+.tmcard-stats span{display:flex;flex-direction:column;font-size:10px;font-weight:700;letter-spacing:.14em;color:var(--dim)}
+.tmcard-stats b{font-size:26px;color:var(--text);letter-spacing:0}
+.tm-who{flex:1;display:flex;flex-direction:column;min-width:0}
+.fteam{display:inline-flex;align-items:center;gap:8px;margin-top:12px;padding:6px 12px 6px 10px;border:1px solid rgba(201,162,74,.5);border-radius:999px;color:var(--text);font-weight:700;font-size:14px}
+.fteam .tm-tag{vertical-align:0;margin-right:0}
+.stgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;margin-top:10px}
+.stcard{display:flex;align-items:center;gap:14px;padding:14px;border:1px solid var(--line2);border-radius:16px;background:var(--panel)}
+.stcard-t{display:flex;flex-direction:column;min-width:0}.stcard-n{font-size:22px;line-height:1.1}
+.stcontact{max-width:none}
 .lv-cancel{font:700 11px Inter,sans-serif;letter-spacing:.16em;color:var(--red);border:1px solid rgba(229,72,77,.5);padding:4px 10px;border-radius:999px}
 .lvbout-cancel .lv-side{opacity:.4;text-decoration:line-through;text-decoration-color:rgba(229,72,77,.6)}
 .fformer{display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;margin:12px 0 0;font-size:13px}
@@ -3943,8 +4005,9 @@ ACCOUNT_JS = r"""
     if (slot) {
       if (me.logged_in) {
         var av = me.avatar ? '<img src="' + P.esc(me.avatar) + '" alt="">' : '<span class="nu-av">' + P.esc(me.name.slice(0, 1)) + '</span>';
-        var links = '<a href="/me"><span class="nd-t">My PFO</span><span class="nd-s">Your fights, bets, fantasy and more</span></a>';
-        if (me.levels.staff) links += '<a href="/staff"><span class="nd-t">Staff dashboard</span><span class="nd-s">Helper and above</span></a>';
+        var links = '<a href="/me"><span class="nd-t">My PFO</span><span class="nd-s">Your fights, bets, fantasy and more</span></a>'
+          + '<a href="/me/cards"><span class="nd-t">My cards</span><span class="nd-s">Your collection and trades</span></a>';
+        if (me.levels.staff) links += '<a href="/dashboard"><span class="nd-t">Staff dashboard</span><span class="nd-s">Helper and above</span></a>';
         if (me.levels.senior) links += '<a href="/stats"><span class="nd-t">Site stats</span><span class="nd-s">Head Moderator+</span></a>';
         links += '<div class="nu-sep"></div><button type="button" data-out="0"><span class="nd-t">Log out</span></button><button type="button" data-out="1"><span class="nd-t">Log out everywhere</span><span class="nd-s">Every phone and computer</span></button>';
         var head = '<div class="nu-head"><b>' + P.esc(me.name) + '</b><span>' + Number(me.coins || 0).toLocaleString('en-GB') + ' coins</span></div>';
@@ -4243,7 +4306,7 @@ V2_JS = r"""
     else if (path.indexOf('/fighter/') === 0 && location.pathname !== path) label = 'Back to fighter';
     else {
       var names = { '/live': 'Live card', '/results': 'Results', '/fighters': 'Fighters', '/sportsbook': 'Sportsbook', '/fantasy': 'Fantasy',
-        '/titles': 'Titles', '/leaderboards': 'Leaderboards', '/compare': 'Head to head', '/me': 'My PFO', '/staff': 'Staff', '/social': 'Social',
+        '/titles': 'Titles', '/leaderboards': 'Leaderboards', '/compare': 'Head to head', '/me': 'My PFO', '/staff': 'Staff', '/dashboard': 'Staff dashboard', '/teams': 'Teams', '/social': 'Social',
         '/records': 'Records', '/awards': 'Awards', '/week': 'The week', '/hall-of-fame': 'Hall of Fame', '/': 'Home' };
       label = names[path] || null;
     }
@@ -4580,6 +4643,7 @@ V2_JS = r"""
           if (!d.ok) { P.toast(d.message, 'bad'); return; }
           showCoins(d.balance); dlg.close ? dlg.close() : dlg.removeAttribute('open');
           P.toast(d.message, 'ok');
+          if (d.pack_id) { location.href = '/me/cards?pack=' + d.pack_id; }
         });
     });
   }
@@ -4729,6 +4793,7 @@ V2_JS = r"""
   P.onMe(function (me) {
     if (!me.logged_in || !me.levels.staff) return;
     document.body.classList.add('is-staff');
+    $$('[data-staff-only]').forEach(function (el) { el.hidden = false; });
     // Results: edit / swap winner / remove
     var rows = $$('.res[data-fight]');
     rows.forEach(function (r) {
@@ -4818,11 +4883,188 @@ V2_JS = r"""
 """
 
 
+CARDS_JS = r"""
+(function () {
+  var P = window.PFO = window.PFO || { me: null, waiting: [] };
+  function $(q, el) { return (el || document).querySelector(q); }
+  function $$(q, el) { return Array.prototype.slice.call((el || document).querySelectorAll(q)); }
+  function esc(t) { var d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
+  function busy(btn, on) { if (!btn) return; btn.disabled = !!on; btn.classList.toggle('is-busy', !!on); }
+  function post(url, body, btn, reload) {
+    busy(btn, true);
+    return P.post(url, body).then(function (d) {
+      busy(btn, false);
+      if (!d.ok) { P.toast(d.message, 'bad'); return d; }
+      P.toast(d.message, 'ok');
+      if (reload) setTimeout(function () { location.reload(); }, 700);
+      return d;
+    });
+  }
+
+  // ---- fighter page tabs ----
+  $$('[data-ftabs]').forEach(function (nav) {
+    var keys = $$('[data-ftab]', nav).map(function (b) { return b.getAttribute('data-ftab'); });
+    function show(k) {
+      $$('[data-fpanel]').forEach(function (p) { p.hidden = p.getAttribute('data-fpanel') !== k; });
+      $$('[data-ftab]', nav).forEach(function (b) {
+        var on = b.getAttribute('data-ftab') === k; b.classList.toggle('on', on); b.setAttribute('aria-selected', on ? 'true' : 'false');
+      });
+    }
+    nav.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-ftab]'); if (!b) return;
+      var k = b.getAttribute('data-ftab'); show(k);
+      try { history.replaceState(null, '', '#' + k); } catch (err) {}
+    });
+    var h = (location.hash || '').slice(1);
+    show(keys.indexOf(h) >= 0 ? h : 'overview');
+    nav.hidden = false;
+  });
+
+  // ---- /cards filter ----
+  $$('[data-cardfilter]').forEach(function (bar) {
+    bar.addEventListener('click', function (e) {
+      var b = e.target.closest('[data-ct]'); if (!b) return;
+      var t = b.getAttribute('data-ct');
+      $$('[data-ct]', bar).forEach(function (x) { x.classList.toggle('on', x === b); });
+      $$('.cardgrid [data-tier]').forEach(function (c) { c.hidden = !!t && c.getAttribute('data-tier') !== t; });
+    });
+  });
+
+  // ---- my cards ----
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-packdecide]');
+    if (b) { post('/api/cards/pack', { pack_id: b.getAttribute('data-packdecide'), decision: b.getAttribute('data-d') }, b, true); return; }
+    b = e.target.closest('[data-sellspares]');
+    if (b) {
+      if (b.getAttribute('data-sure') !== '1') { b.setAttribute('data-sure', '1'); b.textContent = 'TAP AGAIN TO SELL'; return; }
+      post('/api/cards/sell', {}, b, true); return;
+    }
+    b = e.target.closest('[data-trade]');
+    if (b) { post('/api/cards/trade/respond', { trade_id: b.getAttribute('data-trade'), action: b.getAttribute('data-a') }, b, true); }
+  });
+
+  var form = $('[data-tradeform]');
+  if (form) {
+    var who = null, timer = null;
+    $('#trwho').addEventListener('input', function () {
+      var q = this.value.trim(); clearTimeout(timer); who = null;
+      if (q.length < 2) { $('#trwhores').innerHTML = ''; return; }
+      timer = setTimeout(function () {
+        fetch('/api/members?q=' + encodeURIComponent(q), { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
+          $('#trwhores').innerHTML = (d.results || []).map(function (m) { return '<button type="button" data-trwho="' + m.id + '">' + esc(m.name) + '</button>'; }).join('') || '<span class="muted">Nobody found.</span>';
+        });
+      }, 250);
+    });
+    $('#trwhores').addEventListener('click', function (e) {
+      var b = e.target.closest('[data-trwho]'); if (!b) return;
+      who = b.getAttribute('data-trwho'); $('#trwho').value = b.textContent; $('#trwhores').innerHTML = '';
+      $('#trtheirs').innerHTML = '<p class="muted">Loading…</p>';
+      fetch('/api/cards/of?user=' + who, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (d) {
+        $('#trtheirs').innerHTML = (d.cards || []).map(function (c) {
+          return '<label class="tr-pick"><input type="checkbox" name="want" value="' + c.id + '"> ' + esc(c.label) + '</label>';
+        }).join('') || '<p class="muted">They have no cards free to trade.</p>';
+      });
+    });
+    $('#trsend').addEventListener('click', function () {
+      if (!who) { P.toast('Pick who you are trading with.', 'warn'); return; }
+      var give = $$('input[name=give]:checked', form).map(function (i) { return i.value; });
+      var want = $$('input[name=want]:checked', form).map(function (i) { return i.value; });
+      if (give.length > 3 || want.length > 3) { P.toast('Up to 3 cards a side.', 'warn'); return; }
+      post('/api/cards/trade', { to: who, give: give, want: want, give_coins: $('#trgivec').value, want_coins: $('#trwantc').value }, this, true);
+    });
+  }
+
+  // ---- replays: loop the video ----
+  var frames = $$('[data-replay]').filter(function (f) { return f.getAttribute('data-replay'); });
+  if (frames.length) {
+    var s = document.createElement('script');
+    s.src = 'https://player.twitch.tv/js/embed/v1.js';
+    s.onload = function () {
+      if (!window.Twitch || !window.Twitch.Player) return;
+      frames.forEach(function (f, i) {
+        var id = 'replay-' + i; var box = document.createElement('div'); box.id = id; box.className = 'replay-player';
+        f.innerHTML = ''; f.appendChild(box);
+        var player = new window.Twitch.Player(id, { video: 'v' + f.getAttribute('data-replay'), parent: [f.getAttribute('data-host'), location.hostname],
+                                                  autoplay: true, muted: true, width: '100%', height: '100%' });
+        player.addEventListener(window.Twitch.Player.ENDED, function () { try { player.seek(0); player.play(); } catch (err) {} });
+      });
+    };
+    document.head.appendChild(s);
+  }
+})();
+"""
+
+CARDS_CSS = r"""
+/* fighter tabs */
+.ftabs[hidden],[data-fpanel][hidden],.cardtile[hidden]{display:none!important}
+.ftabs{display:flex;gap:6px;flex-wrap:wrap;margin:28px 0 4px;border-bottom:1px solid var(--line)}
+.ftabs button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);font:600 12px/1 Inter,system-ui,sans-serif;letter-spacing:.16em;padding:12px 14px;cursor:pointer}
+.ftabs button.on{color:var(--text);border-bottom-color:var(--gold)}
+.ftabs button:focus-visible{outline:2px solid var(--gold);outline-offset:2px}
+/* fights like */
+.like{display:flex;gap:20px;align-items:center;flex-wrap:wrap}
+.like-ring{--p:50;width:92px;height:92px;border-radius:50%;display:grid;place-items:center;background:conic-gradient(var(--gold) calc(var(--p)*1%),#26262d 0);position:relative;flex:none}
+.like-ring::after{content:"";position:absolute;inset:7px;border-radius:50%;background:var(--bg,#08080A)}
+.like-ring span{position:relative;z-index:1;font-size:26px}
+.like-t{display:grid;gap:4px;min-width:0}
+.like-name{font-size:clamp(28px,5vw,40px);line-height:1}
+.lk-legend{display:flex;gap:16px;font-size:12px;color:var(--muted);margin:18px 0 10px}
+.lk-dot{display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--gold);margin-right:6px}
+.lk-dot-u{background:#c9c6be}
+.lk-bars{display:grid;gap:9px;max-width:620px}
+.lk-bar{display:grid;grid-template-columns:62px 1fr 1fr;gap:10px;align-items:center;font-size:12px}
+.lk-k{color:var(--muted);letter-spacing:.12em;font-weight:600}
+.lk-t{height:8px;border-radius:4px;background:#1f1f25;overflow:hidden;position:relative}
+.lk-t i{position:absolute;inset:0 auto 0 0;border-radius:4px;background:var(--gold)}
+.lk-u i{background:#c9c6be}
+/* cards */
+.cardimg{display:block;width:100%;height:auto;aspect-ratio:5/7;border-radius:14px;background:#111}
+.cardgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:18px;margin-top:18px}
+.cardtile{position:relative;display:block;transition:transform .2s}
+.cardtile:hover{transform:translateY(-4px)}
+.cardcount,.cardheld{position:absolute;top:8px;right:8px;background:rgba(0,0,0,.75);color:#fff;font:700 12px/1 Inter,system-ui,sans-serif;padding:5px 8px;border-radius:6px}
+.cardheld{top:auto;bottom:8px;left:8px;right:auto;color:var(--gold)}
+.cardfilter{display:flex;gap:6px;flex-wrap:wrap}
+.cardfilter button{background:none;border:1px solid var(--line);color:var(--muted);border-radius:999px;padding:7px 12px;font:600 11px/1 Inter,system-ui,sans-serif;letter-spacing:.12em;cursor:pointer}
+.cardfilter button.on{border-color:var(--gold);color:var(--text)}
+.fcard-in{display:grid;grid-template-columns:minmax(0,320px) 1fr;gap:28px;align-items:center}
+.fcard-t{display:grid;gap:10px;min-width:0}
+.packrow{display:grid;grid-template-columns:repeat(3,minmax(0,240px));gap:18px;margin:18px 0}
+.packcard{display:grid;gap:8px;text-align:center}
+.trade{border:1px solid var(--line);border-radius:12px;padding:16px;display:grid;gap:12px;margin-top:12px}
+.trade-sides{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.trade-sides>div{display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start}
+.trade-sides .num-l{width:100%}
+.tr-card{border:1px solid var(--line);border-radius:6px;padding:5px 9px;font-size:13px}
+.tr-card.tier-champion,.tr-card.tier-double{border-color:var(--gold)}
+.tradeform{display:grid;gap:10px;max-width:760px}
+.tr-in{background:#0A0A0D;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:10px 12px;font:14px Inter,sans-serif;width:100%;box-sizing:border-box}
+.tr-cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+.tr-list{display:grid;gap:4px;max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;margin-bottom:8px}
+.tr-pick{display:flex;gap:8px;align-items:center;font-size:13px;padding:4px}
+.pickres{display:flex;gap:6px;flex-wrap:wrap}
+.pickres button{background:var(--panel,#121216);border:1px solid var(--line);color:inherit;border-radius:6px;padding:6px 10px;cursor:pointer}
+/* replay */
+.replay-grid{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(0,1fr);gap:20px;align-items:start}
+.replay-solo{grid-template-columns:1fr}
+.replay-res{display:grid;gap:10px;min-width:0}
+.replay-res .btn{justify-self:start}
+.replay-player,.replay-player iframe{width:100%;height:100%}
+@media (max-width:760px){
+  .replay-grid,.fcard-in,.tr-cols,.trade-sides{grid-template-columns:1fr}
+  .packrow{grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
+  .cardgrid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+  .fcard-in{max-width:340px}
+}
+"""
+
 SITE_JS += EXTRA_JS
 SITE_JS += NAV_JS
 SITE_JS += ACCOUNT_JS
 SITE_JS += V2_JS
+SITE_JS += CARDS_JS
 SITE_CSS += V2_CSS
+SITE_CSS += CARDS_CSS
 
 
 # ============================================================
@@ -4985,8 +5227,8 @@ SECURITY_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
     "Content-Security-Policy": (
         "default-src 'self'; img-src 'self' https: data: blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; connect-src 'self'; "
-        "frame-src https://player.twitch.tv https://www.twitch.tv; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://discord.com"
+        "font-src 'self' https://fonts.gstatic.com; script-src 'self' 'unsafe-inline' https://player.twitch.tv; connect-src 'self'; "
+        "frame-src https://player.twitch.tv https://www.twitch.tv https://clips.twitch.tv; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://discord.com"
     ),
 }
 
@@ -5570,7 +5812,10 @@ def add_action_routes(app, bot, g):
             raise ActionError(re.sub(r"<@!?(\d+)>", "them", message[2:].replace("**", "")))
         clean = re.sub(r"<@!?(\d+)>", lambda m: "@" + player_name(ctx(), int(m.group(1))), message).replace("**", "")
         clean = clean.replace(g["COIN"], "").replace("  ", " ")
-        return {"ok": True, "message": clean, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+        out = {"ok": True, "message": clean, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+        if item in g.get("PACK_ITEMS", {}):
+            out["pack_id"] = g["_last_pack"].pop((gd.id, viewer.user_id), None)
+        return out
 
     async def members_search(request):
         viewer = viewer_for(bot, g, request)
@@ -5879,7 +6124,7 @@ def render_me(ctx, viewer, query):
     links = ""
     if fights or ctx.get_user_rankings(gid, uid):
         links += f'<a class="btn btn-ghost btn-sm" href="{fighter_url(uid)}">MY FIGHTER PAGE</a>'
-    links += '<a class="btn btn-ghost btn-sm" href="/shop">SHOP</a><a class="btn btn-ghost btn-sm" href="/app">GET THE APP</a>'
+    links += '<a class="btn btn-ghost btn-sm" href="/shop">SHOP</a><a class="btn btn-ghost btn-sm" href="/me/cards">MY CARDS</a><a class="btn btn-ghost btn-sm" href="/app">GET THE APP</a>'
     hero = f"""
 <section class="mehero">
   <div class="wrap mehero-in">
@@ -6918,6 +7163,421 @@ self.addEventListener('fetch', function (e) {
 """
 
 
+# ------------------------------------------------------------
+# Teams /teams and /team/ID
+# ------------------------------------------------------------
+
+def team_name_html(team):
+    tag = f'<span class="tm-tag">{esc(team["tag"])}</span>' if row_get(team, "tag") else ""
+    return f'{tag}{esc(team["name"])}'
+
+
+def team_card(ctx, team, i=0):
+    members = ctx.team_members(team["id"])
+    rec = ctx.team_record(ctx.gid, team["id"])
+    faces = "".join(avatar_html(ctx, uid, fighter_name(ctx, uid), "av av-sm") for uid, _ in members[:8])
+    champs = sum(1 for uid, _ in members if ctx.is_any_champion(ctx.gid, uid))
+    owners = ctx.team_owner_ids(team)
+    owner = ", ".join(fighter_name(ctx, uid) for uid in owners)
+    return f"""
+      <a class="tmcard {stagger(i, 3)}" href="/team/{team['id']}">
+        <span class="d tmcard-name">{team_name_html(team)}</span>
+        <span class="muted">Owner{'s' if len(owners) > 1 else ''}: {esc(owner)} · {len(members)} member{'s' if len(members) != 1 else ''}</span>
+        <span class="tmcard-faces">{faces}</span>
+        <span class="tmcard-stats">
+          <span><b class="d">{rec['wins']}-{rec['losses']}-{rec['draws']}</b>TEAM RECORD</span>
+          <span><b class="d">{rec['finishes']}</b>FINISHES</span>
+          <span><b class="d{' gold' if champs else ''}">{champs}</b>CHAMPS</span>
+        </span>
+      </a>"""
+
+
+def render_teams(ctx):
+    teams = list(ctx.all_teams(ctx.gid))
+    scored = []
+    for t in teams:
+        rec = ctx.team_record(ctx.gid, t["id"])
+        scored.append((rec["wins"] - rec["losses"], rec["wins"], t))
+    scored.sort(key=lambda x: (-x[0], -x[1], x[2]["name"].lower()))
+    cards = "".join(team_card(ctx, t, i) for i, (_, _, t) in enumerate(scored))
+    total = sum(len(ctx.team_members(t["id"])) for t in teams)
+    strip = chip("TEAMS", len(teams)) + chip("FIGHTERS ON TEAMS", total, "gold")
+    how = """
+  <section class="block bt"><div class="head-t rv"><span class="eyebrow">IN DISCORD</span><h2 class="d h-m">JOINING A TEAM</h2></div>
+    <div class="pgrid">
+      <div class="pbox"><h3 class="pbox-h">1 · SET UP BY STAFF</h3><p class="muted">Staff create each team and its Discord role, and pick the owners.</p></div>
+      <div class="pbox"><h3 class="pbox-h">2 · GET THE ROLE</h3><p class="muted">Anyone with a team's role is on that team. Want in? Speak to the team's owner or a staff member.</p></div>
+      <div class="pbox"><h3 class="pbox-h">3 · FIGHT</h3><p class="muted">Every fight members have while on the team counts towards the team record.</p></div>
+    </div>
+    <p class="note">See any team in Discord with <code>/team</code>.</p>
+  </section>"""
+    body = page_hero("FIGHT CAMPS OF THE PFO", "TEAMS", "TEAM", f'<div class="evchips l-up">{strip}</div>') + f"""
+<div class="wrap">
+  <section class="block"><div class="tmgrid">{cards or '<p class="empty">No teams yet. Staff set teams up in the Discord.</p>'}</div></section>
+  {how}
+</div>"""
+    return page(ctx, "Teams", "teams", body, "PFO fighter teams, members and team records.")
+
+
+def render_team(ctx, team_id):
+    team = ctx.get_team(team_id)
+    if not team or team["guild_id"] != ctx.gid:
+        return None
+    members = ctx.team_members(team["id"])
+    owners = ctx.team_owner_ids(team)
+    rec = ctx.team_record(ctx.gid, team["id"])
+    rows = ""
+    cache = {}
+    for i, (uid, joined) in enumerate(members):
+        name = fighter_name(ctx, uid)
+        stats = stats_for(ctx, uid, cache)
+        division = main_division(ctx, uid)
+        rank = rank_in(ctx, uid, division) if division else None
+        role = '<span class="badge badge-gold">OWNER</span>' if uid in owners else ""
+        rows += f"""
+          <li class="row rank-row {stagger(i, 3)}">
+            {avatar_html(ctx, uid, name, 'av av-sm')}
+            <span class="tm-who">{name_link(ctx, uid, name, 'd rank-name')}<span class="muted">{esc((division or '').upper())}{(' · ' + esc(rank_label(rank))) if rank is not None else ''}</span></span>
+            {role}
+            <span class="muted tab">{esc(ctx.stats_record(stats) if stats else '')}</span>
+          </li>"""
+    # Recent team fights
+    fights = []
+    for uid, joined in members:
+        start = datetime.fromtimestamp(joined, timezone.utc).isoformat()
+        fights += ctx.q("SELECT * FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?) AND created_at >= ?",
+                        (ctx.gid, uid, uid, start))
+    seen, recent = set(), []
+    for f in sorted(fights, key=lambda f: f["created_at"], reverse=True):
+        if f["id"] not in seen:
+            seen.add(f["id"])
+            recent.append(f)
+    results = "".join(result_row(ctx, f, i) for i, f in enumerate(recent[:12]))
+    created = datetime.fromtimestamp(team["created_at"], timezone.utc)
+    strip = (chip("TEAM RECORD", f"{rec['wins']}-{rec['losses']}-{rec['draws']}", "gold") + chip("FINISHES", rec["finishes"])
+             + chip("TITLE WINS", rec["titles"]) + chip("MEMBERS", len(members)))
+    label = (f"[{team['tag']}] " if row_get(team, "tag") else "") + team["name"]
+    body = page_hero(f"TEAM · SINCE {created.day} {created:%b %Y}".upper(), label.upper(), row_get(team, "tag") or "TEAM",
+                     f'<div class="evchips l-up">{strip}</div>') + f"""
+<div class="wrap">
+  <section class="block"><div class="head-t rv"><h2 class="d h-m">ROSTER</h2></div><ol class="list">{rows}</ol></section>
+  <section class="block bt"><div class="head-t rv"><span class="eyebrow">WHILE ON THE TEAM</span><h2 class="d h-m">TEAM FIGHTS</h2></div>
+    <div class="list">{results or '<p class="empty">No fights since the team started.</p>'}</div></section>
+  <p class="note"><a href="/teams">← All teams</a></p>
+</div>"""
+    return page(ctx, label, "teams", body, f"{label}: PFO team roster and record.")
+
+
+# ------------------------------------------------------------
+# Staff & contacts /staff (public)
+# ------------------------------------------------------------
+
+STAFF_CONTACT = os.getenv("STAFF_CONTACT", "").strip()
+STAFF_ORDER = ["Owner", "Vice President", "Head Moderator", "Moderator", "Helper"]
+STAFF_ABOUT = {
+    "Owner": "Runs the league",
+    "Vice President": "Runs the league with the owner",
+    "Head Moderator": "Leads the staff team, betting and the economy",
+    "Moderator": "Rankings, stats, transfers and discipline",
+    "Helper": "Sign-ups, cards, results and recaps",
+}
+
+
+def render_staff_public(ctx):
+    guild = ctx.guild
+    has = ctx.has_any_role
+    groups = {name: [] for name in STAFF_ORDER}
+    for member in getattr(guild, "members", []):
+        if member.bot:
+            continue
+        group = None
+        if member.id == guild.owner_id:
+            group = "Owner"
+        else:
+            for name in STAFF_ORDER:
+                if has(member, [name]):
+                    group = name
+                    break
+        if group:
+            groups[group].append(member)
+    blocks = ""
+    count = 0
+    for name in STAFF_ORDER:
+        people = sorted(groups[name], key=lambda m: clean_name(ctx, m.display_name).lower())
+        if not people:
+            continue
+        count += len(people)
+        cards = "".join(
+            f'<div class="stcard {stagger(i, 3)}">{avatar_html(ctx, m.id, clean_name(ctx, m.display_name), "av av-md")}'
+            f'<span class="stcard-t"><span class="d stcard-n">{esc(clean_name(ctx, m.display_name))}</span>'
+            f'<span class="muted">@{esc(m.name)}</span></span></div>' for i, m in enumerate(people))
+        blocks += (f'<section class="block bt"><div class="head-t rv"><span class="eyebrow">{esc(STAFF_ABOUT.get(name, "").upper())}</span>'
+                   f'<h2 class="d h-m">{esc(name.upper())}{"S" if len(people) > 1 and not name.endswith("s") else ""}</h2></div>'
+                   f'<div class="stgrid">{cards}</div></section>')
+    contact = STAFF_CONTACT or "Got a question or a problem? Message any Moderator in the Discord. For anything about a fight result, include the event and your opponent."
+    discord_btn = discord_button("Open the Discord", "btn-gold-solid") if DISCORD_INVITE else ""
+    body = page_hero("WHO RUNS THE PFO", "STAFF", "STAFF",
+                     f'<div class="evchips l-up">{chip("STAFF", count, "gold")}</div><div class="btns l-up">{discord_btn}'
+                     '<a class="btn btn-ghost" href="/dashboard" data-staff-only hidden>STAFF DASHBOARD</a></div>') + f"""
+<div class="wrap">
+  <section class="block"><div class="loginbox stcontact rv"><span class="eyebrow">CONTACT</span><p>{esc(contact)}</p></div></section>
+  {blocks or '<section class="block"><p class="empty">No staff roles found.</p></section>'}
+</div>"""
+    return page(ctx, "Staff", "staffpage", body, "The PFO staff team and how to contact them.")
+
+
+# ------------------------------------------------------------
+# Fighter cards  /cards, /me/cards and the card images
+# ------------------------------------------------------------
+
+CARD_TIER_ORDER = ["double", "champion", "contender", "ranked", "prospect"]
+CARD_TIER_TEXT = {"double": "DOUBLE CHAMP", "champion": "CHAMPION", "contender": "CONTENDER", "ranked": "RANKED", "prospect": "PROSPECT"}
+
+
+def card_bust():
+    """Changes every 10 minutes so card pictures refresh after results."""
+    return int(time.time() // 600)
+
+
+def fighter_card_img(user_id, name="", cls="cardimg", lazy=True):
+    return (f'<img class="{cls}" src="/cardimg/fighter/{user_id}.png?v={card_bust()}" width="500" height="700" '
+            f'alt="{esc(name)} fighter card"{" loading=lazy" if lazy else ""}>')
+
+
+def pull_card_img(pull_id, name="", cls="cardimg"):
+    return (f'<img class="{cls}" src="/cardimg/pull/{pull_id}.png" width="500" height="700" '
+            f'alt="{esc(name)} card" loading="lazy">')
+
+
+def fights_like_block(ctx, user_id, stats):
+    fn = getattr(ctx, "fights_like", None)
+    if not fn or not stats:
+        return ""
+    try:
+        matches = fn(stats, ctx.fighter_division(ctx.gid, user_id), top=3)
+    except Exception:
+        return ""
+    if not matches:
+        return ""
+    name, score = matches[0]
+    style = ctx.fights_like_style(name) if getattr(ctx, "fights_like_style", None) else ""
+    values = ctx.ufc_styles().get(name)
+    wins = stats["wins"]
+    by = stats["wins_by"]
+    total = wins + stats["losses"]
+    mine = [round(100 * wins / total) if total else 0, round(100 * by.get("KO/TKO", 0) / wins) if wins else 0,
+            round(100 * by.get("SUB", 0) / wins) if wins else 0, round(100 * by.get("DEC", 0) / wins) if wins else 0]
+    theirs = [0, 0, 0, 0]
+    if values:
+        _, w, l, ko, sub, dec = values[:6]
+        theirs = [round(100 * w / (w + l)) if w + l else 0, round(100 * ko / w) if w else 0,
+                  round(100 * sub / w) if w else 0, round(100 * dec / w) if w else 0]
+    bars = "".join(
+        f'<div class="lk-bar"><span class="lk-k">{label}</span>'
+        f'<span class="lk-t"><i style="width:{a}%"></i></span><span class="lk-t lk-u"><i style="width:{b}%"></i></span></div>'
+        for label, a, b in zip(["WIN %", "KO", "SUB", "DEC"], mine, theirs))
+    others = " · ".join(f"{esc(n)} {s}%" for n, s in matches[1:])
+    record = f"{values[1]}-{values[2]}" if values else ""
+    return f"""
+  <section class="block bt likeblock" aria-labelledby="flike">
+    <div class="like">
+      <div class="like-ring" style="--p:{score}"><span class="d">{score}%</span></div>
+      <div class="like-t">
+        <span class="eyebrow" id="flike">FIGHTS LIKE</span>
+        <span class="d like-name">{esc(name.upper())}</span>
+        <span class="muted">{esc(style)}{(' · UFC record ' + esc(record)) if record else ''}{(' · next closest: ' + others) if others else ''}</span>
+      </div>
+    </div>
+    <div class="lk-legend"><span><i class="lk-dot"></i>PFO</span><span><i class="lk-dot lk-dot-u"></i>{esc(name)}</span></div>
+    <div class="lk-bars">{bars}</div>
+    <p class="note">Matched on win rate and how they win. Just for fun.</p>
+  </section>"""
+
+
+def render_cards(ctx):
+    tiers, cards = ctx.pool_by_tier(ctx.guild)
+    order = sorted(cards.values(), key=lambda c: (CARD_TIER_ORDER.index(c["tier"]), -c["ovr"], c["name"].lower()))
+    tiles = ""
+    for i, info in enumerate(order):
+        tiles += (f'<a class="cardtile {stagger(i, 4)}" href="{fighter_url(info["user_id"])}#card" data-tier="{info["tier"]}">'
+                  f'{fighter_card_img(info["user_id"], info["name"])}</a>')
+    counts = "".join(chip(CARD_TIER_TEXT[t], len(tiers.get(t, [])), "gold" if t in ("double", "champion") else "")
+                     for t in CARD_TIER_ORDER if tiers.get(t))
+    filters = '<div class="cardfilter" data-cardfilter><button type="button" class="on" data-ct="">ALL</button>' + "".join(
+        f'<button type="button" data-ct="{t}">{CARD_TIER_TEXT[t]}</button>' for t in CARD_TIER_ORDER if tiers.get(t)) + '</div>'
+    packs = "".join(
+        f'<div class="pbox"><h3 class="pbox-h">{esc(ctx.SHOP_ITEMS[k][1])} {esc(ctx.SHOP_ITEMS[k][0].upper())} · {ctx.item_price(ctx.gid, k):,}</h3>'
+        f'<p class="muted">{esc(ctx.SHOP_ITEMS[k][5])}</p></div>' for k in ("pack_common", "pack_rare", "pack_champ"))
+    body = page_hero("COLLECT THE LEAGUE", "CARDS", "CARD", f'<div class="evchips l-up">{chip("FIGHTERS", len(order))}{counts}</div>'
+                     '<div class="btns l-up"><a class="btn btn-gold" href="/shop">GET PACKS</a><a class="btn btn-ghost" href="/me/cards">MY CARDS</a></div>') + f"""
+<div class="wrap">
+  <section class="block">{filters}<div class="cardgrid">{tiles or '<p class="empty">Cards appear once fights are logged.</p>'}</div></section>
+  <section class="block bt"><div class="head-t rv"><span class="eyebrow">IN THE SHOP</span><h2 class="d h-m">PACKS</h2></div>
+    <div class="pgrid">{packs}</div>
+    <p class="note">Each card's tier comes from where the fighter stands: Double Champ, Champion, Contender (#1 to #5), Ranked, Prospect.
+    Cards you pull keep the tier they had that day. Duplicates sell for {', '.join(f'{CARD_TIER_TEXT[t].title()} {ctx.CARD_SELL[t]:,}' for t in reversed(CARD_TIER_ORDER))}.</p>
+  </section>
+</div>"""
+    return page(ctx, "Cards", "cards", body, "Every PFO fighter's trading card. Collect them from packs in the shop.")
+
+
+def render_my_cards(ctx, viewer, query):
+    uid = viewer.user_id
+    gid = ctx.gid
+    have, total = ctx.collection_progress(ctx.guild, uid)
+    spares = ctx.spare_cards(gid, uid)
+    worth = sum(ctx.CARD_SELL[r["tier"]] for r in spares)
+
+    # Pack just opened
+    pack_html = ""
+    raw = str(query.get("pack", "") or "")
+    if raw.isdigit():
+        rows = ctx.q("SELECT * FROM card_packs WHERE id = ? AND user_id = ? AND guild_id = ?", (int(raw), uid, gid))
+        if rows:
+            pack = rows[0]
+            pulls = ctx.pack_cards(pack["id"])
+            dupes = ctx.duplicates_in_pack(gid, uid, pack["id"])
+            dupe_ids = {r["id"] for r in dupes}
+            cards_html = "".join(f'<div class="packcard {stagger(i, 3)}">{pull_card_img(r["id"], ctx.card_info(r)["name"])}'
+                                 f'<span class="muted">{CARD_TIER_TEXT[r["tier"]].title()}{" · duplicate" if r["id"] in dupe_ids else ""}{" · sold" if r["status"] == "sold" else ""}</span></div>'
+                                 for i, r in enumerate(pulls))
+            buttons = ""
+            if dupes and not pack["decided"]:
+                value = sum(ctx.CARD_SELL[r["tier"]] for r in dupes)
+                buttons = (f'<div class="btns"><button class="btn btn-ghost" type="button" data-packdecide="{pack["id"]}" data-d="keep">KEEP DUPLICATES</button>'
+                           f'<button class="btn btn-gold" type="button" data-packdecide="{pack["id"]}" data-d="sell">SELL DUPLICATES (+{value:,})</button></div>')
+            pack_html = f"""
+  <section class="block packopen" aria-label="Pack opened">
+    <div class="head-t rv"><span class="eyebrow">{esc(ctx.PACK_NAMES[pack['pack']].upper())} OPENED</span><h2 class="d h-m">YOU PULLED</h2></div>
+    <div class="packrow">{cards_html}</div>
+    {buttons}
+  </section>"""
+
+    # Trades
+    trades = ctx.q("SELECT * FROM card_trades WHERE guild_id = ? AND status = 'open' AND (from_id = ? OR to_id = ?) ORDER BY id DESC",
+                   (gid, uid, uid))
+    trade_rows = ""
+    for t in trades:
+        give = ctx.trade_card_rows(json.loads(t["give_cards"]))
+        want = ctx.trade_card_rows(json.loads(t["want_cards"]))
+        incoming = t["to_id"] == uid
+        other = t["from_id"] if incoming else t["to_id"]
+
+        def side(rows, coins):
+            bits = [f'<span class="tr-card tier-{r["tier"]}">{esc(ctx.card_info(r)["name"])} <b>{ctx.card_info(r)["ovr"]}</b></span>' for r in rows]
+            if coins:
+                bits.append(f'<span class="tr-card">{coins:,} coins</span>')
+            return "".join(bits) or '<span class="muted">Nothing</span>'
+        you_give = side(want, t["want_coins"]) if incoming else side(give, t["give_coins"])
+        you_get = side(give, t["give_coins"]) if incoming else side(want, t["want_coins"])
+        actions = (f'<button class="btn btn-gold btn-sm" type="button" data-trade="{t["id"]}" data-a="accept">ACCEPT</button>'
+                   f'<button class="btn btn-ghost btn-sm" type="button" data-trade="{t["id"]}" data-a="decline">DECLINE</button>') if incoming else \
+                  f'<button class="btn btn-ghost btn-sm" type="button" data-trade="{t["id"]}" data-a="decline">WITHDRAW</button>'
+        trade_rows += f"""
+      <div class="trade">
+        <span class="eyebrow-grey">{'FROM' if incoming else 'TO'} {esc(player_name(ctx, other).upper())} · ENDS {when_html(t['created_at'] + ctx.TRADE_HOURS * 3600, True)}</span>
+        <div class="trade-sides"><div><span class="num-l">YOU GIVE</span>{you_give}</div><div><span class="num-l">YOU GET</span>{you_get}</div></div>
+        <div class="btns">{actions}</div>
+      </div>"""
+
+    # Collection
+    groups = {}
+    for row in ctx.owned_cards(gid, uid, include_held=True):
+        groups.setdefault((row["fighter_id"], row["tier"]), []).append(row)
+    ordered = sorted(groups.values(), key=lambda rows: (CARD_TIER_ORDER.index(rows[0]["tier"]), -ctx.card_info(rows[-1])["ovr"]))
+    grid = ""
+    for i, rows in enumerate(ordered):
+        info = ctx.card_info(rows[-1])
+        held = any(r["status"] == "held" for r in rows)
+        grid += (f'<div class="cardtile {stagger(i, 4)}" data-tier="{rows[0]["tier"]}">{pull_card_img(rows[-1]["id"], info["name"])}'
+                 + (f'<span class="cardcount">×{len(rows)}</span>' if len(rows) > 1 else "")
+                 + ('<span class="cardheld">IN A TRADE</span>' if held else "") + '</div>')
+    mine_options = "".join(
+        f'<label class="tr-pick"><input type="checkbox" name="give" value="{r["id"]}"> {esc(ctx.card_label(r))}</label>'
+        for r in reversed(ctx.owned_cards(gid, uid)))
+    sell_btn = (f'<button class="btn btn-ghost" type="button" data-sellspares>SELL {len(spares)} SPARE{"S" if len(spares) != 1 else ""} (+{worth:,})</button>'
+                if spares else "")
+    body = page_hero("MY PFO", "MY CARDS", "CARD", f'<div class="evchips l-up">{chip("COLLECTION", f"{have}/{total}", "gold")}'
+                     f'{chip("CARDS", sum(len(g) for g in groups.values()))}{chip("SPARES", len(spares))}</div>'
+                     f'<div class="btns l-up"><a class="btn btn-gold" href="/shop">GET PACKS</a><a class="btn btn-ghost" href="/cards">ALL CARDS</a>{sell_btn}</div>') + f"""
+<div class="wrap">
+  {pack_html}
+  {f'<section class="block bt"><div class="head-t rv"><h2 class="d h-m">OPEN TRADES</h2></div>{trade_rows}</section>' if trade_rows else ''}
+  <section class="block bt"><div class="head-t rv"><span class="eyebrow">{have} OF {total} FIGHTERS</span><h2 class="d h-m">COLLECTION</h2></div>
+    <div class="cardgrid">{grid or '<p class="empty">No cards yet. Packs are in the shop.</p>'}</div></section>
+  <section class="block bt" id="newtrade"><div class="head-t rv"><span class="eyebrow">UP TO {ctx.TRADE_MAX_CARDS} CARDS A SIDE</span><h2 class="d h-m">MAKE A TRADE</h2></div>
+    <div class="tradeform" data-tradeform>
+      <label class="num-l" for="trwho">TRADE WITH</label>
+      <input id="trwho" class="tr-in" type="search" placeholder="Start typing a name" autocomplete="off">
+      <div id="trwhores" class="pickres"></div>
+      <div class="tr-cols">
+        <div><span class="num-l">YOUR CARDS</span><div class="tr-list" id="trmine">{mine_options or '<p class="muted">No cards free to trade.</p>'}</div>
+          <label class="num-l" for="trgivec">ADD COINS</label><input id="trgivec" class="tr-in" type="number" min="0" step="50" value="0"></div>
+        <div><span class="num-l">THEIR CARDS</span><div class="tr-list" id="trtheirs"><p class="muted">Pick who first.</p></div>
+          <label class="num-l" for="trwantc">ASK FOR COINS</label><input id="trwantc" class="tr-in" type="number" min="0" step="50" value="0"></div>
+      </div>
+      <button class="btn btn-gold" type="button" id="trsend">SEND OFFER</button>
+      <p class="note">The offer is posted in the Discord for them to accept. Your cards and coins are held until they answer, or for {ctx.TRADE_HOURS} hours.</p>
+    </div>
+  </section>
+</div>"""
+    return page(ctx, "My cards", "me", body, "Your PFO fighter card collection.")
+
+
+# ------------------------------------------------------------
+# Replays
+# ------------------------------------------------------------
+
+def site_host():
+    return re.sub(r"^https?://", "", SITE_URL or "prestigefightingorg.com").split("/")[0].split(":")[0]
+
+
+def replay_player(ctx, vod, eyebrow="LAST EVENT · REPLAY", show_results=True):
+    if not vod:
+        return ""
+    video, clip = vod["video_id"], vod["clip_id"]
+    host = site_host()
+    if video:
+        src = f"https://player.twitch.tv/?video=v{esc(video)}&parent={esc(host)}&autoplay=true&muted=true"
+    else:
+        src = f"https://clips.twitch.tv/embed?clip={esc(clip)}&parent={esc(host)}&autoplay=true&muted=true"
+    frame = (f'<div class="watch-frame" data-replay="{esc(video or "")}" data-host="{esc(host)}">'
+             f'<iframe src="{src}" title="{esc(vod["event"])} replay" allowfullscreen allow="autoplay; fullscreen"></iframe></div>')
+    results = ""
+    if show_results:
+        fights = ctx.event_fights(ctx.gid, vod["event"]) if getattr(ctx, "event_fights", None) else []
+        rows = "".join(result_row(ctx, f, i) for i, f in enumerate(list(reversed(fights))[:6]))
+        if rows:
+            results = (f'<div class="replay-res"><span class="num-l">RESULTS</span><div class="list">{rows}</div>'
+                       f'<a class="btn btn-gold btn-sm" href="{event_url(vod["event"])}">FULL RESULTS</a></div>')
+    url = vod["url"] if vod["url"].startswith("http") else "https://" + vod["url"]
+    return f"""
+  <section class="block bt replay" id="replay" aria-label="{esc(vod['event'])} replay">
+    <div class="head rv"><div class="head-t"><span class="eyebrow">{esc(eyebrow)}</span><h2 class="d h-m">{esc(vod['event'].upper())}</h2></div>
+      <a class="btn btn-ghost btn-sm" href="{esc(url)}" target="_blank" rel="noopener">WATCH ON TWITCH ↗</a></div>
+    <div class="replay-grid{' replay-solo' if not results else ''}">{frame}{results}</div>
+    <p class="note">Plays muted on a loop. Tap the player for sound.</p>
+  </section>"""
+
+
+def is_live_now(ctx):
+    try:
+        rows = ctx.q("SELECT live FROM twitch_state WHERE id = 1")
+        return bool(rows and rows[0]["live"])
+    except Exception:
+        return False
+
+
+def home_replay(ctx):
+    fn = getattr(ctx, "latest_vod", None)
+    if not fn or is_live_now(ctx):
+        return ""
+    try:
+        return replay_player(ctx, fn(ctx.gid))
+    except Exception:
+        return ""
+
+
 def add_page_routes(app, bot, g, serve, html_response):
     """Routes for the pages added with logins. Personal pages are built per visitor and never cached."""
 
@@ -6958,6 +7618,134 @@ def add_page_routes(app, bot, g, serve, html_response):
 
     async def me_page(request):
         return await personal(request, "My PFO", render_me)
+
+    async def my_cards_page(request):
+        return await personal(request, "My cards", render_my_cards)
+
+    async def cards_page(request):
+        return await serve(request, "cards", render_cards)
+
+    _card_png = {}
+
+    async def card_image(request):
+        kind = request.match_info.get("kind", "")
+        raw = request.match_info.get("ident", "")
+        if kind not in ("fighter", "pull") or not raw.isdigit():
+            raise web.HTTPNotFound()
+        gd = guild()
+        if gd is None:
+            raise web.HTTPServiceUnavailable()
+        key = (kind, int(raw))
+        hit = _card_png.get(key)
+        if hit and time.time() - hit[0] < 600:
+            data = hit[1]
+        else:
+            if kind == "fighter":
+                member = gd.get_member(int(raw))
+                if not member:
+                    raise web.HTTPNotFound()
+                data = await g["card_png_for_fighter"](gd, member)
+            else:
+                rows = g["discipline_query"]("SELECT * FROM card_pulls WHERE id = ? AND guild_id = ?", (int(raw), gd.id))
+                if not rows:
+                    raise web.HTTPNotFound()
+                data = await g["card_png_for_pull"](gd, rows[0])
+            if not data:
+                raise web.HTTPNotFound()
+            if len(_card_png) > 300:
+                _card_png.clear()
+            _card_png[key] = (time.time(), data)
+        headers = {"Cache-Control": "public, max-age=600"}
+        if request.query.get("download"):
+            headers["Content-Disposition"] = f'attachment; filename="pfo-card-{raw}.png"'
+        return web.Response(body=data, content_type="image/png", headers=headers)
+
+    @action_route(bot, g, bucket="cards", limit=20, window=60)
+    async def cards_pack(viewer, body, request):
+        gd = guild()
+        pack_id = _int(body.get("pack_id"), 0)
+        rows = g["discipline_query"]("SELECT * FROM card_packs WHERE id = ? AND user_id = ? AND guild_id = ?", (pack_id, viewer.user_id, gd.id))
+        if not rows:
+            raise ActionError("That pack isn't yours.")
+        if rows[0]["decided"]:
+            raise ActionError("Already done.")
+        if body.get("decision") == "sell":
+            total = g["sell_cards"](gd.id, viewer.user_id, g["duplicates_in_pack"](gd.id, viewer.user_id, pack_id))
+            message = f"Sold for {total:,} coins."
+        else:
+            total, message = 0, "Kept. You can sell spares any time."
+        g["discipline_query"]("UPDATE card_packs SET decided = ? WHERE id = ?", ("sell" if body.get("decision") == "sell" else "keep", pack_id), write=True)
+        return {"ok": True, "message": message, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+
+    @action_route(bot, g, bucket="cards", limit=20, window=60)
+    async def cards_sell_spares(viewer, body, request):
+        gd = guild()
+        spares = g["spare_cards"](gd.id, viewer.user_id)
+        if not spares:
+            raise ActionError("No spare cards to sell.")
+        total = g["sell_cards"](gd.id, viewer.user_id, spares)
+        return {"ok": True, "message": f"Sold {len(spares)} spare card{'s' if len(spares) != 1 else ''} for {total:,} coins.",
+                "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+
+    @action_route(bot, g, bucket="trade", limit=10, window=60)
+    async def cards_trade(viewer, body, request):
+        gd = guild()
+        to = gd.get_member(_int(body.get("to"), 0))
+        if not to or to.bot:
+            raise ActionError("Pick who you're trading with.")
+        give = [_int(x, 0) for x in (body.get("give") or [])][:5]
+        want = [_int(x, 0) for x in (body.get("want") or [])][:5]
+        trade_id, error = g["create_trade"](gd.id, viewer.user_id, to.id, [x for x in give if x], [x for x in want if x],
+                                            max(0, _int(body.get("give_coins"), 0) or 0), max(0, _int(body.get("want_coins"), 0) or 0))
+        if error:
+            raise ActionError(re.sub(r"^[^\w]+", "", error).replace("**", ""))
+        posted = await g["post_web_trade"](gd, trade_id)
+        await g["trade_log"](gd, f"<@{viewer.user_id}> offered <@{to.id}> a trade from the website (#{trade_id}).")
+        return {"ok": True, "message": "Offer sent." + ("" if posted else " (It couldn't be posted in the Discord, but they can see it on My cards.)")}
+
+    @action_route(bot, g, bucket="trade", limit=20, window=60)
+    async def cards_trade_respond(viewer, body, request):
+        gd = guild()
+        trade = g["get_trade"](_int(body.get("trade_id"), 0))
+        if not trade or trade["guild_id"] != gd.id or viewer.user_id not in (trade["from_id"], trade["to_id"]):
+            raise ActionError("That trade isn't yours.")
+        if trade["status"] != "open":
+            raise ActionError("That trade is closed.")
+        if body.get("action") == "accept":
+            if viewer.user_id != trade["to_id"]:
+                raise ActionError("Only the person it's for can accept.")
+            error = g["complete_trade"](trade, viewer.user_id)
+            if error and g["get_trade"](trade["id"])["status"] == "open":
+                raise ActionError(re.sub(r"^[^\w]+", "", error).replace("**", ""))
+            message = error or "Trade done. The cards are yours."
+            if not error:
+                await g["trade_log"](gd, f"<@{trade['from_id']}> and <@{trade['to_id']}> traded on the website (#{trade['id']}).")
+        else:
+            g["release_trade"](trade, "withdrawn" if viewer.user_id == trade["from_id"] else "declined", viewer.user_id)
+            message = "Trade withdrawn." if viewer.user_id == trade["from_id"] else "Trade declined."
+        await g["refresh_trade_post"](trade["id"])
+        return {"ok": True, "message": message, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+
+    async def cards_of(request):
+        viewer = viewer_for(bot, g, request)
+        if not viewer.ok:
+            return jres({"cards": []}, 401)
+        gd = guild()
+        uid = _int(request.query.get("user"), 0)
+        rows = g["owned_cards"](gd.id, uid) if uid and uid != viewer.user_id else []
+        return jres({"cards": [{"id": r["id"], "label": re.sub(r"^\S+\s", "", g["card_label"](r)), "tier": r["tier"]} for r in reversed(rows)]})
+
+    async def teams_page(request):
+        return await serve(request, "teams", render_teams)
+
+    async def team_page(request):
+        raw = request.match_info.get("team_id", "")
+        if not raw.isdigit():
+            return await serve(request, "404", render_404, 404)
+        return await serve(request, f"team:{raw}", lambda ctx: render_team(ctx, int(raw)))
+
+    async def staff_public(request):
+        return await serve(request, "staffpublic", render_staff_public)
 
     async def staff_page(request):
         return await personal(request, "Staff", render_staff, "staff", "The staff dashboard is for Helpers and above.")
@@ -7087,7 +7875,14 @@ def add_page_routes(app, bot, g, serve, html_response):
                      "title_fight": bool(fight["title_fight"]), "winner": fighter_name(Ctx(g, guild()), fight["winner_id"], fight["winner_name"]),
                      "loser": fighter_name(Ctx(g, guild()), fight["loser_id"], fight["loser_name"])})
 
-    for path, handler in (("/me", me_page), ("/staff", staff_page), ("/stats", stats_page), ("/shop", shop), ("/social", social),
+    for path, handler in (("/me/cards", my_cards_page), ("/cards", cards_page), ("/cardimg/{kind}/{ident}.png", card_image),
+                          ("/api/cards/of", cards_of)):
+        app.router.add_get(path, handler)
+    for path, handler in (("/api/cards/pack", cards_pack), ("/api/cards/sell", cards_sell_spares), ("/api/cards/trade", cards_trade),
+                          ("/api/cards/trade/respond", cards_trade_respond)):
+        app.router.add_post(path, handler)
+    for path, handler in (("/me", me_page), ("/dashboard", staff_page), ("/staff", staff_public), ("/teams", teams_page),
+                          ("/team/{team_id}", team_page), ("/stats", stats_page), ("/shop", shop), ("/social", social),
                           ("/records", records), ("/awards", awards), ("/week", week), ("/app", app_page), ("/offline", offline),
                           ("/manifest.webmanifest", manifest), ("/sw.js", service_worker), ("/icon.svg", icon_svg),
                           ("/icon-192.png", icon), ("/icon-512.png", icon), ("/api/home", home_panel), ("/api/staff/fight", staff_fight_info)):
