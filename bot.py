@@ -428,6 +428,9 @@ def setup_database():
     setup_week_post_table()
     setup_former_name_table()
     setup_cancelled_bout_table()
+    setup_team_tables()
+    setup_card_collect_tables()
+    setup_vod_table()
     setup_fantasy_tables()
 
 
@@ -4233,10 +4236,25 @@ def fight_method_text(
     return text
 
 
+PROFILE_TABS = [("overview", "Overview"), ("stats", "Stats"), ("career", "Career"), ("card", "Card")]
+
+
+def short_weight(weight: str):
+    return WEIGHTS.get(weight, weight)
+
+
+def method_short_text(counts):
+    names = {"KO/TKO": "KO", "SUB": "SUB", "DEC": "DEC", "DQ": "DQ"}
+    parts = [f"{counts[m]} {names[m]}" for m in ("KO/TKO", "SUB", "DEC", "DQ") if counts.get(m)]
+    return " · ".join(parts) if parts else "—"
+
+
 async def create_profile_embed(
     guild: discord.Guild,
-    member
+    member,
+    tab: str = "overview"
 ):
+    """/profile, split into tabs: overview, stats, career, card."""
 
     stats = get_fighter_stats(
         guild.id,
@@ -4249,28 +4267,22 @@ async def create_profile_embed(
         member.id
     ) if member.id else []
 
-    # Champion lines + ranking list
     champion_of = [
         row["weight"] for row in ranks
         if row["rank"] == 0 and row["weight"] != P4P_WEIGHT
     ]
 
-    rank_lines = []
-
     # Divisions first, P4P last.
     weight_order = [w for w in WEIGHTS.keys() if w != P4P_WEIGHT] + [P4P_WEIGHT]
-
+    rank_bits = []
     for weight in weight_order:
         for row in ranks:
             if row["weight"] != weight:
                 continue
-
             if row["rank"] == 0:
-                rank_lines.append(f"👑 {weight}")
-            elif weight == P4P_WEIGHT:
-                rank_lines.append(f"#{row['rank']} P4P")
+                rank_bits.append(f"👑 {short_weight(weight)}")
             else:
-                rank_lines.append(f"#{row['rank']} {weight}")
+                rank_bits.append(f"#{row['rank']} {short_weight(weight)}")
 
     embed = discord.Embed(
         title=member.display_name,
@@ -4282,93 +4294,6 @@ async def create_profile_embed(
         timestamp=discord.utils.utcnow()
     )
 
-    description = []
-
-    if len(champion_of) >= 2:
-        description.append(f"👑👑 **{ {2: 'Double', 3: 'Triple'}.get(len(champion_of), str(len(champion_of)) + 'x') } Champ**")
-    for weight in champion_of:
-        description.append(f"👑 **{weight} Champion**")
-
-    if stats["title_wins"]:
-        description.append(
-            f"🏆 {stats['title_wins']} title fight "
-            f"win{'s' if stats['title_wins'] != 1 else ''}"
-        )
-
-    try:
-        former = former_fighters(guild.id, member.id, member.display_name) if member.id else []
-        if former:
-            description.append("🥊 **Former fighters:** " + " · ".join(short_fighter(n) for n in former[-8:]))
-    except Exception as error:
-        print(f"Profile former fighters failed: {error}")
-
-    if is_prospect(stats) and not champion_of:
-        fights_so_far = stats["wins"] + stats["losses"] + stats["draws"]
-        description.append(f"🌱 **Prospect** · unbeaten in their first {fights_so_far} fight{'s' if fights_so_far != 1 else ''}")
-
-    # Shop items: nickname, badge, quote, bounty
-    if member.id:
-        try:
-            cosmetics = get_cosmetics(guild.id, member.id)
-            tags = []
-            if cosmetics.get("nickname"):
-                tags.append(f"🏷️ *“{cosmetics['nickname']}”*")
-            if cosmetics.get("badge"):
-                tags.append(f"🏅 **{cosmetics['badge']}**")
-            if tags:
-                description.insert(0, " · ".join(tags))
-            bounty = open_bounty_total(guild.id, member.id)
-            if bounty:
-                description.append(f"💰 Bounty on their head: {COIN} **{coins_text(bounty)}**")
-            if cosmetics.get("quote"):
-                description.append(f"> *“{cosmetics['quote']}”*")
-        except Exception as error:
-            print(f"Profile shop extras failed: {error}")
-
-    # Hall of Fame
-    try:
-        hof_number, _ = hof_entry(guild.id, member.id, member.display_name)
-        if hof_number:
-            description.insert(0, f"🏛️ **Hall of Fame** (#{hof_number})")
-    except Exception as error:
-        print(f"Profile Hall of Fame lookup failed: {error}")
-
-    # Interim / BMF / WMF belts
-    if member.id:
-        try:
-            for belt_weight, belt_key in get_member_belts(guild.id, member.id):
-                description.append(f"**{belt_title(belt_weight, belt_key)}**")
-        except Exception as error:
-            print(f"Profile belt lookup failed: {error}")
-
-    # Title reigns (from title fights)
-    try:
-        description += title_summary_for_member(guild.id, member.id, member.display_name)
-    except Exception as error:
-        print(f"Profile title lookup failed: {error}")
-
-    # Suspension / warnings
-    if member.id:
-        try:
-            suspension = get_active_suspension(guild.id, member.id)
-
-            if suspension:
-                description.insert(
-                    0,
-                    f"⛔ **Suspended** until <t:{suspension['ends_at']}:f> "
-                    f"(<t:{suspension['ends_at']}:R>)"
-                )
-            else:
-                warns = len(active_warnings(guild.id, member.id))
-
-                if warns:
-                    description.append(f"⚠️ {warns}/{MAX_WARNINGS} warnings")
-        except Exception as error:
-            print(f"Profile warning lookup failed: {error}")
-
-    if description:
-        embed.description = "\n".join(description)
-
     apply_branding(
         embed,
         banner_file=PROFILE_BANNER_FILE,
@@ -4376,182 +4301,231 @@ async def create_profile_embed(
         show_thumbnail=False
     )
 
-    # Fighter's own avatar in the corner.
     avatar = getattr(member, "display_avatar", None)
 
-    if avatar:
-        embed.set_thumbnail(
-            url=avatar.url
-        )
+    if avatar and tab != "card":
+        embed.set_thumbnail(url=avatar.url)
 
-    streak = stats["streak"]
+    lines = []
 
-    if streak.startswith("W") and int(streak[1:]) >= 3:
-        streak_text = f"🔥 {streak}"
-    elif streak:
-        streak_text = streak
-    else:
-        streak_text = "—"
+    if tab == "overview":
 
-    embed.add_field(
-        name="Record",
-        value=f"**{stats_record(stats)}**",
-        inline=True
-    )
+        top = []
 
-    embed.add_field(
-        name="Streak",
-        value=streak_text,
-        inline=True
-    )
-
-    embed.add_field(
-        name="Finish Rate",
-        value=(
-            f"{stats['finish_rate']}%"
-            if stats["finish_rate"] is not None else "—"
-        ),
-        inline=True
-    )
-
-    embed.add_field(
-        name="Rankings",
-        value="\n".join(rank_lines) if rank_lines else "Unranked",
-        inline=True
-    )
-
-    def method_lines(counts):
-        lines = [
-            f"{METHOD_LABELS[method]}  {counts[method]}"
-            for method in ("KO/TKO", "SUB", "DEC", "DQ")
-            if counts.get(method)
-        ]
-        return "\n".join(lines) if lines else "—"
-
-    embed.add_field(
-        name="Wins By",
-        value=method_lines(stats["wins_by"]),
-        inline=True
-    )
-
-    embed.add_field(
-        name="Losses By",
-        value=method_lines(stats["losses_by"]),
-        inline=True
-    )
-
-    # Fight stats from /addstrikes, and record as favourite / underdog
-    if member.id:
+        # Hall of Fame, suspension, nickname / badge go first
         try:
-            total = fight_stat_totals(guild.id).get(member.id)
-            stat_lines = []
-
-            if total:
-                stat_lines += [
-                    f"Strikes **{total['total_landed']:,}**/{total['total_thrown']:,}"
-                    f" · Sig. **{total['sig_landed']:,}**/{total['sig_thrown']:,}"
-                    + (f" ({round(100 * total['sig_landed'] / total['sig_thrown'])}%)" if total["sig_thrown"] else ""),
-                    f"Takedowns **{total['td_landed']}**/{total['td_attempted']}"
-                    f" · Control **{total['control'] // 60}:{total['control'] % 60:02d}**"
-                    f" · Knockdowns **{total['knockdowns']}**",
-                    f"-# landed / thrown over {total['fights']} fight{'s' if total['fights'] != 1 else ''} with stats",
-                ]
-
-            odds_record = favourite_records(guild.id).get(member.id)
-
-            if odds_record and (sum(odds_record["fav"]) or sum(odds_record["dog"])):
-                fav, dog = odds_record["fav"], odds_record["dog"]
-                stat_lines.append(
-                    f"⭐ Favourite **{fav[0]}-{fav[1]}** · 🐶 Underdog **{dog[0]}-{dog[1]}**"
-                )
-
-            if stat_lines:
-                embed.add_field(name="📊 Fight Stats", value="\n".join(stat_lines)[:1024], inline=False)
+            hof_number, _ = hof_entry(guild.id, member.id, member.display_name)
+            if hof_number:
+                top.append(f"🏛️ **Hall of Fame** (#{hof_number})")
         except Exception as error:
-            print(f"Profile stats lookup failed: {error}")
+            print(f"Profile Hall of Fame lookup failed: {error}")
 
-        # Top 3 spots on any leaderboard
+        warn_line = None
+        if member.id:
+            try:
+                suspension = get_active_suspension(guild.id, member.id)
+                if suspension:
+                    top.insert(0, f"⛔ **Suspended** until <t:{suspension['ends_at']}:f> (<t:{suspension['ends_at']}:R>)")
+                else:
+                    warns = len(active_warnings(guild.id, member.id))
+                    if warns:
+                        warn_line = f"⚠️ {warns}/{MAX_WARNINGS} warnings"
+            except Exception as error:
+                print(f"Profile warning lookup failed: {error}")
+
+        cosmetics = {}
+        if member.id:
+            try:
+                cosmetics = get_cosmetics(guild.id, member.id)
+                tags = []
+                if cosmetics.get("nickname"):
+                    tags.append(f"🏷️ *“{cosmetics['nickname']}”*")
+                if cosmetics.get("badge"):
+                    tags.append(f"🏅 **{cosmetics['badge']}**")
+                if tags:
+                    top.append(" · ".join(tags))
+            except Exception as error:
+                print(f"Profile shop extras failed: {error}")
+
+        lines += top
+
+        if len(champion_of) >= 2:
+            lines.append(f"👑👑 **{ {2: 'Double', 3: 'Triple'}.get(len(champion_of), str(len(champion_of)) + 'x') } Champ**")
+        for weight in champion_of:
+            lines.append(f"👑 **{weight} Champion**")
+
+        if member.id:
+            try:
+                for belt_weight, belt_key in get_member_belts(guild.id, member.id):
+                    lines.append(f"**{belt_title(belt_weight, belt_key)}**")
+            except Exception as error:
+                print(f"Profile belt lookup failed: {error}")
+
+        if is_prospect(stats) and not champion_of:
+            fights_so_far = stats["wins"] + stats["losses"] + stats["draws"]
+            lines.append(f"🌱 **Prospect** · unbeaten in their first {fights_so_far} fight{'s' if fights_so_far != 1 else ''}")
+
+        streak = stats["streak"]
+        if streak.startswith("W") and int(streak[1:]) >= 3:
+            streak_text = f"🔥 {streak}"
+        else:
+            streak_text = streak or "no streak"
+        finish = f"{stats['finish_rate']}% finishes" if stats["finish_rate"] is not None else "no finishes yet"
+
+        if lines:
+            lines.append("")
+        lines.append(f"**{stats_record(stats)}** · {streak_text} · {finish}")
+        lines.append(" · ".join(rank_bits) if rank_bits else "Unranked")
+        lines.append("")
+        lines.append(f"**Wins** {method_short_text(stats['wins_by'])}")
+        lines.append(f"**Losses** {method_short_text(stats['losses_by'])}")
+
         try:
-            places = leaderboard_places(guild, member.id)
-
-            if places:
-                medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-                lines = []
-                for place in (1, 2, 3):
-                    names = [LEADERBOARD_SHORT[category] for spot, category in places if spot == place]
-                    if names:
-                        lines.append(f"{medals[place]} " + " · ".join(names))
-                embed.add_field(name="🏅 Leaderboards", value="\n".join(lines)[:1024], inline=False)
+            like = fights_like_line(guild.id, member, stats, ranks)
+            if like:
+                lines.append(like)
         except Exception as error:
-            print(f"Profile leaderboard lookup failed: {error}")
+            print(f"Profile fights-like failed: {error}")
 
-    # Rivalries (2+ fights against the same person) and awards
-    rival_keys = set()
+        if member.id:
+            try:
+                bounty = open_bounty_total(guild.id, member.id)
+                if bounty:
+                    lines.append(f"💰 Bounty on their head: {COIN} **{coins_text(bounty)}**")
+                if cosmetics.get("quote"):
+                    lines.append(f"> *“{cosmetics['quote']}”*")
+            except Exception as error:
+                print(f"Profile bounty failed: {error}")
 
-    try:
-        rivals = rivalries_for(guild.id, member.id, member.display_name)
-        rival_keys = {fighter_key(rival["opponent_id"], rival["opponent_name"]) for rival in rivals}
-        rival_lines = rivalry_profile_lines(guild, member.id, member.display_name)
-        if rival_lines:
-            embed.add_field(name="⚔️ Rivalries", value="\n".join(rival_lines)[:1024], inline=False)
-    except Exception as error:
-        print(f"Profile rivalry lookup failed: {error}")
+        if warn_line:
+            lines.append(warn_line)
 
-    if member.id:
+        recent = list(reversed(stats["fights"]))[:3]
+        if recent:
+            bits = []
+            for fight in recent:
+                if fight["method"] in ("NC", "DRAW"):
+                    bits.append(f"⚪ {fight['method']}")
+                    continue
+                won = fight_is_win_for(fight, member.id, member.display_name)
+                method = {"KO/TKO": "KO"}.get(fight["method"], fight["method"])
+                rnd = f" R{fight['round']}" if fight["round"] and fight["method"] != "DEC" else ""
+                bits.append(f"{'✅ W' if won else '❌ L'} {method}{rnd}")
+            lines.append("")
+            lines.append("-# Last " + str(len(recent)) + ": " + " · ".join(bits))
+
+    elif tab == "stats":
+
+        if member.id:
+            try:
+                total = fight_stat_totals(guild.id).get(member.id)
+                if total:
+                    lines += [
+                        f"**Strikes** {total['total_landed']:,}/{total['total_thrown']:,}"
+                        f" · **Sig.** {total['sig_landed']:,}/{total['sig_thrown']:,}"
+                        + (f" ({round(100 * total['sig_landed'] / total['sig_thrown'])}%)" if total["sig_thrown"] else ""),
+                        f"**Takedowns** {total['td_landed']}/{total['td_attempted']}"
+                        f" · **Control** {total['control'] // 60}:{total['control'] % 60:02d}"
+                        f" · **KD** {total['knockdowns']}",
+                        f"-# landed / thrown over {total['fights']} fight{'s' if total['fights'] != 1 else ''} with stats",
+                    ]
+                else:
+                    lines.append("No fight stats yet. Staff add them with `/addstrikes`.")
+
+                odds_record = favourite_records(guild.id).get(member.id)
+                if odds_record and (sum(odds_record["fav"]) or sum(odds_record["dog"])):
+                    fav, dog = odds_record["fav"], odds_record["dog"]
+                    lines += ["", f"⭐ Favourite **{fav[0]}-{fav[1]}** · 🐶 Underdog **{dog[0]}-{dog[1]}**"]
+            except Exception as error:
+                print(f"Profile stats lookup failed: {error}")
+
+            try:
+                places = leaderboard_places(guild, member.id)
+                if places:
+                    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+                    lines.append("")
+                    for place in (1, 2, 3):
+                        names = [LEADERBOARD_SHORT[category] for spot, category in places if spot == place]
+                        if names:
+                            lines.append(f"{medals[place]} " + " · ".join(names))
+            except Exception as error:
+                print(f"Profile leaderboard lookup failed: {error}")
+        else:
+            lines.append("No fight stats for fighters who've left.")
+
+    elif tab == "career":
+
+        if stats["title_wins"]:
+            lines.append(f"🏆 {stats['title_wins']} title fight win{'s' if stats['title_wins'] != 1 else ''}")
         try:
-            award_rows = awards_for_member(guild.id, member.id)
-            if award_rows:
-                latest = award_rows[0]
-                embed.add_field(
-                    name="🏅 Awards",
-                    value=f"{award_counts_text(award_rows)}\n-# Latest: {AWARD_TYPES[latest['award']][0]}"
-                          + (f" at {latest['fight_event'] or latest['event']}"),
-                    inline=False
-                )
+            lines += title_summary_for_member(guild.id, member.id, member.display_name)
         except Exception as error:
-            print(f"Profile awards lookup failed: {error}")
+            print(f"Profile title lookup failed: {error}")
 
-    # Last 5 fights, newest first
-    recent = list(reversed(stats["fights"]))[:5]
+        try:
+            team = team_of(guild.id, member.id) if member.id else None
+            if team:
+                lines.append(f"🛡️ **Team:** {team_label(team)}" + (" (owner)" if is_team_owner(team, member.id) else ""))
+        except Exception as error:
+            print(f"Profile team failed: {error}")
 
-    if recent:
-        lines = []
+        try:
+            former = former_fighters(guild.id, member.id, member.display_name) if member.id else []
+            if former:
+                lines.append("🥊 **Former fighters:** " + " · ".join(short_fighter(n) for n in former[-8:]))
+        except Exception as error:
+            print(f"Profile former fighters failed: {error}")
 
-        for fight in recent:
-            if fight_is_win_for(fight, member.id, member.display_name):
-                opp = await opponent_text(guild, fight["loser_id"], fight["loser_name"])
-            else:
-                opp = await opponent_text(guild, fight["winner_id"], fight["winner_name"])
+        rival_keys = set()
+        try:
+            rivals = rivalries_for(guild.id, member.id, member.display_name)
+            rival_keys = {fighter_key(rival["opponent_id"], rival["opponent_name"]) for rival in rivals}
+            rival_lines = rivalry_profile_lines(guild, member.id, member.display_name)
+            if rival_lines:
+                lines += ["", "**⚔️ Rivalries**"] + rival_lines
+        except Exception as error:
+            print(f"Profile rivalry lookup failed: {error}")
 
-            extra = ""
+        if member.id:
+            try:
+                award_rows = awards_for_member(guild.id, member.id)
+                if award_rows:
+                    latest = award_rows[0]
+                    lines += ["", f"**🏅 Awards** {award_counts_text(award_rows)}",
+                              f"-# Latest: {AWARD_TYPES[latest['award']][0]} at {latest['fight_event'] or latest['event']}"]
+            except Exception as error:
+                print(f"Profile awards lookup failed: {error}")
 
-            if fight["event"]:
-                extra += f" · *{fight['event']}*"
-            elif fight["fight_date"]:
-                y, m, d = fight["fight_date"].split("-")
-                extra += f" · *{d}/{m}/{y}*"
+        recent = list(reversed(stats["fights"]))[:5]
+        if recent:
+            lines += ["", "**🥊 Last 5 fights**"]
+            for fight in recent:
+                if fight_is_win_for(fight, member.id, member.display_name):
+                    opp = await opponent_text(guild, fight["loser_id"], fight["loser_name"])
+                    opp_key = fighter_key(fight["loser_id"], fight["loser_name"])
+                else:
+                    opp = await opponent_text(guild, fight["winner_id"], fight["winner_name"])
+                    opp_key = fighter_key(fight["winner_id"], fight["winner_name"])
+                extra = ""
+                if fight["event"]:
+                    extra += f" · *{fight['event']}*"
+                elif fight["fight_date"]:
+                    y, m, d = fight["fight_date"].split("-")
+                    extra += f" · *{d}/{m}/{y}*"
+                if fight["title_fight"]:
+                    extra += " 👑"
+                if opp_key in rival_keys:
+                    opp += " ⚔️"
+                lines.append(f"{fight_line_tag(fight, member.id, member.display_name)} vs {opp} — {fight_method_text(fight)}{extra}")
+        if not lines:
+            lines.append("No career history yet.")
 
-            if fight["title_fight"]:
-                extra += " 👑"
+    elif tab == "card":
+        lines.append(f"**{stats_record(stats)}** · " + (" · ".join(rank_bits) if rank_bits else "Unranked"))
+        lines.append("-# Collect cards from packs in `/shop` · `/card` posts anyone's card")
+        embed.set_image(url="attachment://fighter_card.png")
 
-            if fight_is_win_for(fight, member.id, member.display_name):
-                opp_key = fighter_key(fight["loser_id"], fight["loser_name"])
-            else:
-                opp_key = fighter_key(fight["winner_id"], fight["winner_name"])
-
-            if opp_key in rival_keys:
-                opp += " ⚔️"
-
-            lines.append(
-                f"{fight_line_tag(fight, member.id, member.display_name)} vs {opp} — "
-                f"{fight_method_text(fight)}{extra}"
-            )
-
-        embed.add_field(
-            name="🥊 Last 5 Fights",
-            value="\n".join(lines)[:1024],
-            inline=False
-        )
+    embed.description = "\n".join(lines)[:4000] or None
 
     footer = f"{len(stats['fights'])} PFO fight{'s' if len(stats['fights']) != 1 else ''} logged"
 
@@ -4570,6 +4544,64 @@ async def create_profile_embed(
     )
 
     return embed
+
+
+class ProfileView(discord.ui.View):
+    """Overview / Stats / Career / Card buttons under /profile.
+    The person who ran it flips the tabs; anyone else gets their own private copy."""
+
+    def __init__(self, owner_id: int, member, tab: str = "overview"):
+        super().__init__(timeout=3600)
+        self.owner_id = owner_id
+        self.member = member
+        self.tab = tab
+        self.message = None
+        self.build()
+
+    def build(self):
+        self.clear_items()
+        for key, label in PROFILE_TABS:
+            button = discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.blurple if key == self.tab else discord.ButtonStyle.grey
+            )
+            button.callback = self.make_callback(key)
+            self.add_item(button)
+
+    def make_callback(self, key):
+        async def callback(interaction):
+            await self.switch(interaction, key)
+        return callback
+
+    async def render(self, guild, tab):
+        embed = await create_profile_embed(guild, self.member, tab)
+        files = []
+        if tab == "card":
+            card = await fighter_card_file(guild, self.member)
+            if card:
+                files.append(card)
+            else:
+                embed.set_image(url=None)
+                embed.description = (embed.description or "") + "\n\nNo card yet: cards are made once someone has a fight logged."
+        return embed, files
+
+    async def switch(self, interaction, key):
+        if interaction.user.id != self.owner_id:
+            copy = ProfileView(interaction.user.id, self.member, key)
+            embed, files = await copy.render(interaction.guild, key)
+            await interaction.response.send_message(embed=embed, files=files, view=copy, ephemeral=True)
+            return
+        self.tab = key
+        self.build()
+        embed, files = await self.render(interaction.guild, key)
+        await interaction.response.edit_message(embed=embed, attachments=files, view=self)
+
+    async def on_timeout(self):
+        try:
+            if self.message:
+                await self.message.edit(view=None)
+        except Exception:
+            pass
 
 
 def create_result_embed(
@@ -5275,8 +5307,9 @@ async def profile(
                 return
 
         try:
-            await interaction.followup.send(
-                embed=await create_profile_embed(interaction.guild, member)
+            view = ProfileView(interaction.user.id, member)
+            view.message = await interaction.followup.send(
+                embed=await create_profile_embed(interaction.guild, member), view=view
             )
         except Exception as error:
             print(f"Profile error: {error}")
@@ -5319,11 +5352,13 @@ async def profile(
 
     try:
 
-        await interaction.followup.send(
+        view = ProfileView(interaction.user.id, member)
+        view.message = await interaction.followup.send(
             embed=await create_profile_embed(
                 interaction.guild,
                 member
-            )
+            ),
+            view=view
         )
 
         if problem and is_staff(interaction):
@@ -8935,6 +8970,19 @@ async def vote_closer():
         await check_former_names()
     except Exception as error:
         print(f"Former names error: {error}")
+    try:
+        await sync_all_teams()
+    except Exception as error:
+        print(f"Team sync error: {error}")
+    try:
+        await expire_trades()
+    except Exception as error:
+        print(f"Trade expiry error: {error}")
+    try:
+        if uk_now().minute % 15 == 7:
+            await check_vods()
+    except Exception as error:
+        print(f"Replay check error: {error}")
     try:
         if uk_now().minute == 3:
             await post_week_recap()
@@ -17107,6 +17155,10 @@ def setup_cancelled_bout_table():
     except sqlite3.OperationalError:
         pass
     try:
+        db.execute("ALTER TABLE cancelled_bouts ADD COLUMN notice_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    try:
         db.execute("CREATE TABLE IF NOT EXISTS bot_meta (key TEXT PRIMARY KEY, value TEXT)")
     except sqlite3.OperationalError:
         pass
@@ -17139,14 +17191,77 @@ def mark_bout_cancelled(guild_id: int, market_id: int, position: int, cancelled:
         return
     low, high = sorted((bout[0]["fighter_a"], bout[0]["fighter_b"]))
     key = market_event_key(market)
+    notice_id = row_value(market, "notice_id")
+    if not notice_id:
+        notice = card_notice_with_pair(guild_id, low, high)
+        notice_id = notice["id"] if notice else None
     if cancelled:
         discipline_query(
-            "INSERT OR REPLACE INTO cancelled_bouts (guild_id, event_key, fighter_low, fighter_high, market_id, position, cancelled_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)", (guild_id, key, low, high, market_id, position, int(time.time())), write=True
+            "INSERT OR REPLACE INTO cancelled_bouts (guild_id, event_key, fighter_low, fighter_high, market_id, position, cancelled_at, notice_id) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)", (guild_id, key, low, high, market_id, position, int(time.time()), notice_id), write=True
         )
     else:
-        discipline_query("DELETE FROM cancelled_bouts WHERE guild_id = ? AND event_key = ? AND fighter_low = ? AND fighter_high = ?",
-                         (guild_id, key, low, high), write=True)
+        discipline_query("DELETE FROM cancelled_bouts WHERE guild_id = ? AND fighter_low = ? AND fighter_high = ? AND (event_key = ? OR notice_id = ?)",
+                         (guild_id, low, high, key, notice_id or -1), write=True)
+
+
+def card_notice_with_pair(guild_id: int, a: int, b: int):
+    """The newest DMed card (last 21 days) that has these two fighting each other."""
+    pair = frozenset((a, b))
+    try:
+        for notice in discipline_query("SELECT * FROM card_notices WHERE guild_id = ? ORDER BY id DESC LIMIT 12", (guild_id,)):
+            if time.time() - notice_created_ts(notice) > 21 * 86400:
+                continue
+            if any(frozenset((x, y)) == pair for x, y, _ in notice_layout(notice)):
+                return notice
+    except Exception as error:
+        print(f"Card lookup failed: {error}")
+    return None
+
+
+def notice_created_ts(notice):
+    try:
+        value = datetime.fromisoformat(str(notice["created_at"]).replace("Z", "+00:00"))
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.timestamp()
+    except Exception:
+        return 0
+
+
+def notice_cancelled(notice):
+    """{frozenset((a, b))} called off on this DMed card. Matches on the card itself, its event name,
+    or the same two fighters being cancelled any time after the card was sent out."""
+    try:
+        rows = discipline_query("SELECT * FROM cancelled_bouts WHERE guild_id = ?", (notice["guild_id"],))
+    except sqlite3.OperationalError:
+        return set()
+    key = event_key(notice["event"]) if notice["event"] else None
+    since = notice_created_ts(notice)
+    on_card = {frozenset((a, b)) for a, b, _ in notice_layout(notice)}
+    gone = set()
+    for row in rows:
+        pair = frozenset((row["fighter_low"], row["fighter_high"]))
+        if pair not in on_card:
+            continue
+        if row_value(row, "notice_id") == notice["id"] or (key and row["event_key"] == key) or row["cancelled_at"] >= since:
+            gone.add(pair)
+    return gone
+
+
+def cancel_card_bout(guild_id: int, notice_id: int, a: int, b: int, cancelled: bool):
+    """Call off (or put back) a fight on a DMed card that has no betting."""
+    low, high = sorted((a, b))
+    if cancelled:
+        discipline_query(
+            "INSERT OR REPLACE INTO cancelled_bouts (guild_id, event_key, fighter_low, fighter_high, market_id, position, cancelled_at, notice_id) "
+            "VALUES (?, ?, ?, ?, NULL, NULL, ?, ?)", (guild_id, f"notice:{notice_id}", low, high, int(time.time()), notice_id), write=True)
+    else:
+        notice = get_notice(notice_id)
+        key = event_key(notice["event"]) if notice and notice["event"] else f"notice:{notice_id}"
+        discipline_query("DELETE FROM cancelled_bouts WHERE guild_id = ? AND fighter_low = ? AND fighter_high = ? "
+                         "AND (notice_id = ? OR event_key = ? OR event_key = ? OR cancelled_at >= ?)",
+                         (guild_id, low, high, notice_id, key, f"notice:{notice_id}", notice_created_ts(notice) if notice else 0), write=True)
 
 
 def cancelled_pairs(guild_id: int, event: str):
@@ -17160,7 +17275,7 @@ def cancelled_pairs(guild_id: int, event: str):
 
 def active_layout(notice):
     """notice_layout without the fights that were cancelled."""
-    gone = cancelled_pairs(notice["guild_id"], notice["event"]) if notice["event"] else set()
+    gone = notice_cancelled(notice)
     return [(a, b, spot) for a, b, spot in notice_layout(notice) if frozenset((a, b)) not in gone]
 
 
@@ -17865,11 +17980,33 @@ async def cancellable_fight_autocomplete(interaction: discord.Interaction, curre
     """, (interaction.guild.id,))
 
     choices = []
+    betting_pairs = set()
 
     for row in rows:
+        betting_pairs.add(frozenset((row["fighter_a"], row["fighter_b"])))
         label = f"{row['name_a']} vs {row['name_b']} · {row['event']}"
         if current.lower() in label.lower():
             choices.append(app_commands.Choice(name=label[:100], value=f"{row['market_id']}:{row['position']}"))
+
+    # Fights on recent DMed cards with no betting open
+    try:
+        guild = interaction.guild
+        for notice in discipline_query("SELECT * FROM card_notices WHERE guild_id = ? ORDER BY id DESC LIMIT 4", (guild.id,)):
+            if time.time() - notice_created_ts(notice) > 21 * 86400:
+                continue
+            gone = notice_cancelled(notice)
+            card = notice["event"] or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
+            for a, b, _ in notice_layout(notice):
+                pair = frozenset((a, b))
+                if pair in betting_pairs:
+                    continue
+                name_a = fight_display_name(guild, a, "Fighter")
+                name_b = fight_display_name(guild, b, "Fighter")
+                label = f"{name_a} vs {name_b} · {card} (card{', cancelled' if pair in gone else ', no betting'})"
+                if current.lower() in label.lower():
+                    choices.append(app_commands.Choice(name=label[:100], value=f"card:{notice['id']}:{a}:{b}"))
+    except Exception as error:
+        print(f"Card fights for /cancelfight failed: {error}")
 
     return choices[:25]
 
@@ -17944,12 +18081,62 @@ class CancelFightView(
         await interaction.response.edit_message(content="Nothing changed.", embed=None, view=None)
 
 
+class CardCancelView(discord.ui.View):
+    """Cancel / put back a fight on a DMed card that has no betting."""
+
+    def __init__(self, staff_id: int, notice_id: int, a: int, b: int):
+        super().__init__(timeout=900)
+        self.staff_id, self.notice_id, self.a, self.b = staff_id, notice_id, a, b
+        self.build()
+
+    def is_off(self):
+        notice = get_notice(self.notice_id)
+        return bool(notice) and frozenset((self.a, self.b)) in notice_cancelled(notice)
+
+    def card_name(self):
+        notice = get_notice(self.notice_id)
+        return (notice["event"] if notice and notice["event"] else "the DMed card")
+
+    def text(self, note=""):
+        state = ("🚫 It's **cancelled**: crossed out on the website's live card and gone from both fighters' My PFO."
+                 if self.is_off() else "It's **on**. Cancelling takes it off the website's next-fight panels and crosses it out on the live card.")
+        return (f"{note}\n" if note else "") + f"<@{self.a}> vs <@{self.b}> · **{self.card_name()}**\n{state}\n-# No betting is open on this fight."
+
+    def build(self):
+        self.clear_items()
+        if self.is_off():
+            button = discord.ui.Button(label="Put it back on", style=discord.ButtonStyle.green)
+            button.callback = self.restore
+        else:
+            button = discord.ui.Button(label="Cancel the fight", style=discord.ButtonStyle.red)
+            button.callback = self.cancel
+        self.add_item(button)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.staff_id
+
+    async def cancel(self, interaction):
+        cancel_card_bout(interaction.guild.id, self.notice_id, self.a, self.b, True)
+        self.build()
+        await interaction.response.edit_message(content=self.text("✅ Done."), view=self, allowed_mentions=discord.AllowedMentions.none())
+        try:
+            await post_staff_log(interaction.guild, staff_log_embed("🚫 Fight cancelled", [
+                f"{interaction.user.mention} cancelled <@{self.a}> vs <@{self.b}> on **{self.card_name()}** (no betting)."]))
+        except Exception:
+            pass
+
+    async def restore(self, interaction):
+        cancel_card_bout(interaction.guild.id, self.notice_id, self.a, self.b, False)
+        self.build()
+        await interaction.response.edit_message(content=self.text("✅ Back on."), view=self, allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.tree.command(
     name="cancelfight",
-    description="Cancel a fight that has bets on it: refunds singles, takes it out of accumulators."
+    description="Cancel a fight: refunds any bets, and takes it off the website's card and next-fight panels."
 )
 @app_commands.describe(
-    fight="The fight to cancel (start typing a name)"
+    fight="The fight to cancel (start typing a name). Fights on DMed cards with no betting are listed too."
 )
 @app_commands.autocomplete(fight=cancellable_fight_autocomplete)
 async def cancelfight(
@@ -17959,6 +18146,18 @@ async def cancelfight(
 
     if not is_staff(interaction):
         await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can cancel fights.", ephemeral=True)
+        return
+
+    card_match = re.fullmatch(r"card:(\d+):(\d+):(\d+)", fight.strip())
+
+    if card_match:
+        notice = get_notice(int(card_match.group(1)))
+        a, b = int(card_match.group(2)), int(card_match.group(3))
+        if not notice or notice["guild_id"] != interaction.guild.id or frozenset((a, b)) not in {frozenset((x, y)) for x, y, _ in notice_layout(notice)}:
+            await interaction.response.send_message("❌ Pick the fight from the list that pops up.", ephemeral=True)
+            return
+        view = CardCancelView(interaction.user.id, notice["id"], a, b)
+        await interaction.response.send_message(view.text(), view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
         return
 
     match = re.fullmatch(r"(\d+):(\d+)", fight.strip())
@@ -22497,7 +22696,7 @@ NAME_COLOUR_DAYS = 30
 SPOTLIGHT_DAYS = 7
 JACKPOT_TICKET = 100
 
-SHOP_CATEGORIES = ["Fighter", "Profile & looks", "Media", "Betting", "Games"]
+SHOP_CATEGORIES = ["Fighter", "Profile & looks", "Media", "Betting", "Games", "Cards"]
 
 # id: (name, emoji, price, category, needs staff, description)
 SHOP_ITEMS = {
@@ -22539,6 +22738,12 @@ SHOP_ITEMS = {
                 "One entry into the weekly jackpot, drawn every Sunday at 8pm. The winner takes every ticket's coins."),
     "gift": ("Gift Coins", "🎁", 0, "Games", False,
              f"Send coins to someone. There's a {round(GIFT_FEE * 100)}% fee."),
+    "pack_common": ("Common Pack", "🃏", 750, "Cards", False,
+                    "3 fighter cards. Each card: Prospect 55%, Ranked 35%, Contender 8.5%, Champion 1.5%."),
+    "pack_rare": ("Rare Pack", "💠", 2000, "Cards", False,
+                  "3 fighter cards. At least one Contender or better, guaranteed (Contender 85%, Champion 15%)."),
+    "pack_champ": ("Champ Pack", "👑", 6000, "Cards", False,
+                   "3 fighter cards. A Champion every time (a Double Champ 25% of the time if there is one), the other two Ranked or better."),
 }
 
 BADGES = ["The Finisher", "Knockout Artist", "Sub Specialist", "Underdog King", "Iron Chin",
@@ -23356,6 +23561,12 @@ async def buy_item(interaction: discord.Interaction, item: str, target=None, cho
     if item == "mystery_box" and boxes_today(guild.id, user.id) >= BOX_PER_DAY:
         return f"❌ You've opened {BOX_PER_DAY} boxes today. Come back tomorrow."
 
+    if item in PACK_ITEMS:
+        if packs_today(guild.id, user.id) >= PACKS_PER_DAY:
+            return f"❌ You've opened {PACKS_PER_DAY} packs today. Come back tomorrow."
+        if not card_pool(guild):
+            return "❌ There are no fighter cards to pull yet."
+
     # ---- pay ----
     add_coins(guild.id, user.id, -price, f"shop:{item}")
 
@@ -23370,6 +23581,15 @@ async def buy_item(interaction: discord.Interaction, item: str, target=None, cho
         )
 
     # ---- straight away ----
+    if item in PACK_ITEMS:
+        pack_id = open_pack(guild, user.id, PACK_ITEMS[item], price)
+        if not pack_id:
+            add_coins(guild.id, user.id, price, f"refund:{item}")
+            return "❌ There are no fighter cards to pull yet. You haven't been charged."
+        add_shop_item(guild.id, user.id, item, "used", price, {"pack_id": pack_id})
+        names = ", ".join(card_info(r)["name"] for r in pack_cards(pack_id))
+        return f"🃏 **{name}** opened: {names}. Your cards are below."
+
     if item == "mystery_box":
         add_shop_item(guild.id, user.id, item, "used", price)
         prize = open_box(guild.id, user.id)
@@ -23538,6 +23758,10 @@ def item_embed(guild: discord.Guild, user_id: int, item: str, note: str = None):
             for e, label, chance, rarity, _ in BOX_PRIZES
         ]
         lines.append(f"-# Opened today: {boxes_today(guild.id, user_id)} of {BOX_PER_DAY}")
+
+    if item in PACK_ITEMS:
+        lines += ["", "**Duplicates sell for**", " · ".join(f"{CARD_TIER_NAMES[t]} {coins_text(CARD_SELL[t])}" for t in CARD_TIERS),
+                  f"-# Opened today: {packs_today(guild.id, user_id)} of {PACKS_PER_DAY} · see your cards with /collection"]
 
     if item == "jackpot":
         pot, tickets = jackpot_pot(guild.id, jackpot_week())
@@ -23878,6 +24102,7 @@ class ShopPanel(
 
     async def after_buy(self, interaction, message: str):
         failed = message.startswith("❌")
+        bought = self.item
         if not failed:
             self.item = None
             self.target = None
@@ -23886,6 +24111,11 @@ class ShopPanel(
         self.build()
         embed = item_embed(self.guild, self.user_id, self.item, message) if self.item else shop_embed(self.guild, self.user_id, message)
         await interaction.response.edit_message(embed=embed, view=self)
+        if not failed and bought in PACK_ITEMS and _last_pack.get((self.guild.id, self.user_id)):
+            try:
+                await send_pack_result(interaction, _last_pack.pop((self.guild.id, self.user_id)))
+            except Exception as error:
+                print(f"Pack result failed: {error}")
 
     async def back(self, interaction):
         self.item = None
@@ -25098,9 +25328,10 @@ HELP_LEVEL_NAMES = {
 HELP_SECTIONS = {
     "everyone": [
         ("For everyone", ["help", "coins", "tasks", "shop", "fantasy", "myawards", "halloffame"]),
+        ("Cards & replays", ["card", "collection", "trade", "vod"]),
     ],
     "fighter": [
-        ("For fighters", ["profile"]),
+        ("For fighters", ["profile", "team"]),
     ],
     "helper": [
         ("Sign-ups", ["fnsignup", "livesignup", "signuptimes", "signupclose", "signuppaste", "inactive"]),
@@ -25112,8 +25343,9 @@ HELP_SECTIONS = {
         ("Rankings & titles", ["rankingsp", "rankingsu", "rankingsr", "rankingsclearunknown", "rankingsupdate",
                                "belt", "titlehistory"]),
         ("Betting & coins", ["openbets", "lockbets", "cancelfight", "givecoins"]),
-        ("Posts & media", ["mainvote", "leaderboard", "taleofthetape", "interview", "interviews"]),
+        ("Posts & media", ["mainvote", "leaderboard", "taleofthetape", "interview", "interviews", "vodset", "vodclear"]),
         ("Discipline", ["warn", "removewarning", "unsuspend", "warnings"]),
+        ("Teams", ["teamcreate", "teamedit", "teamdelete"]),
         ("Staff tools", ["rating", "fightername", "formername", "health", "staffreport"]),
     ],
     "moderator": [
@@ -25129,10 +25361,12 @@ HELP_NOTES = {
     ("everyone", "halloffame"): "See the Hall of Fame list or one inductee",
     ("moderator", "halloffame"): "Add, edit or remove Hall of Fame inductees",
     ("everyone", "help"): "This list",
+    ("fighter", "team"): "See a team's members, owners and record",
 }
 
 
-HELP_FUNCTION_NAMES = {"warnings": "warnings_command", "help": "help_command", "tasks": "tasks_command"}
+HELP_FUNCTION_NAMES = {"warnings": "warnings_command", "help": "help_command", "tasks": "tasks_command", "team": "team_command",
+                       "card": "card_command", "collection": "collection_command", "trade": "trade_command", "vod": "vod_command"}
 
 
 def help_level_for(interaction: discord.Interaction):
@@ -27461,6 +27695,9 @@ async def setup_hook():
     setup_week_post_table()
     setup_former_name_table()
     setup_cancelled_bout_table()
+    setup_team_tables()
+    setup_card_collect_tables()
+    setup_vod_table()
     setup_fantasy_tables()
 
     # Buttons first, so they work even if the sync below fails.
@@ -27474,6 +27711,7 @@ async def setup_hook():
     restore_auto_rank_buttons()
     restore_shop_buttons()
     bot.add_view(ShopBoardView())
+    restore_trade_buttons()
     restore_loot_buttons()
     bot.add_view(WelcomeView())
     reprice_open_markets_once()
@@ -28923,6 +29161,423 @@ def restore_social_buttons():
 
 
 # ============================================================
+# TEAMS
+#
+# Staff set teams up. Each team is linked to a Discord role that
+# staff make by hand: whoever has that role is on the team, so
+# giving or taking the role is how people join or leave.
+#
+#   /teamcreate name role owner [owner2] [owner3] [tag]   staff: set up a team
+#   /teamedit team [name] [tag] [role] [owner] [owner2] [owner3]   staff
+#   /teamdelete team                                        staff: close a team (the role is kept)
+#   /team [team]                                            anyone: see a team
+#
+# Owners always count as members. Team record = fights members
+# had while they were on the team. Shown on /profile and the
+# website's Teams page and fighter pages.
+# ============================================================
+
+TEAM_SYNC_MINUTES = 10
+
+
+def setup_team_tables():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            tag TEXT,
+            owner_id INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            disbanded_at INTEGER
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS team_members (
+            team_id INTEGER NOT NULL,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at INTEGER NOT NULL,
+            left_at INTEGER
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS team_owners (
+            team_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY (team_id, user_id)
+        )
+    """)
+    columns = [row[1] for row in db.execute("PRAGMA table_info(teams)").fetchall()]
+    if "role_id" not in columns:
+        db.execute("ALTER TABLE teams ADD COLUMN role_id INTEGER")
+    db.execute("CREATE INDEX IF NOT EXISTS team_members_user ON team_members(guild_id, user_id)")
+    db.commit()
+    db.close()
+
+
+def get_team(team_id: int):
+    rows = discipline_query("SELECT * FROM teams WHERE id = ? AND disbanded_at IS NULL", (team_id,))
+    return rows[0] if rows else None
+
+
+def team_of(guild_id: int, user_id: int):
+    """The team this member is on now, or None."""
+    rows = discipline_query("""
+        SELECT teams.* FROM team_members JOIN teams ON teams.id = team_members.team_id
+        WHERE team_members.guild_id = ? AND team_members.user_id = ? AND team_members.left_at IS NULL AND teams.disbanded_at IS NULL
+        ORDER BY team_members.joined_at DESC LIMIT 1
+    """, (guild_id, user_id))
+    return rows[0] if rows else None
+
+
+def team_owner_ids(team):
+    """Owner user ids, main owner first."""
+    if not team:
+        return []
+    rows = discipline_query("SELECT user_id FROM team_owners WHERE team_id = ?", (team["id"],))
+    ids = [r["user_id"] for r in rows]
+    if team["owner_id"] not in ids:
+        ids.append(team["owner_id"])
+    ids.sort(key=lambda uid: uid != team["owner_id"])
+    return ids
+
+
+def is_team_owner(team, user_id: int):
+    return bool(team) and user_id in team_owner_ids(team)
+
+
+def team_members(team_id: int):
+    """[(user_id, joined_at)] current members, owners first."""
+    team = get_team(team_id)
+    rows = discipline_query("SELECT user_id, joined_at FROM team_members WHERE team_id = ? AND left_at IS NULL ORDER BY joined_at", (team_id,))
+    out = [(r["user_id"], r["joined_at"]) for r in rows]
+    if team:
+        owners = team_owner_ids(team)
+        out.sort(key=lambda item: (owners.index(item[0]) if item[0] in owners else len(owners), item[1]))
+    return out
+
+
+def all_teams(guild_id: int):
+    return discipline_query("SELECT * FROM teams WHERE guild_id = ? AND disbanded_at IS NULL ORDER BY id", (guild_id,))
+
+
+def clean_team_name(name: str):
+    name = " ".join((name or "").split())
+    name = re.sub(r"[<>@#*_`~|]", "", name)
+    return name[:32]
+
+
+def clean_team_tag(tag: str):
+    return re.sub(r"[^A-Za-z0-9]", "", tag or "").upper()[:4] or None
+
+
+def team_record(guild_id: int, team_id: int):
+    """Wins, losses, draws, finishes from fights members had while on the team."""
+    totals = {"wins": 0, "losses": 0, "draws": 0, "finishes": 0, "titles": 0}
+    spans = discipline_query("SELECT user_id, joined_at, left_at FROM team_members WHERE team_id = ?", (team_id,))
+    if not spans:
+        return totals
+    seen = set()
+    for span in spans:
+        start = datetime.fromtimestamp(span["joined_at"], timezone.utc).isoformat()
+        end = datetime.fromtimestamp(span["left_at"], timezone.utc).isoformat() if span["left_at"] else "9999"
+        for fight in discipline_query(
+            "SELECT * FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?) AND created_at >= ? AND created_at < ?",
+            (guild_id, span["user_id"], span["user_id"], start, end)
+        ):
+            key = (fight["id"], span["user_id"])
+            if key in seen or fight["method"] == "NC":
+                continue
+            seen.add(key)
+            if fight["method"] == "DRAW":
+                totals["draws"] += 1
+            elif fight["winner_id"] == span["user_id"]:
+                totals["wins"] += 1
+                totals["finishes"] += fight["method"] in ("KO/TKO", "SUB")
+                totals["titles"] += 1 if fight["title_fight"] else 0
+            else:
+                totals["losses"] += 1
+    return totals
+
+
+def team_label(team):
+    return f"[{team['tag']}] {team['name']}" if team and team["tag"] else (team["name"] if team else "")
+
+
+def team_role(guild, team):
+    role_id = row_value(team, "role_id")
+    return guild.get_role(role_id) if guild and role_id else None
+
+
+def row_value(row, key, default=None):
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return default
+
+
+def sync_team(guild, team):
+    """Make the member list match the team role (plus owners). Returns (joined, left)."""
+    role = team_role(guild, team)
+    if not role:
+        return [], []
+    want = {m.id for m in getattr(role, "members", []) if not m.bot}
+    want |= set(team_owner_ids(team))
+    have = {uid for uid, _ in team_members(team["id"])}
+    now = int(time.time())
+    joined, left = sorted(want - have), sorted(have - want)
+    for uid in joined:
+        discipline_query("INSERT INTO team_members (team_id, guild_id, user_id, joined_at) VALUES (?, ?, ?, ?)",
+                         (team["id"], guild.id, uid, now), write=True)
+    for uid in left:
+        discipline_query("UPDATE team_members SET left_at = ? WHERE team_id = ? AND user_id = ? AND left_at IS NULL",
+                         (now, team["id"], uid), write=True)
+    return joined, left
+
+
+_team_last_sync = {}
+
+
+async def sync_all_teams(force=False):
+    for guild in list(getattr(bot, "guilds", [])):
+        if not force and time.time() - _team_last_sync.get(guild.id, 0) < TEAM_SYNC_MINUTES * 60:
+            continue
+        _team_last_sync[guild.id] = time.time()
+        for team in all_teams(guild.id):
+            try:
+                sync_team(guild, team)
+            except Exception as error:
+                print(f"Team sync failed for {team['id']}: {error}")
+
+
+@bot.listen("on_member_update")
+async def team_role_changed(before, after):
+    """Someone was given or lost a team role: update their team straight away."""
+    try:
+        if after.bot:
+            return
+        changed = {r.id for r in before.roles} ^ {r.id for r in after.roles}
+        if not changed:
+            return
+        for team in all_teams(after.guild.id):
+            if row_value(team, "role_id") in changed:
+                joined, left = sync_team(after.guild, team)
+                for uid in joined:
+                    await team_log(after.guild, f"<@{uid}> joined **{team_label(team)}** (got the <@&{team['role_id']}> role).")
+                for uid in left:
+                    await team_log(after.guild, f"<@{uid}> left **{team_label(team)}** (lost the <@&{team['role_id']}> role).")
+    except Exception as error:
+        print(f"Team role check failed: {error}")
+
+
+def team_embed(guild: discord.Guild, team):
+    members = team_members(team["id"])
+    record = team_record(guild.id, team["id"])
+    owners = team_owner_ids(team)
+    lines = []
+    for uid, joined in members:
+        member = guild.get_member(uid)
+        name = name_without_record(member.display_name) if member else "Former member"
+        try:
+            rec = stats_record(get_fighter_stats(guild.id, uid))
+        except Exception:
+            rec = ""
+        champ = " 👑" if is_any_champion(guild.id, uid) else ""
+        lines.append(f"{'⭐ ' if uid in owners else '• '}**{name}**{champ}" + (f" · {rec}" if rec else ""))
+    role = team_role(guild, team)
+    embed = discord.Embed(
+        title=f"🛡️ {team_label(team)}",
+        description=(f"**Team record:** {record['wins']}-{record['losses']}-{record['draws']}"
+                     f" · {record['finishes']} finish{'es' if record['finishes'] != 1 else ''}"
+                     + (f" · {record['titles']} title win{'s' if record['titles'] != 1 else ''}" if record["titles"] else "")
+                     + (f"\n**Role:** {role.mention}" if role else "")
+                     + f"\n**Members:** {len(members)}\n\n" + "\n".join(lines))[:4000],
+        color=(role.color if role and getattr(role.color, "value", 0) else PFO_GOLD)
+    )
+    embed.set_author(name="PFO • TEAMS", icon_url=asset_url(LOGO_FILE))
+    embed.set_footer(text="⭐ owner · team record counts fights while on the team")
+    return embed
+
+
+async def team_log(guild, text):
+    try:
+        await post_staff_log(guild, staff_log_embed("🛡️ Teams", [text]))
+    except Exception:
+        pass
+
+
+async def team_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=team_label(t)[:100], value=str(t["id"]))
+            for t in all_teams(interaction.guild.id) if current.lower() in team_label(t).lower()][:25]
+
+
+def _team_role_problem(guild, role, ignore_team=None):
+    if role.id == guild.id or getattr(role, "managed", False):
+        return "❌ Pick a normal role made for the team (not @everyone or a bot role)."
+    for t in all_teams(guild.id):
+        if row_value(t, "role_id") == role.id and t["id"] != ignore_team:
+            return f"❌ That role is already linked to **{team_label(t)}**."
+    return None
+
+
+def _set_team_owners(team_id, owners):
+    discipline_query("DELETE FROM team_owners WHERE team_id = ?", (team_id,), write=True)
+    for uid in owners:
+        discipline_query("INSERT OR IGNORE INTO team_owners (team_id, user_id) VALUES (?, ?)", (team_id, uid), write=True)
+    discipline_query("UPDATE teams SET owner_id = ? WHERE id = ?", (owners[0], team_id), write=True)
+
+
+def _owner_list(*members):
+    out = []
+    for m in members:
+        if m and not m.bot and m.id not in out:
+            out.append(m.id)
+    return out
+
+
+def _missing_role_note(guild, team, owners):
+    role = team_role(guild, team)
+    if not role:
+        return ""
+    missing = [uid for uid in owners if not any(r.id == role.id for r in getattr(guild.get_member(uid), "roles", []) or [])]
+    if not missing:
+        return ""
+    return ("\n-# " + ", ".join(f"<@{uid}>" for uid in missing)
+            + f" {'is' if len(missing) == 1 else 'are'} counted as owner{'s' if len(missing) > 1 else ''} but "
+            + f"{'does' if len(missing) == 1 else 'do'} not have {role.mention} yet.")
+
+
+@bot.tree.command(name="teamcreate", description="Staff: set up a team linked to a role you've made.")
+@app_commands.describe(name="Team name (up to 32 characters)",
+                       role="The team's role (make it in Server Settings first). Everyone with it is on the team.",
+                       owner="Team owner", owner2="Second owner (optional)", owner3="Third owner (optional)",
+                       tag="Short tag, 2-4 letters, e.g. ATT (optional)")
+async def teamcreate(interaction: discord.Interaction, name: str, role: discord.Role, owner: discord.Member,
+                     owner2: discord.Member = None, owner3: discord.Member = None, tag: str = None):
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can set up teams.", ephemeral=True)
+        return
+    guild = interaction.guild
+    name, tag = clean_team_name(name), clean_team_tag(tag)
+    if len(name) < 3:
+        await interaction.response.send_message("❌ Give the team a name (3 to 32 characters).", ephemeral=True)
+        return
+    problem = _team_role_problem(guild, role)
+    if problem:
+        await interaction.response.send_message(problem, ephemeral=True)
+        return
+    for t in all_teams(guild.id):
+        if t["name"].casefold() == name.casefold() or (tag and (t["tag"] or "") == tag):
+            await interaction.response.send_message("❌ A team already has that name or tag.", ephemeral=True)
+            return
+    owners = _owner_list(owner, owner2, owner3)
+    if not owners:
+        await interaction.response.send_message("❌ Pick a person (not a bot) as the owner.", ephemeral=True)
+        return
+    team_id = discipline_query(
+        "INSERT INTO teams (guild_id, name, tag, owner_id, created_at, role_id) VALUES (?, ?, ?, ?, ?, ?)",
+        (guild.id, name, tag, owners[0], int(time.time()), role.id), write=True)
+    _set_team_owners(team_id, owners)
+    team = get_team(team_id)
+    sync_team(guild, team)
+    count = len(team_members(team_id))
+    await interaction.response.send_message(
+        f"🛡️ **{team_label(team)}** is set up, linked to {role.mention}.\n"
+        f"Owner{'s' if len(owners) > 1 else ''}: {', '.join(f'<@{uid}>' for uid in owners)} · {count} member{'s' if count != 1 else ''} now.\n"
+        f"-# Give someone {role.mention} to add them to the team, take it away to remove them."
+        + _missing_role_note(guild, team, owners),
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    await team_log(guild, f"<@{interaction.user.id}> set up **{team_label(team)}** ({role.mention}) · owner{'s' if len(owners) > 1 else ''}: "
+                          + ", ".join(f"<@{uid}>" for uid in owners))
+
+
+@bot.tree.command(name="teamedit", description="Staff: change a team's name, tag, role or owners.")
+@app_commands.describe(team="Which team", name="New name", tag="New tag (2-4 letters, or - to remove it)",
+                       role="Link a different role", owner="New owner (replaces the owners)",
+                       owner2="Second owner", owner3="Third owner")
+@app_commands.autocomplete(team=team_autocomplete)
+async def teamedit(interaction: discord.Interaction, team: str, name: str = None, tag: str = None, role: discord.Role = None,
+                   owner: discord.Member = None, owner2: discord.Member = None, owner3: discord.Member = None):
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can edit teams.", ephemeral=True)
+        return
+    guild = interaction.guild
+    target = get_team(int(team)) if str(team).isdigit() else None
+    if not target or target["guild_id"] != guild.id:
+        await interaction.response.send_message("❌ Pick a team from the list.", ephemeral=True)
+        return
+    if not any([name, tag, role, owner, owner2, owner3]):
+        await interaction.response.send_message("Nothing to change. Fill in at least one option.", ephemeral=True)
+        return
+    new_name = clean_team_name(name) if name else target["name"]
+    new_tag = (None if tag.strip() == "-" else clean_team_tag(tag)) if tag is not None else target["tag"]
+    if len(new_name) < 3:
+        await interaction.response.send_message("❌ Names need 3 to 32 characters.", ephemeral=True)
+        return
+    for t in all_teams(guild.id):
+        if t["id"] != target["id"] and (t["name"].casefold() == new_name.casefold() or (new_tag and (t["tag"] or "") == new_tag)):
+            await interaction.response.send_message("❌ A team already has that name or tag.", ephemeral=True)
+            return
+    if role:
+        problem = _team_role_problem(guild, role, ignore_team=target["id"])
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
+    changes = []
+    if new_name != target["name"] or new_tag != target["tag"]:
+        discipline_query("UPDATE teams SET name = ?, tag = ? WHERE id = ?", (new_name, new_tag, target["id"]), write=True)
+        changes.append(f"name **{team_label(target)}** → **{team_label(get_team(target['id']))}**")
+    if role and role.id != row_value(target, "role_id"):
+        discipline_query("UPDATE teams SET role_id = ? WHERE id = ?", (role.id, target["id"]), write=True)
+        changes.append(f"role → {role.mention}")
+    owners = _owner_list(owner, owner2, owner3)
+    if owners:
+        _set_team_owners(target["id"], owners)
+        changes.append("owners → " + ", ".join(f"<@{uid}>" for uid in owners))
+    updated = get_team(target["id"])
+    sync_team(guild, updated)
+    text = "\n".join(f"• {c}" for c in changes) or "Nothing changed."
+    await interaction.response.send_message(f"✅ **{team_label(updated)}** updated:\n{text}"
+                                            + _missing_role_note(guild, updated, team_owner_ids(updated)),
+                                            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    if changes:
+        await team_log(guild, f"<@{interaction.user.id}> edited **{team_label(updated)}**: " + "; ".join(changes))
+
+
+@bot.tree.command(name="teamdelete", description="Staff: close a team. The Discord role is left alone.")
+@app_commands.describe(team="Which team")
+@app_commands.autocomplete(team=team_autocomplete)
+async def teamdelete(interaction: discord.Interaction, team: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can close teams.", ephemeral=True)
+        return
+    target = get_team(int(team)) if str(team).isdigit() else None
+    if not target or target["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message("❌ Pick a team from the list.", ephemeral=True)
+        return
+    now = int(time.time())
+    discipline_query("UPDATE teams SET disbanded_at = ? WHERE id = ?", (now, target["id"]), write=True)
+    discipline_query("UPDATE team_members SET left_at = ? WHERE team_id = ? AND left_at IS NULL", (now, target["id"]), write=True)
+    await interaction.response.send_message(
+        f"🗑️ **{team_label(target)}** is closed. The role is still in the server; delete it in Server Settings if you don't need it.",
+        ephemeral=True)
+    await team_log(interaction.guild, f"<@{interaction.user.id}> closed **{team_label(target)}**.")
+
+
+@bot.tree.command(name="team", description="See a team: its members, owners and record.")
+@app_commands.describe(team="Which team (yours if you leave it empty)")
+@app_commands.autocomplete(team=team_autocomplete)
+async def team_command(interaction: discord.Interaction, team: str = None):
+    target = get_team(int(team)) if team and str(team).isdigit() else team_of(interaction.guild.id, interaction.user.id)
+    if not target or target["guild_id"] != interaction.guild.id:
+        await interaction.response.send_message("You're not on a team. Pick one from the list to see it.", ephemeral=True)
+        return
+    await interaction.response.send_message(embed=team_embed(interaction.guild, target), ephemeral=True)
+
+
+# ============================================================
 # FORMER FIGHTERS
 #
 # Members change their UFC 6 fighter over time. The bot keeps the
@@ -29754,6 +30409,1396 @@ if not TOKEN:
     raise RuntimeError(
         "DISCORD_TOKEN is missing from your environment variables."
     )
+
+
+import random
+import urllib.parse
+
+# ============================================================
+# FIGHTS LIKE (closest UFC 6 fighter by style)
+#
+# ufc_styles.json (next to bot.py) holds each UFC 6 fighter's
+# record: wins, losses and how they won and lost. Edit it to fix a
+# record. Matching uses win rate and how they win (KO / SUB / DEC),
+# with a small boost for the same weight class. Shows after 3 fights.
+# WOMEN_UFC_MATCHES=on also matches against the women's roster.
+# ============================================================
+
+UFC_STYLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ufc_styles.json")
+FIGHTS_LIKE_MIN = 3
+WOMEN_UFC_MATCHES = os.getenv("WOMEN_UFC_MATCHES", "off").strip().lower() in ("on", "yes", "true", "1")
+_ufc_styles = {"loaded": 0, "data": {}}
+
+
+def ufc_styles():
+    """{name: (division, wins, losses, ko, sub, dec, ko_l, sub_l, dec_l)}"""
+    try:
+        changed = os.path.getmtime(UFC_STYLE_FILE)
+    except OSError:
+        return {}
+    if changed != _ufc_styles["loaded"]:
+        try:
+            with open(UFC_STYLE_FILE, encoding="utf-8") as handle:
+                raw = json.load(handle).get("fighters", {})
+            _ufc_styles["data"] = {name: tuple(values) for name, values in raw.items() if len(values) >= 9}
+            _ufc_styles["loaded"] = changed
+        except Exception as error:
+            print(f"ufc_styles.json couldn't be read: {error}")
+    return _ufc_styles["data"]
+
+
+def style_shares(wins, losses, ko, sub, dec):
+    total = wins + losses
+    return (wins / total if total else 0, ko / wins if wins else 0, sub / wins if wins else 0, dec / wins if wins else 0)
+
+
+def fighter_division(guild_id: int, user_id: int, ranks=None):
+    """Their main division: a belt, then their best ranking, then where they've fought most."""
+    ranks = ranks if ranks is not None else (get_user_rankings(guild_id, user_id) if user_id else [])
+    rows = sorted([r for r in ranks if r["weight"] != P4P_WEIGHT], key=lambda r: r["rank"])
+    if rows:
+        return rows[0]["weight"]
+    try:
+        found = discipline_query(
+            "SELECT division, COUNT(*) AS n FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?) "
+            "AND division IS NOT NULL AND division != '' GROUP BY division ORDER BY n DESC LIMIT 1",
+            (guild_id, user_id, user_id))
+        return found[0]["division"] if found else None
+    except Exception:
+        return None
+
+
+def fights_like(stats, division=None, top=3):
+    """[(ufc name, match %)] closest first, or [] if not enough fights."""
+    wins, losses = stats["wins"], stats["losses"]
+    if wins + losses + stats["draws"] < FIGHTS_LIKE_MIN or not wins:
+        return []
+    by = stats["wins_by"]
+    mine = style_shares(wins, losses, by.get("KO/TKO", 0), by.get("SUB", 0), by.get("DEC", 0))
+    short = WEIGHTS.get(division) if division else None
+    scored = []
+    for name, values in ufc_styles().items():
+        div, w, l, ko, sub, dec = values[:6]
+        if div == "W" and not WOMEN_UFC_MATCHES:
+            continue
+        theirs = style_shares(w, l, ko, sub, dec)
+        distance = 0.8 * abs(mine[0] - theirs[0]) + abs(mine[1] - theirs[1]) + abs(mine[2] - theirs[2]) + abs(mine[3] - theirs[3])
+        score = 100 - distance * 60 + (2 if short and div == short else 0)
+        scored.append((max(40, min(99, round(score))), name))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [(name, score) for score, name in scored[:top]]
+
+
+def fights_like_style(name):
+    values = ufc_styles().get(name)
+    if not values:
+        return ""
+    _, w, l, ko, sub, dec = values[:6]
+    if not w:
+        return ""
+    ko_s, sub_s, dec_s = ko / w, sub / w, dec / w
+    finish = ko_s + sub_s
+    if sub_s >= 0.45:
+        text = "Submission-heavy finisher"
+    elif ko_s >= 0.6:
+        text = "Knockout artist"
+    elif dec_s >= 0.6:
+        text = "Grinds out decisions"
+    elif finish >= 0.5:
+        text = "Finishes with strikes and subs"
+    else:
+        text = "Mix of finishes and decisions"
+    return text
+
+
+def fights_like_line(guild_id: int, member, stats, ranks):
+    if not getattr(member, "id", None):
+        return None
+    match = fights_like(stats, fighter_division(guild_id, member.id, ranks), top=1)
+    if not match:
+        return None
+    name, score = match[0]
+    return f"🧬 Fights like **{name}** ({score}%)"
+
+
+# ============================================================
+# FIGHTER CARDS
+#
+# Every fighter has a card. Tier comes from where they stand:
+#   Double Champ · Champion · Contender (#1-5) · Ranked (#6+) · Prospect
+# Stats: OVR (skill rating), STR (sig. strike accuracy), GRP
+# (takedowns + control), POW (KO wins + knockdowns), SUB, FIN
+# (finish rate), FTS (fights).
+#   /card [fighter]      posts a card in the channel
+#   /collection          your cards (sell spares, trade)
+#   /trade               swap cards (and coins) with someone
+# Packs are in the shop (Cards). PACKS_PER_DAY (default 5).
+# ============================================================
+
+CARD_TIERS = ["prospect", "ranked", "contender", "champion", "double"]
+CARD_TIER_NAMES = {"prospect": "Prospect", "ranked": "Ranked", "contender": "Contender", "champion": "Champion", "double": "Double Champ"}
+CARD_TIER_ICONS = {"prospect": "🟢", "ranked": "🥉", "contender": "🥈", "champion": "👑", "double": "👑👑"}
+# frame colours: light, dark, mid, badge text
+CARD_COLOURS = {
+    "prospect": ((159, 227, 194), (42, 58, 52), (88, 117, 106), (6, 20, 14)),
+    "ranked": ((240, 181, 133), (110, 59, 28), (194, 122, 69), (26, 14, 5)),
+    "contender": ((244, 246, 248), (124, 133, 144), (196, 203, 211), (17, 20, 24)),
+    "champion": ((243, 210, 122), (138, 100, 22), (212, 168, 67), (20, 16, 8)),
+    "double": ((255, 231, 160), (58, 42, 8), (224, 181, 74), (20, 13, 0)),
+}
+CARD_SELL = {"prospect": 50, "ranked": 100, "contender": 250, "champion": 500, "double": 1000}
+PACKS_PER_DAY = int(os.getenv("PACKS_PER_DAY", "5") or 5)
+PACK_ITEMS = {"pack_common": "common", "pack_rare": "rare", "pack_champ": "champ"}
+PACK_NAMES = {"common": "Common Pack", "rare": "Rare Pack", "champ": "Champ Pack"}
+COMMON_ODDS = [("prospect", 55), ("ranked", 35), ("contender", 8.5), ("champion", 1.5)]
+RANKED_PLUS_ODDS = [("ranked", 70), ("contender", 24), ("champion", 6)]
+TRADE_HOURS = 24
+TRADE_MAX_CARDS = 3
+
+
+def setup_card_collect_tables():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS card_pulls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            owner_id INTEGER NOT NULL,
+            fighter_id INTEGER NOT NULL,
+            tier TEXT NOT NULL,
+            data TEXT NOT NULL,
+            pack TEXT,
+            pack_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'owned',
+            trade_id INTEGER,
+            pulled_at INTEGER NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS card_packs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            pack TEXT NOT NULL,
+            price INTEGER NOT NULL,
+            decided TEXT,
+            opened_at INTEGER NOT NULL
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS card_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            from_id INTEGER NOT NULL,
+            to_id INTEGER NOT NULL,
+            give_cards TEXT NOT NULL,
+            want_cards TEXT NOT NULL,
+            give_coins INTEGER NOT NULL DEFAULT 0,
+            want_coins INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            channel_id INTEGER,
+            message_id INTEGER,
+            created_at INTEGER NOT NULL,
+            closed_at INTEGER,
+            closed_by INTEGER
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS card_pulls_owner ON card_pulls(guild_id, owner_id, status)")
+    db.commit()
+    db.close()
+
+
+def clean_card_name(name: str):
+    name = name_without_record(name or "")
+    name = re.sub(r"\[[^\]]*\]", "", name)
+    return " ".join(name.split()) or "Fighter"
+
+
+def card_rating_table(guild_id: int):
+    try:
+        return cached_ratings(guild_id)
+    except Exception:
+        try:
+            return compute_ratings(guild_id)
+        except Exception:
+            return {}
+
+
+def fighter_card_data(guild, user_id: int, member=None, ratings=None):
+    """Everything drawn on a fighter's card right now, or None if they have no fights."""
+    member = member or (guild.get_member(user_id) if guild else None)
+    display = getattr(member, "display_name", None) or ""
+    stats = get_fighter_stats(guild.id, user_id, display)
+    fights = stats["wins"] + stats["losses"] + stats["draws"]
+    if not fights:
+        return None
+    ranks = get_user_rankings(guild.id, user_id)
+    champ_of = [r["weight"] for r in ranks if r["rank"] == 0 and r["weight"] != P4P_WEIGHT]
+    ranked = sorted([r for r in ranks if r["weight"] != P4P_WEIGHT and r["rank"] > 0], key=lambda r: r["rank"])
+    p4p = next((r["rank"] for r in ranks if r["weight"] == P4P_WEIGHT and r["rank"] > 0), None)
+
+    if len(champ_of) >= 2:
+        tier = "double"
+    elif champ_of:
+        tier = "champion"
+    elif ranked and ranked[0]["rank"] <= 5:
+        tier = "contender"
+    elif ranked:
+        tier = "ranked"
+    else:
+        tier = "prospect"
+
+    weight_order = [w for w in WEIGHTS if w != P4P_WEIGHT]
+    if champ_of:
+        division = "·".join(WEIGHTS[w] for w in sorted(champ_of, key=weight_order.index))
+    elif ranked:
+        division = WEIGHTS.get(ranked[0]["weight"], "")
+    else:
+        division = WEIGHTS.get(fighter_division(guild.id, user_id, ranks) or "", "PFO")
+
+    if tier == "double":
+        badge = "DOUBLE CHAMP"
+    elif tier == "champion":
+        badge = "CHAMP"
+    elif ranked:
+        badge = f"#{ranked[0]['rank']}"
+    else:
+        badge = "PROSPECT" if is_prospect(stats) else "UNRANKED"
+
+    chips = []
+    for row in ranked:
+        if champ_of or row is not ranked[0]:
+            chips.append(f"#{row['rank']} {WEIGHTS.get(row['weight'], row['weight'])}")
+    if p4p:
+        chips.append(f"#{p4p} P4P")
+    if tier == "double" and stats["title_wins"]:
+        chips.append(f"{stats['title_wins']} TITLE WINS")
+    chips = chips[:2]
+
+    total = fight_stat_totals(guild.id).get(user_id)
+    wins = stats["wins"]
+    by = stats["wins_by"]
+    ko_share = by.get("KO/TKO", 0) / wins if wins else 0
+    sub_share = by.get("SUB", 0) / wins if wins else 0
+
+    def cap(value):
+        return None if value is None else max(1, min(99, round(value)))
+
+    strike = grapple = None
+    knockdowns = None
+    if total and total["fights"]:
+        if total["sig_thrown"]:
+            strike = 40 + 100 * total["sig_landed"] / total["sig_thrown"] * 0.85
+        td = 100 * total["td_landed"] / total["td_attempted"] if total["td_attempted"] else 0
+        control = total["control"] / total["fights"]
+        grapple = 40 + td * 0.3 + min(control / 300, 1) * 30
+        knockdowns = total["knockdowns"] / total["fights"]
+    if knockdowns is None:
+        power = 40 + ko_share * 59 if wins else None
+    else:
+        power = 40 + ko_share * 35 + min(knockdowns, 2.5) * 10
+    sub = 25 + sub_share * 74 if wins else None
+    finish = stats["finish_rate"]
+
+    ratings = ratings if ratings is not None else card_rating_table(guild.id)
+    entry = ratings.get(fighter_key(user_id, None)) if ratings else None
+    rating = entry["rating"] if entry else RATING_START
+    ovr = 70 + (rating - RATING_START) / 8
+    ovr = max(ovr, {"double": 90, "champion": 85, "contender": 78}.get(tier, 0))
+    ovr = max(55, min(99, round(ovr)))
+
+    streak = stats["streak"] or ""
+    return {
+        "user_id": user_id,
+        "name": clean_card_name(display or (stats["fights"][-1]["winner_name"] if stats["fights"] else "Fighter")),
+        "tier": tier,
+        "ovr": ovr,
+        "division": division or "PFO",
+        "badge": badge,
+        "chips": chips,
+        "record": stats_record(stats),
+        "streak": streak,
+        "stats": [("STR", cap(strike)), ("GRP", cap(grapple)), ("POW", cap(power)),
+                  ("SUB", cap(sub)), ("FIN", cap(finish) if finish is not None else None), ("FTS", fights)],
+        "made": datetime.now(timezone.utc).strftime("%b %Y").upper(),
+    }
+
+
+def card_pool(guild):
+    """Fighters who can come out of packs: in the server with at least one fight."""
+    ids = set()
+    for row in discipline_query("SELECT DISTINCT winner_id AS uid FROM fights WHERE guild_id = ? AND winner_id IS NOT NULL "
+                                "UNION SELECT DISTINCT loser_id FROM fights WHERE guild_id = ? AND loser_id IS NOT NULL",
+                                (guild.id, guild.id)):
+        member = guild.get_member(row["uid"])
+        if member and not member.bot:
+            ids.add(row["uid"])
+    return sorted(ids)
+
+
+def pool_by_tier(guild):
+    ratings = card_rating_table(guild.id)
+    tiers = {tier: [] for tier in CARD_TIERS}
+    cards = {}
+    for uid in card_pool(guild):
+        data = fighter_card_data(guild, uid, ratings=ratings)
+        if data:
+            tiers[data["tier"]].append(uid)
+            cards[uid] = data
+    return tiers, cards
+
+
+def _pick_tier(odds):
+    roll = random.uniform(0, sum(weight for _, weight in odds))
+    for tier, weight in odds:
+        roll -= weight
+        if roll <= 0:
+            return tier
+    return odds[-1][0]
+
+
+def _draw_from(tiers, tier, upward=False):
+    """A random fighter of this tier; falls back to the next tier down (or up) if nobody is in it."""
+    order = CARD_TIERS if upward else list(reversed(CARD_TIERS))
+    start = order.index(tier)
+    for t in order[start:] + list(reversed(order[:start])):
+        if tiers.get(t):
+            return random.choice(tiers[t])
+    return None
+
+
+def pack_slots(pack, tiers):
+    """Which tier each of the 3 cards comes from."""
+    champs = tiers["champion"] + tiers["double"]
+    slots = []
+    for i in range(3):
+        if pack == "champ":
+            if i < 2:
+                tier = _pick_tier(RANKED_PLUS_ODDS)
+            elif tiers["double"] and (not tiers["champion"] or random.random() < 0.25):
+                tier = "double"
+            else:
+                tier = "champion"
+            if i == 2:
+                slots.append(tier)
+                continue
+        elif pack == "rare" and i == 2:
+            tier = "contender" if random.random() < 0.85 else "champion"
+        else:
+            tier = _pick_tier(COMMON_ODDS)
+        if tier == "champion" and champs:
+            # Double champs are inside the Champion odds
+            tier = "double" if random.choice(champs) in tiers["double"] else "champion"
+        slots.append(tier)
+    return slots
+
+
+def packs_today(guild_id: int, user_id: int):
+    start = int(datetime.combine(datetime.now(timezone.utc).date(), datetime.min.time(), timezone.utc).timestamp())
+    rows = discipline_query("SELECT COUNT(*) AS n FROM card_packs WHERE guild_id = ? AND user_id = ? AND opened_at >= ?",
+                            (guild_id, user_id, start))
+    return rows[0]["n"] if rows else 0
+
+
+def open_pack(guild, user_id: int, pack: str, price: int):
+    """Makes the 3 cards. Returns the pack id, or None if nobody can be pulled."""
+    tiers, cards = pool_by_tier(guild)
+    if not cards:
+        return None
+    guaranteed = {"rare": "contender", "champ": "champion"}.get(pack)
+    picks = []
+    for i, tier in enumerate(pack_slots(pack, tiers)):
+        upward = guaranteed is not None and i == 2
+        uid = _draw_from(tiers, tier, upward=upward)
+        if uid is None:
+            uid = random.choice(list(cards))
+        picks.append(uid)
+    now = int(time.time())
+    pack_id = discipline_query("INSERT INTO card_packs (guild_id, user_id, pack, price, opened_at) VALUES (?, ?, ?, ?, ?)",
+                               (guild.id, user_id, pack, price, now), write=True)
+    for uid in picks:
+        data = cards[uid]
+        discipline_query("INSERT INTO card_pulls (guild_id, owner_id, fighter_id, tier, data, pack, pack_id, pulled_at) "
+                         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                         (guild.id, user_id, uid, data["tier"], json.dumps(data), pack, pack_id, now), write=True)
+    _last_pack[(guild.id, user_id)] = pack_id
+    return pack_id
+
+
+_last_pack = {}
+
+
+def pack_cards(pack_id: int):
+    return discipline_query("SELECT * FROM card_pulls WHERE pack_id = ? ORDER BY id", (pack_id,))
+
+
+def owned_cards(guild_id: int, user_id: int, include_held=False):
+    statuses = ("owned", "held") if include_held else ("owned",)
+    marks = ",".join("?" * len(statuses))
+    return discipline_query(f"SELECT * FROM card_pulls WHERE guild_id = ? AND owner_id = ? AND status IN ({marks}) ORDER BY id",
+                            (guild_id, user_id) + statuses)
+
+
+def card_info(row):
+    try:
+        return json.loads(row["data"])
+    except Exception:
+        return {"name": "Fighter", "tier": row["tier"], "ovr": 60, "division": "PFO", "badge": "", "chips": [],
+                "record": "", "streak": "", "stats": [], "made": ""}
+
+
+def card_label(row):
+    info = card_info(row)
+    return f"{CARD_TIER_ICONS[row['tier']]} {info['name']} · {CARD_TIER_NAMES[row['tier']]} {info['ovr']}"
+
+
+def spare_cards(guild_id: int, user_id: int, only_ids=None):
+    """Cards they have more than one of (same fighter and tier), newest copies first, keeping one."""
+    groups = {}
+    for row in owned_cards(guild_id, user_id):
+        groups.setdefault((row["fighter_id"], row["tier"]), []).append(row)
+    spares = []
+    for rows in groups.values():
+        rows.sort(key=lambda r: r["id"])
+        spares += rows[1:]
+    if only_ids is not None:
+        spares = [r for r in spares if r["id"] in only_ids]
+    return spares
+
+
+def sell_cards(guild_id: int, user_id: int, rows):
+    total = 0
+    for row in rows:
+        done = discipline_query("UPDATE card_pulls SET status = 'sold' WHERE id = ? AND owner_id = ? AND status = 'owned'",
+                                (row["id"], user_id), write=True)
+        total += CARD_SELL[row["tier"]]
+    if total:
+        add_coins(guild_id, user_id, total, "cards:sell")
+    return total
+
+
+def collection_progress(guild, user_id: int):
+    owned = {row["fighter_id"] for row in owned_cards(guild.id, user_id, include_held=True)}
+    pool = set(card_pool(guild))
+    return len(owned & pool) if pool else len(owned), max(len(pool), len(owned))
+
+
+# ---------------- drawing ----------------
+
+def _gradient(size, colours, angle=145):
+    """Diagonal gradient through the colours."""
+    from PIL import Image
+    w, h = size
+    strip = Image.new("RGB", (256, 1))
+    stops = [(i / (len(colours) - 1), c) for i, c in enumerate(colours)]
+    for x in range(256):
+        t = x / 255
+        for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+            if t0 <= t <= t1:
+                f = (t - t0) / (t1 - t0) if t1 > t0 else 0
+                strip.putpixel((x, 0), tuple(int(c0[k] + (c1[k] - c0[k]) * f) for k in range(3)))
+                break
+    big = max(w, h) * 2
+    grad = strip.resize((big, big)).rotate(90 - angle, resample=Image.BICUBIC)
+    left, top = (big - w) // 2, (big - h) // 2
+    return grad.crop((left, top, left + w, top + h))
+
+
+def _round_mask(size, radius):
+    from PIL import Image, ImageDraw
+    w, h = size
+    mask = Image.new("L", (w * 2, h * 2), 0)
+    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w * 2 - 1, h * 2 - 1), radius=radius * 2, fill=255)
+    return mask.resize((w, h), Image.LANCZOS)
+
+
+def draw_card_image(info, picture_bytes=None, serial=""):
+    """A 500x700 trading card (PNG bytes)."""
+    from PIL import Image, ImageDraw, ImageFilter
+    import io as _io
+    W, H = 500, 700
+    tier = info.get("tier", "prospect")
+    f1, f2, f3, ink = CARD_COLOURS.get(tier, CARD_COLOURS["prospect"])
+    card = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+    if tier == "double":
+        frame = _gradient((W, H), [(255, 231, 160), (184, 134, 42), (90, 61, 12), (255, 211, 107), (255, 243, 201), (184, 134, 42), (58, 42, 8)], 120)
+    else:
+        frame = _gradient((W, H), [f1, f2, f3, f2], 145)
+    card.paste(frame, (0, 0), _round_mask((W, H), 30))
+
+    inset = 13
+    iw, ih = W - inset * 2, H - inset * 2
+    inner_top = (20, 16, 8) if tier == "double" else (34, 30, 24) if tier == "champion" else (26, 26, 30) if tier == "contender" else (30, 24, 20) if tier == "ranked" else (22, 28, 25)
+    inner = _gradient((iw, ih), [inner_top, (10, 10, 9)], 180)
+    glow = Image.new("RGBA", (iw, ih), (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.ellipse((-iw * .2, -ih * .25, iw * 1.2, ih * .55), fill=f1 + (34 if tier in ("champion", "double") else 20,))
+    glow = glow.filter(ImageFilter.GaussianBlur(60))
+    inner = inner.convert("RGBA")
+    inner.alpha_composite(glow)
+    if tier in ("champion", "double"):
+        holo = Image.new("RGBA", (iw * 2, ih * 2), (0, 0, 0, 0))
+        hd = ImageDraw.Draw(holo)
+        bands = [(255, 110, 200, 85), (255, 240, 150, 110), (110, 220, 255, 90), (150, 120, 255, 60)] if tier == "double" else [(255, 240, 180, 50)]
+        for k, colour in enumerate(bands):
+            x = iw * 0.55 + k * 46
+            hd.polygon([(x, 0), (x + 70, 0), (x - ih * 0.8 + 70, ih * 2), (x - ih * 0.8, ih * 2)], fill=colour)
+        holo = holo.filter(ImageFilter.GaussianBlur(26)).crop((iw // 2, 0, iw // 2 + iw, ih))
+        inner.alpha_composite(holo)
+    card.paste(inner, (inset, inset), _round_mask((iw, ih), 22))
+    d = ImageDraw.Draw(card)
+
+    def overlay(draw_fn):
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        draw_fn(ImageDraw.Draw(layer))
+        card.alpha_composite(layer)
+
+    # Ghost division behind the picture
+    ghost = info.get("division", "").split("·")[0]
+    if ghost:
+        gfont = rank_font("display", 210)
+        gw = d.textlength(ghost, font=gfont)
+        overlay(lambda o: o.text(((W - gw) / 2, 120), ghost, font=gfont, fill=(255, 255, 255, 14)))
+
+    # OVR + division
+    ofont = rank_font("display", 78)
+    ovr = str(info.get("ovr", ""))
+    ow = d.textlength(ovr, font=ofont)
+    d.text((40, 28), ovr, font=ofont, fill=f1)
+    dfont = _fit_font(d, info.get("division", ""), "bold", 20, 120, 12)
+    dw = d.textlength(info.get("division", ""), font=dfont)
+    d.text((40 + (ow - dw) / 2, 112), info.get("division", ""), font=dfont, fill=(232, 226, 210))
+
+    # Badge
+    badge = info.get("badge", "")
+    if badge:
+        bfont = rank_font("bold", 17)
+        bw = d.textlength(badge, font=bfont) + 22
+        bx = W - 40 - bw
+        d.rounded_rectangle((bx, 38, bx + bw, 68), radius=6, fill=f1)
+        d.text((bx + 11, 42), badge, font=bfont, fill=ink)
+
+    # Picture (square crop first so it isn't stretched)
+    if picture_bytes:
+        try:
+            pic = Image.open(_io.BytesIO(picture_bytes)).convert("RGB")
+            side = min(pic.size)
+            left, top_ = (pic.width - side) // 2, (pic.height - side) // 2
+            buf = _io.BytesIO()
+            pic.crop((left, top_, left + side, top_ + side)).save(buf, "PNG")
+            picture_bytes = buf.getvalue()
+        except Exception:
+            picture_bytes = None
+    size = 270
+    face = _round_avatar(size, info.get("name", "?"), picture_bytes)
+    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(halo).ellipse(((W - size) / 2 - 18, 128, (W + size) / 2 + 18, 128 + size + 36), fill=f1 + (70,))
+    card.alpha_composite(halo.filter(ImageFilter.GaussianBlur(22)))
+    px, py = (W - size) // 2, 146
+    overlay(lambda o: o.ellipse((px - 10, py - 10, px + size + 10, py + size + 10), fill=(0, 0, 0, 150)))
+    d.ellipse((px - 6, py - 6, px + size + 6, py + size + 6), fill=f3)
+    card.alpha_composite(face, (px, py))
+
+    # Name
+    name = info.get("name", "Fighter").upper()
+    nfont = _fit_font(d, name, "display", 52, W - 70, 28)
+    nw = d.textlength(name, font=nfont)
+    d.text(((W - nw) / 2, 432), name, font=nfont, fill=(255, 255, 255))
+    sub = " · ".join(x for x in (info.get("record", ""), info.get("streak", "")) if x)
+    sfont = rank_font("semibold", 17)
+    sw = d.textlength(sub, font=sfont)
+    d.text(((W - sw) / 2, 492), sub, font=sfont, fill=(201, 194, 174))
+
+    # Chips
+    chips = info.get("chips", [])
+    if chips:
+        cfont = rank_font("bold", 14)
+        widths = [d.textlength(c, font=cfont) + 16 for c in chips]
+        x = (W - (sum(widths) + 8 * (len(chips) - 1))) / 2
+        for chip, cw in zip(chips, widths):
+            overlay(lambda o, x=x, cw=cw: o.rounded_rectangle((x, 520, x + cw, 544), radius=4, outline=(255, 255, 255, 70), width=1))
+            d.text((x + 8, 523), chip, font=cfont, fill=(232, 226, 210))
+            x += cw + 8
+
+    # Stats
+    top = 558
+    overlay(lambda o: o.line((40, top, W - 40, top), fill=f3 + (150,), width=1))
+    vfont = rank_font("display", 36)
+    lfont = rank_font("bold", 15)
+    col_w = (W - 80) / 3
+    for i, (label, value) in enumerate(info.get("stats", [])[:6]):
+        cx = 40 + (i % 3) * col_w + col_w / 2
+        cy = top + 10 + (i // 3) * 44
+        text = "—" if value is None else str(value)
+        vw = d.textlength(text, font=vfont)
+        lw = d.textlength(label, font=lfont)
+        x0 = cx - (vw + 6 + lw) / 2
+        d.text((x0, cy), text, font=vfont, fill=(255, 255, 255))
+        d.text((x0 + vw + 6, cy + 17), label, font=lfont, fill=(168, 161, 144))
+
+    # Footer
+    ffont = rank_font("medium", 13)
+    d.text((40, H - 40), f"PFO · {info.get('made', '')}", font=ffont, fill=(125, 119, 104))
+    if serial:
+        sw = d.textlength(serial, font=ffont)
+        d.text((W - 40 - sw, H - 40), serial, font=ffont, fill=(125, 119, 104))
+
+    out = _io.BytesIO()
+    card.save(out, "PNG")
+    return out.getvalue()
+
+
+def draw_card_strip(images):
+    """Cards side by side (for packs and trades)."""
+    from PIL import Image
+    import io as _io
+    cards = [Image.open(_io.BytesIO(b)).convert("RGBA") for b in images]
+    if not cards:
+        return None
+    gap = 24
+    w = sum(c.width for c in cards) + gap * (len(cards) - 1)
+    strip = Image.new("RGBA", (w, cards[0].height), (0, 0, 0, 0))
+    x = 0
+    for c in cards:
+        strip.alpha_composite(c, (x, 0))
+        x += c.width + gap
+    strip = strip.resize((int(w * 0.62), int(cards[0].height * 0.62)), Image.LANCZOS)
+    out = _io.BytesIO()
+    strip.save(out, "PNG")
+    return out.getvalue()
+
+
+def fighter_number(guild_id: int, user_id: int):
+    rows = discipline_query("""
+        SELECT uid, MIN(id) AS first FROM (
+            SELECT winner_id AS uid, id FROM fights WHERE guild_id = ? AND winner_id IS NOT NULL
+            UNION ALL SELECT loser_id, id FROM fights WHERE guild_id = ? AND loser_id IS NOT NULL
+        ) GROUP BY uid ORDER BY first
+    """, (guild_id, guild_id))
+    for i, row in enumerate(rows, start=1):
+        if row["uid"] == user_id:
+            return i
+    return 0
+
+
+async def card_png_for_fighter(guild, member):
+    info = fighter_card_data(guild, member.id, member)
+    if not info:
+        return None
+    picture = await _avatar_bytes(member) if hasattr(member, "display_avatar") and member.display_avatar else None
+    number = fighter_number(guild.id, member.id)
+    return draw_card_image(info, picture, f"#{number:04d}" if number else "")
+
+
+async def card_png_for_pull(guild, row):
+    member = guild.get_member(row["fighter_id"]) if guild else None
+    picture = await _avatar_bytes(member) if member else None
+    return draw_card_image(card_info(row), picture, f"No. {row['id']:04d}")
+
+
+async def fighter_card_file(guild, member):
+    try:
+        if not getattr(member, "id", None):
+            return None
+        png = await card_png_for_fighter(guild, member)
+        if not png:
+            return None
+        import io as _io
+        return discord.File(_io.BytesIO(png), filename="fighter_card.png")
+    except Exception as error:
+        print(f"Card drawing failed: {error}")
+        return None
+
+
+@bot.tree.command(name="card", description="Post a fighter's trading card (yours if you leave it empty).")
+@app_commands.describe(fighter="Whose card")
+async def card_command(interaction: discord.Interaction, fighter: discord.Member = None):
+    member = fighter or interaction.user
+    if member.bot:
+        await interaction.response.send_message("❌ Bots don't have cards.", ephemeral=True)
+        return
+    await interaction.response.defer()
+    file = await fighter_card_file(interaction.guild, member)
+    if not file:
+        await interaction.followup.send(f"❌ **{clean_card_name(member.display_name)}** doesn't have a card yet. Cards are made once a fight is logged.")
+        return
+    info = fighter_card_data(interaction.guild, member.id, member)
+    embed = discord.Embed(title=f"{CARD_TIER_ICONS[info['tier']]} {info['name']}",
+                          description=f"**{CARD_TIER_NAMES[info['tier']]}** card · OVR **{info['ovr']}**", color=PFO_GOLD)
+    embed.set_author(name="PFO • FIGHTER CARD", icon_url=asset_url(LOGO_FILE))
+    embed.set_image(url="attachment://fighter_card.png")
+    embed.set_footer(text="Collect cards from packs in /shop")
+    await interaction.followup.send(embed=embed, file=file)
+
+
+# ---------------- packs ----------------
+
+def duplicates_in_pack(guild_id: int, user_id: int, pack_id: int):
+    """Cards from this pack they already had a copy of (or got twice)."""
+    rows = pack_cards(pack_id)
+    ids = {r["id"] for r in rows}
+    return [r for r in spare_cards(guild_id, user_id, only_ids=ids) if r["status"] == "owned"]
+
+
+def pack_embed(guild, user_id: int, pack_id: int, note: str = None):
+    rows = pack_cards(pack_id)
+    pack = discipline_query("SELECT * FROM card_packs WHERE id = ?", (pack_id,))[0]
+    dupes = {r["id"] for r in duplicates_in_pack(guild.id, user_id, pack_id)}
+    earlier = {(r["fighter_id"], r["tier"]) for r in owned_cards(guild.id, user_id, include_held=True) if r["pack_id"] != pack_id}
+    bits = []
+    for r in rows:
+        info = card_info(r)
+        name = f"**{info['name']}**" if r["tier"] in ("champion", "double") else info["name"]
+        tag = ""
+        if r["status"] == "sold":
+            tag = " · sold"
+        elif r["id"] in dupes:
+            tag = " · 🔁 duplicate"
+        elif (r["fighter_id"], r["tier"]) not in earlier:
+            tag = " · NEW"
+        bits.append(f"{CARD_TIER_ICONS[r['tier']]} {name} ({CARD_TIER_NAMES[r['tier']]} {info['ovr']}){tag}")
+    have, total = collection_progress(guild, user_id)
+    embed = discord.Embed(title="🃏 You pulled 3 cards", description="\n".join(bits), color=PFO_GOLD)
+    embed.set_author(name=f"PFO • {PACK_NAMES[pack['pack']].upper()}", icon_url=asset_url(LOGO_FILE))
+    if note:
+        embed.description = note + "\n\n" + embed.description
+    embed.set_image(url="attachment://pack.png")
+    worth = sum(CARD_SELL[r["tier"]] for r in duplicates_in_pack(guild.id, user_id, pack_id))
+    embed.set_footer(text=f"Collection {have} / {total}" + (f" · duplicates worth {worth:,} coins" if worth else ""))
+    return embed
+
+
+async def pack_file(guild, pack_id: int):
+    import io as _io
+    images = [await card_png_for_pull(guild, r) for r in pack_cards(pack_id)]
+    strip = draw_card_strip(images)
+    return discord.File(_io.BytesIO(strip), filename="pack.png") if strip else None
+
+
+class PackResultView(discord.ui.View):
+    """Keep / Sell duplicates / Show off, under a pack that's just been opened."""
+
+    def __init__(self, guild, user_id: int, pack_id: int):
+        super().__init__(timeout=1800)
+        self.guild, self.user_id, self.pack_id = guild, user_id, pack_id
+        self.build()
+
+    def build(self):
+        self.clear_items()
+        dupes = duplicates_in_pack(self.guild.id, self.user_id, self.pack_id)
+        decided = discipline_query("SELECT decided FROM card_packs WHERE id = ?", (self.pack_id,))[0]["decided"]
+        if dupes and not decided:
+            keep = discord.ui.Button(label="Keep duplicates", style=discord.ButtonStyle.grey)
+            keep.callback = self.keep
+            sell = discord.ui.Button(label=f"Sell duplicates (+{sum(CARD_SELL[r['tier']] for r in dupes):,})", style=discord.ButtonStyle.green)
+            sell.callback = self.sell
+            self.add_item(keep)
+            self.add_item(sell)
+        show = discord.ui.Button(label="Show off in chat", style=discord.ButtonStyle.blurple)
+        show.callback = self.show
+        self.add_item(show)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.user_id
+
+    async def keep(self, interaction):
+        discipline_query("UPDATE card_packs SET decided = 'keep' WHERE id = ?", (self.pack_id,), write=True)
+        self.build()
+        await interaction.response.edit_message(embed=pack_embed(self.guild, self.user_id, self.pack_id, "✅ Kept. Sell spares any time from `/collection`."),
+                                                view=self)
+
+    async def sell(self, interaction):
+        total = sell_cards(self.guild.id, self.user_id, duplicates_in_pack(self.guild.id, self.user_id, self.pack_id))
+        discipline_query("UPDATE card_packs SET decided = 'sell' WHERE id = ?", (self.pack_id,), write=True)
+        self.build()
+        await interaction.response.edit_message(embed=pack_embed(self.guild, self.user_id, self.pack_id, f"💰 Sold for {COIN} **{coins_text(total)}**."),
+                                                view=self)
+
+    async def show(self, interaction):
+        await interaction.response.defer()
+        file = await pack_file(self.guild, self.pack_id)
+        embed = pack_embed(self.guild, self.user_id, self.pack_id)
+        embed.title = f"🃏 {clean_card_name(interaction.user.display_name)} opened a {PACK_NAMES[discipline_query('SELECT pack FROM card_packs WHERE id = ?', (self.pack_id,))[0]['pack']]}"
+        embed.set_footer(text="Get packs in /shop")
+        try:
+            await interaction.channel.send(embed=embed, file=file)
+        except Exception as error:
+            await interaction.followup.send(f"❌ Couldn't post here: {error}", ephemeral=True)
+
+
+async def send_pack_result(interaction, pack_id: int):
+    guild = interaction.guild
+    file = await pack_file(guild, pack_id)
+    kwargs = {"embed": pack_embed(guild, interaction.user.id, pack_id), "view": PackResultView(guild, interaction.user.id, pack_id), "ephemeral": True}
+    if file:
+        kwargs["file"] = file
+    await interaction.followup.send(**kwargs)
+
+
+# ---------------- collection ----------------
+
+class CollectionView(discord.ui.View):
+
+    PER_PAGE = 15
+
+    def __init__(self, guild, viewer_id: int, owner):
+        super().__init__(timeout=900)
+        self.guild, self.viewer_id, self.owner = guild, viewer_id, owner
+        self.page = 0
+        self.confirm = False
+        self.build()
+
+    def groups(self):
+        groups = {}
+        for row in owned_cards(self.guild.id, self.owner.id, include_held=True):
+            groups.setdefault((row["fighter_id"], row["tier"]), []).append(row)
+        out = list(groups.values())
+        out.sort(key=lambda rows: (-CARD_TIERS.index(rows[0]["tier"]), -card_info(rows[-1])["ovr"], card_info(rows[-1])["name"].lower()))
+        return out
+
+    def pages(self):
+        return max(1, (len(self.groups()) + self.PER_PAGE - 1) // self.PER_PAGE)
+
+    def embed(self, note=None):
+        groups = self.groups()
+        have, total = collection_progress(self.guild, self.owner.id)
+        lines = []
+        for rows in groups[self.page * self.PER_PAGE:(self.page + 1) * self.PER_PAGE]:
+            info = card_info(rows[-1])
+            held = sum(1 for r in rows if r["status"] == "held")
+            lines.append(f"{CARD_TIER_ICONS[rows[0]['tier']]} {info['name']} · {info['ovr']}"
+                         + (f" **×{len(rows)}**" if len(rows) > 1 else "") + (" · 🔒 in a trade" if held else ""))
+        if not lines:
+            lines = ["No cards yet. Packs are in `/shop` → Cards."]
+        spares = spare_cards(self.guild.id, self.owner.id)
+        worth = sum(CARD_SELL[r["tier"]] for r in spares)
+        embed = discord.Embed(title=f"🃏 {clean_card_name(self.owner.display_name)}'s collection · {have} / {total}",
+                              description=((note + "\n\n") if note else "") + "\n".join(lines), color=PFO_GOLD)
+        embed.set_author(name="PFO • MY CARDS", icon_url=asset_url(LOGO_FILE))
+        embed.set_footer(text=f"Page {self.page + 1} of {self.pages()}" + (f" · {len(spares)} spare card{'s' if len(spares) != 1 else ''} worth {worth:,} coins" if spares else ""))
+        return embed
+
+    def build(self):
+        self.clear_items()
+        mine = self.viewer_id == self.owner.id
+        spares = spare_cards(self.guild.id, self.owner.id) if mine else []
+        if mine and spares:
+            worth = sum(CARD_SELL[r["tier"]] for r in spares)
+            if self.confirm:
+                yes = discord.ui.Button(label=f"Yes, sell {len(spares)} for {worth:,}", style=discord.ButtonStyle.red)
+                yes.callback = self.sell
+                no = discord.ui.Button(label="No", style=discord.ButtonStyle.grey)
+                no.callback = self.cancel_sell
+                self.add_item(yes)
+                self.add_item(no)
+            else:
+                sell = discord.ui.Button(label=f"Sell spares (+{worth:,})", style=discord.ButtonStyle.grey)
+                sell.callback = self.ask_sell
+                self.add_item(sell)
+        if self.pages() > 1:
+            prev = discord.ui.Button(label="◀", style=discord.ButtonStyle.grey, disabled=self.page == 0)
+            prev.callback = self.prev
+            nxt = discord.ui.Button(label="▶", style=discord.ButtonStyle.grey, disabled=self.page >= self.pages() - 1)
+            nxt.callback = self.next
+            self.add_item(prev)
+            self.add_item(nxt)
+
+    async def interaction_check(self, interaction):
+        return interaction.user.id == self.viewer_id
+
+    async def ask_sell(self, interaction):
+        self.confirm = True
+        self.build()
+        await interaction.response.edit_message(embed=self.embed("Sell every spare copy? You keep one of each card."), view=self)
+
+    async def cancel_sell(self, interaction):
+        self.confirm = False
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def sell(self, interaction):
+        total = sell_cards(self.guild.id, self.owner.id, spare_cards(self.guild.id, self.owner.id))
+        self.confirm = False
+        self.page = min(self.page, self.pages() - 1)
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(f"💰 Sold your spares for {COIN} **{coins_text(total)}**."), view=self)
+
+    async def prev(self, interaction):
+        self.page = max(0, self.page - 1)
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def next(self, interaction):
+        self.page = min(self.pages() - 1, self.page + 1)
+        self.build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
+@bot.tree.command(name="collection", description="Your fighter cards (or someone else's). Sell spares from here.")
+@app_commands.describe(member="See someone else's cards")
+async def collection_command(interaction: discord.Interaction, member: discord.Member = None):
+    owner = member or interaction.user
+    view = CollectionView(interaction.guild, interaction.user.id, owner)
+    await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+
+
+# ---------------- trading ----------------
+
+def get_trade(trade_id: int):
+    rows = discipline_query("SELECT * FROM card_trades WHERE id = ?", (trade_id,))
+    return rows[0] if rows else None
+
+
+def trade_card_rows(ids):
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    return discipline_query(f"SELECT * FROM card_pulls WHERE id IN ({marks}) ORDER BY id", tuple(ids))
+
+
+def release_trade(trade, status: str, by: int = None):
+    """Hand held cards and coins back and close the trade."""
+    if trade["status"] != "open":
+        return False
+    discipline_query("UPDATE card_pulls SET status = 'owned', trade_id = NULL WHERE trade_id = ? AND status = 'held'",
+                     (trade["id"],), write=True)
+    if trade["give_coins"]:
+        add_coins(trade["guild_id"], trade["from_id"], trade["give_coins"], f"trade_return:{trade['id']}")
+    discipline_query("UPDATE card_trades SET status = ?, closed_at = ?, closed_by = ? WHERE id = ?",
+                     (status, int(time.time()), by, trade["id"]), write=True)
+    return True
+
+
+def create_trade(guild_id: int, from_id: int, to_id: int, give_ids, want_ids, give_coins: int, want_coins: int):
+    """Returns (trade_id, None) or (None, error)."""
+    give_ids, want_ids = list(dict.fromkeys(give_ids)), list(dict.fromkeys(want_ids))
+    if from_id == to_id:
+        return None, "❌ You can't trade with yourself."
+    if not give_ids and not want_ids:
+        return None, "❌ Put at least one card in the trade."
+    if len(give_ids) > TRADE_MAX_CARDS or len(want_ids) > TRADE_MAX_CARDS:
+        return None, f"❌ Up to {TRADE_MAX_CARDS} cards a side."
+    if give_coins < 0 or want_coins < 0:
+        return None, "❌ Coins can't be negative."
+    give = trade_card_rows(give_ids)
+    want = trade_card_rows(want_ids)
+    if len(give) != len(give_ids) or any(r["owner_id"] != from_id or r["status"] != "owned" or r["guild_id"] != guild_id for r in give):
+        return None, "❌ One of your cards isn't free to trade (sold, or already in a trade)."
+    if len(want) != len(want_ids) or any(r["owner_id"] != to_id or r["status"] != "owned" or r["guild_id"] != guild_id for r in want):
+        return None, "❌ They don't have one of those cards free to trade any more."
+    if give_coins and get_wallet(guild_id, from_id)["balance"] < give_coins:
+        return None, f"❌ You don't have {COIN} {coins_text(give_coins)}."
+    # A new offer between the same two people replaces the old one (that's a counter offer)
+    for old in discipline_query("SELECT * FROM card_trades WHERE guild_id = ? AND status = 'open' AND "
+                                "((from_id = ? AND to_id = ?) OR (from_id = ? AND to_id = ?))",
+                                (guild_id, from_id, to_id, to_id, from_id)):
+        release_trade(old, "countered", from_id)
+    give = trade_card_rows(give_ids)
+    if any(r["status"] != "owned" for r in give):
+        return None, "❌ One of your cards isn't free to trade."
+    trade_id = discipline_query(
+        "INSERT INTO card_trades (guild_id, from_id, to_id, give_cards, want_cards, give_coins, want_coins, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (guild_id, from_id, to_id, json.dumps(give_ids), json.dumps(want_ids), give_coins, want_coins, int(time.time())), write=True)
+    for cid in give_ids:
+        discipline_query("UPDATE card_pulls SET status = 'held', trade_id = ? WHERE id = ?", (trade_id, cid), write=True)
+    if give_coins:
+        add_coins(guild_id, from_id, -give_coins, f"trade_hold:{trade_id}")
+    return trade_id, None
+
+
+def complete_trade(trade, accepter_id: int):
+    """The other person accepted. Returns None or an error."""
+    if trade["status"] != "open":
+        return "This trade is closed."
+    if time.time() - trade["created_at"] > TRADE_HOURS * 3600:
+        release_trade(trade, "expired")
+        return "This trade ran out."
+    give_ids, want_ids = json.loads(trade["give_cards"]), json.loads(trade["want_cards"])
+    want = trade_card_rows(want_ids)
+    if len(want) != len(want_ids) or any(r["owner_id"] != trade["to_id"] or r["status"] != "owned" for r in want):
+        return "❌ You don't have all the cards they asked for any more."
+    if trade["want_coins"] and get_wallet(trade["guild_id"], trade["to_id"])["balance"] < trade["want_coins"]:
+        return f"❌ You need {COIN} {coins_text(trade['want_coins'])} for this trade."
+    give = trade_card_rows(give_ids)
+    if any(r["status"] != "held" or r["trade_id"] != trade["id"] for r in give):
+        release_trade(trade, "cancelled")
+        return "❌ Their cards aren't available any more, so the trade is off."
+    for cid in give_ids:
+        discipline_query("UPDATE card_pulls SET owner_id = ?, status = 'owned', trade_id = NULL WHERE id = ?", (trade["to_id"], cid), write=True)
+    for cid in want_ids:
+        discipline_query("UPDATE card_pulls SET owner_id = ?, status = 'owned', trade_id = NULL WHERE id = ?", (trade["from_id"], cid), write=True)
+    if trade["give_coins"]:
+        add_coins(trade["guild_id"], trade["to_id"], trade["give_coins"], f"trade:{trade['id']}")
+    if trade["want_coins"]:
+        add_coins(trade["guild_id"], trade["to_id"], -trade["want_coins"], f"trade:{trade['id']}")
+        add_coins(trade["guild_id"], trade["from_id"], trade["want_coins"], f"trade:{trade['id']}")
+    discipline_query("UPDATE card_trades SET status = 'done', closed_at = ?, closed_by = ? WHERE id = ?",
+                     (int(time.time()), accepter_id, trade["id"]), write=True)
+    return None
+
+
+def trade_side_text(rows, coins):
+    bits = [card_label(r) for r in rows]
+    if coins:
+        bits.append(f"{COIN} {coins_text(coins)}")
+    return "\n".join(bits) or "Nothing"
+
+
+def trade_embed(trade, note=None):
+    give = trade_card_rows(json.loads(trade["give_cards"]))
+    want = trade_card_rows(json.loads(trade["want_cards"]))
+    status = {
+        "open": f"Expires <t:{trade['created_at'] + TRADE_HOURS * 3600}:R> · waiting for <@{trade['to_id']}>",
+        "done": "✅ Trade done",
+        "declined": "❌ Declined",
+        "withdrawn": "↩️ Withdrawn",
+        "expired": "⌛ Ran out",
+        "countered": "🔁 Replaced by a counter offer",
+        "cancelled": "🛑 Cancelled",
+    }.get(trade["status"], trade["status"])
+    embed = discord.Embed(title="🔁 Card trade", description=((note + "\n\n") if note else "") + status,
+                          color=PFO_GOLD if trade["status"] == "open" else 0x4E5058)
+    embed.set_author(name="PFO • CARD TRADE", icon_url=asset_url(LOGO_FILE))
+    embed.add_field(name="Gives", value=f"<@{trade['from_id']}>\n" + trade_side_text(give, trade["give_coins"]), inline=True)
+    embed.add_field(name="For", value=f"<@{trade['to_id']}>\n" + trade_side_text(want, trade["want_coins"]), inline=True)
+    embed.set_footer(text="Counter offer: use /trade with them. It replaces this one.")
+    return embed
+
+
+async def trade_log(guild, text):
+    try:
+        await post_staff_log(guild, staff_log_embed("🔁 Card trade", [text]))
+    except Exception:
+        pass
+
+
+class TradeView(discord.ui.View):
+    """Accept / Decline on a trade post. Works after restarts."""
+
+    def __init__(self, trade_id: int):
+        super().__init__(timeout=None)
+        self.trade_id = trade_id
+        accept = discord.ui.Button(label="Accept", style=discord.ButtonStyle.green, custom_id=f"pfo_trade_{trade_id}_yes")
+        accept.callback = self.accept
+        counter = discord.ui.Button(label="Counter offer", style=discord.ButtonStyle.grey, custom_id=f"pfo_trade_{trade_id}_counter")
+        counter.callback = self.counter
+        decline = discord.ui.Button(label="Decline", style=discord.ButtonStyle.red, custom_id=f"pfo_trade_{trade_id}_no")
+        decline.callback = self.decline
+        for item in (accept, counter, decline):
+            self.add_item(item)
+
+    async def accept(self, interaction):
+        trade = get_trade(self.trade_id)
+        if not trade or interaction.user.id != trade["to_id"]:
+            await interaction.response.send_message("❌ Only the person this trade is for can accept it.", ephemeral=True)
+            return
+        error = complete_trade(trade, interaction.user.id)
+        trade = get_trade(self.trade_id)
+        if error and trade["status"] == "open":
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=trade_embed(trade, error), view=None, allowed_mentions=discord.AllowedMentions.none())
+        if not error:
+            await trade_log(interaction.guild, f"<@{trade['from_id']}> and <@{trade['to_id']}> traded "
+                                               f"({len(json.loads(trade['give_cards']))} for {len(json.loads(trade['want_cards']))} cards).")
+
+    async def counter(self, interaction):
+        trade = get_trade(self.trade_id)
+        if not trade or interaction.user.id not in (trade["to_id"], trade["from_id"]):
+            await interaction.response.send_message("❌ This trade isn't yours.", ephemeral=True)
+            return
+        other = trade["from_id"] if interaction.user.id == trade["to_id"] else trade["to_id"]
+        await interaction.response.send_message(
+            f"Use `/trade` with <@{other}> and pick the cards you want instead. Your new offer replaces this one.", ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none())
+
+    async def decline(self, interaction):
+        trade = get_trade(self.trade_id)
+        if not trade:
+            await interaction.response.send_message("❌ That trade is gone.", ephemeral=True)
+            return
+        staff = is_staff(interaction)
+        if interaction.user.id not in (trade["to_id"], trade["from_id"]) and not staff:
+            await interaction.response.send_message("❌ This trade isn't yours.", ephemeral=True)
+            return
+        status = "withdrawn" if interaction.user.id == trade["from_id"] else "declined" if interaction.user.id == trade["to_id"] else "cancelled"
+        release_trade(trade, status, interaction.user.id)
+        await interaction.response.edit_message(embed=trade_embed(get_trade(self.trade_id)), view=None,
+                                                allowed_mentions=discord.AllowedMentions.none())
+        if status == "cancelled":
+            await trade_log(interaction.guild, f"{interaction.user.mention} cancelled a trade between <@{trade['from_id']}> and <@{trade['to_id']}>.")
+
+
+def restore_trade_buttons():
+    try:
+        for row in discipline_query("SELECT id FROM card_trades WHERE status = 'open'"):
+            bot.add_view(TradeView(row["id"]))
+    except Exception as error:
+        print(f"Could not restore trade buttons: {error}")
+
+
+async def expire_trades():
+    for trade in discipline_query("SELECT * FROM card_trades WHERE status = 'open' AND created_at < ?",
+                                  (int(time.time()) - TRADE_HOURS * 3600,)):
+        release_trade(trade, "expired")
+        try:
+            channel = bot.get_channel(trade["channel_id"]) if trade["channel_id"] else None
+            if channel and trade["message_id"]:
+                message = await channel.fetch_message(trade["message_id"])
+                await message.edit(embed=trade_embed(get_trade(trade["id"])), view=None)
+        except Exception:
+            pass
+
+
+async def my_card_autocomplete(interaction: discord.Interaction, current: str):
+    out = []
+    for row in reversed(owned_cards(interaction.guild.id, interaction.user.id)):
+        label = card_label(row)
+        if current.lower() in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=str(row["id"])))
+    return out[:25]
+
+
+async def their_card_autocomplete(interaction: discord.Interaction, current: str):
+    person = getattr(interaction.namespace, "person", None)
+    person_id = getattr(person, "id", None)
+    if not person_id:
+        return [app_commands.Choice(name="Pick who you're trading with first", value="0")]
+    out = []
+    for row in reversed(owned_cards(interaction.guild.id, person_id)):
+        label = card_label(row)
+        if current.lower() in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=str(row["id"])))
+    return out[:25] or [app_commands.Choice(name="They have no cards free to trade", value="0")]
+
+
+@bot.tree.command(name="trade", description="Offer a card trade (up to 3 cards a side, plus coins).")
+@app_commands.describe(person="Who you're trading with", give="Your card", give2="Another of your cards", give3="Another of your cards",
+                       get="Their card", get2="Another of their cards", get3="Another of their cards",
+                       add_coins="Coins you add to your side", ask_coins="Coins you ask them to add")
+@app_commands.autocomplete(give=my_card_autocomplete, give2=my_card_autocomplete, give3=my_card_autocomplete,
+                           get=their_card_autocomplete, get2=their_card_autocomplete, get3=their_card_autocomplete)
+async def trade_command(interaction: discord.Interaction, person: discord.Member, give: str = None, give2: str = None, give3: str = None,
+                        get: str = None, get2: str = None, get3: str = None,
+                        add_coins: app_commands.Range[int, 0, 100000] = 0, ask_coins: app_commands.Range[int, 0, 100000] = 0):
+    if person.bot:
+        await interaction.response.send_message("❌ You can't trade with a bot.", ephemeral=True)
+        return
+    give_ids = [int(x) for x in (give, give2, give3) if x and str(x).isdigit() and int(x)]
+    want_ids = [int(x) for x in (get, get2, get3) if x and str(x).isdigit() and int(x)]
+    trade_id, error = create_trade(interaction.guild.id, interaction.user.id, person.id, give_ids, want_ids, add_coins or 0, ask_coins or 0)
+    if error:
+        await interaction.response.send_message(error, ephemeral=True)
+        return
+    trade = get_trade(trade_id)
+    view = TradeView(trade_id)
+    await interaction.response.send_message(content=f"🔁 {person.mention}, **{clean_card_name(interaction.user.display_name)}** wants to trade with you.",
+                                            embed=trade_embed(trade), view=view, allowed_mentions=discord.AllowedMentions(users=[person]))
+    try:
+        message = await interaction.original_response()
+        discipline_query("UPDATE card_trades SET channel_id = ?, message_id = ? WHERE id = ?",
+                         (message.channel.id, message.id, trade_id), write=True)
+    except Exception:
+        pass
+    await trade_log(interaction.guild, f"<@{interaction.user.id}> offered <@{person.id}> a trade (#{trade_id}).")
+
+
+async def post_web_trade(guild, trade_id: int):
+    """A trade made on the website gets posted in the shop channel, like /trade."""
+    trade = get_trade(trade_id)
+    channel = None
+    try:
+        channel = find_shop_channel(guild)
+    except Exception:
+        channel = None
+    channel = channel or find_rankings_update_channel(guild)
+    if not channel:
+        return False
+    try:
+        message = await channel.send(content=f"🔁 <@{trade['to_id']}>, <@{trade['from_id']}> sent you a trade from the website.",
+                                     embed=trade_embed(trade), view=TradeView(trade_id),
+                                     allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=trade["to_id"])]))
+        discipline_query("UPDATE card_trades SET channel_id = ?, message_id = ? WHERE id = ?", (channel.id, message.id, trade_id), write=True)
+        return True
+    except Exception as error:
+        print(f"Web trade post failed: {error}")
+        return False
+
+
+async def refresh_trade_post(trade_id: int):
+    trade = get_trade(trade_id)
+    try:
+        channel = bot.get_channel(trade["channel_id"]) if trade and trade["channel_id"] else None
+        if channel and trade["message_id"]:
+            message = await channel.fetch_message(trade["message_id"])
+            await message.edit(embed=trade_embed(trade), view=TradeView(trade_id) if trade["status"] == "open" else None)
+    except Exception:
+        pass
+
+
+# ============================================================
+# VOD REPLAYS
+#
+# /vodset link event    staff: the Twitch replay for an event
+# /vodclear [event]     staff: take one down
+# /vod [event]          anyone: the replay link
+# The website plays the newest replay muted on a loop (home page
+# and the Live page while offline) and on its event page. With the
+# Twitch app set up (TWITCH_CLIENT_ID / SECRET), replays Twitch has
+# deleted are hidden and pfo-bot is told.
+# ============================================================
+
+VOD_PATTERN = re.compile(r"twitch\.tv/(?:videos/(\d+)|[^/\s]+/clip/([A-Za-z0-9_-]+)|[^/\s]+/v/(\d+))|clips\.twitch\.tv/([A-Za-z0-9_-]+)", re.I)
+
+
+def setup_vod_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS vods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            url TEXT NOT NULL,
+            video_id TEXT,
+            clip_id TEXT,
+            set_by INTEGER,
+            set_at INTEGER NOT NULL,
+            hidden INTEGER NOT NULL DEFAULT 0,
+            checked_at INTEGER
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def parse_vod(link: str):
+    """(video_id, clip_id) or (None, None)."""
+    match = VOD_PATTERN.search(link or "")
+    if not match:
+        return None, None
+    video = match.group(1) or match.group(3)
+    clip = match.group(2) or match.group(4)
+    return video, clip
+
+
+def latest_vod(guild_id: int, event: str = None):
+    rows = discipline_query("SELECT * FROM vods WHERE guild_id = ? AND hidden = 0 ORDER BY set_at DESC, id DESC", (guild_id,))
+    if event:
+        key = event_key(event)
+        rows = [r for r in rows if event_key(r["event"]) == key]
+    return rows[0] if rows else None
+
+
+def vod_for_event(guild_id: int, event: str):
+    return latest_vod(guild_id, event) if event else None
+
+
+async def vod_event_autocomplete(interaction: discord.Interaction, current: str):
+    names = []
+    for name in recent_events(interaction.guild.id)[:20]:
+        names.append(name)
+    for notice in discipline_query("SELECT event FROM card_notices WHERE guild_id = ? AND event IS NOT NULL ORDER BY id DESC LIMIT 10",
+                                   (interaction.guild.id,)):
+        if event_key(notice["event"]) not in {event_key(n) for n in names}:
+            names.append(notice["event"])
+    return [app_commands.Choice(name=n[:100], value=n[:100]) for n in names if current.lower() in n.lower()][:25]
+
+
+async def vod_saved_autocomplete(interaction: discord.Interaction, current: str):
+    rows = discipline_query("SELECT DISTINCT event FROM vods WHERE guild_id = ? AND hidden = 0 ORDER BY set_at DESC", (interaction.guild.id,))
+    return [app_commands.Choice(name=r["event"][:100], value=r["event"][:100]) for r in rows if current.lower() in r["event"].lower()][:25]
+
+
+@bot.tree.command(name="vodset", description="Staff: add the Twitch replay for an event. It plays on the website.")
+@app_commands.describe(link="Twitch video or highlight link, e.g. twitch.tv/videos/123456789", event="Which event it's from")
+@app_commands.autocomplete(event=vod_event_autocomplete)
+async def vodset(interaction: discord.Interaction, link: str, event: str):
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can add replays.", ephemeral=True)
+        return
+    video, clip = parse_vod(link)
+    if not (video or clip):
+        await interaction.response.send_message("❌ That isn't a Twitch video link. It should look like `twitch.tv/videos/123456789`.", ephemeral=True)
+        return
+    event = " ".join(event.split())[:100]
+    discipline_query("UPDATE vods SET hidden = 1 WHERE guild_id = ? AND hidden = 0 AND LOWER(event) = LOWER(?)", (interaction.guild.id, event), write=True)
+    discipline_query("INSERT INTO vods (guild_id, event, url, video_id, clip_id, set_by, set_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                     (interaction.guild.id, event, link.strip()[:300], video, clip, interaction.user.id, int(time.time())), write=True)
+    tip = "" if clip else "\n-# Twitch deletes past broadcasts after a while. Save it as a Highlight on Twitch to keep it."
+    site = f" It's on the website now: {BOT_SITE_URL}" if BOT_SITE_URL else " It's on the website now."
+    await interaction.response.send_message(f"📺 Replay saved for **{event}**.{site}{tip}", ephemeral=True)
+    try:
+        await post_staff_log(interaction.guild, staff_log_embed("📺 Replay", [f"{interaction.user.mention} added the replay for **{event}**."]))
+    except Exception:
+        pass
+
+
+@bot.tree.command(name="vodclear", description="Staff: take a replay off the website.")
+@app_commands.describe(event="Which event (the newest replay if empty)")
+@app_commands.autocomplete(event=vod_saved_autocomplete)
+async def vodclear(interaction: discord.Interaction, event: str = None):
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can remove replays.", ephemeral=True)
+        return
+    vod = latest_vod(interaction.guild.id, event)
+    if not vod:
+        await interaction.response.send_message("❌ No replay to remove.", ephemeral=True)
+        return
+    discipline_query("UPDATE vods SET hidden = 1 WHERE id = ?", (vod["id"],), write=True)
+    await interaction.response.send_message(f"🗑️ Took the **{vod['event']}** replay off the website.", ephemeral=True)
+
+
+@bot.tree.command(name="vod", description="Watch the replay of the last event (or pick one).")
+@app_commands.describe(event="Which event")
+@app_commands.autocomplete(event=vod_saved_autocomplete)
+async def vod_command(interaction: discord.Interaction, event: str = None):
+    vod = latest_vod(interaction.guild.id, event)
+    if not vod:
+        await interaction.response.send_message("No replay has been added yet." if not event else f"No replay for **{event}** yet.", ephemeral=True)
+        return
+    view = discord.ui.View()
+    view.add_item(discord.ui.Button(label="Watch on Twitch", emoji="📺", url=vod["url"] if vod["url"].startswith("http") else f"https://{vod['url']}"))
+    if BOT_SITE_URL:
+        view.add_item(discord.ui.Button(label="Watch on the website", emoji="🥊", url=f"{BOT_SITE_URL}/event/{urllib.parse.quote(vod['event'])}"))
+    await interaction.response.send_message(f"📺 **{vod['event']}** replay", view=view, ephemeral=True)
+
+
+async def check_vods():
+    """Hourly: hide replays Twitch has deleted."""
+    if not (TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET):
+        return
+    rows = discipline_query("SELECT * FROM vods WHERE hidden = 0 AND (checked_at IS NULL OR checked_at < ?)", (int(time.time()) - 3600,))
+    if not rows:
+        return
+    import aiohttp
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http:
+        if not _twitch["token"] or time.time() > _twitch["expires"]:
+            async with http.post("https://id.twitch.tv/oauth2/token", params={
+                "client_id": TWITCH_CLIENT_ID, "client_secret": TWITCH_CLIENT_SECRET, "grant_type": "client_credentials"}) as r:
+                data = await r.json()
+            _twitch["token"] = data.get("access_token")
+            _twitch["expires"] = time.time() + int(data.get("expires_in", 3600)) - 60
+        headers = {"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {_twitch['token']}"}
+        for vod in rows:
+            if vod["video_id"]:
+                url, params = "https://api.twitch.tv/helix/videos", {"id": vod["video_id"]}
+            else:
+                url, params = "https://api.twitch.tv/helix/clips", {"id": vod["clip_id"]}
+            async with http.get(url, params=params, headers=headers) as r:
+                status = r.status
+                data = await r.json() if r.status in (200, 404) else {}
+            gone = status == 404 or (status == 200 and not data.get("data"))
+            discipline_query("UPDATE vods SET checked_at = ?, hidden = ? WHERE id = ?", (int(time.time()), 1 if gone else 0, vod["id"]), write=True)
+            if gone:
+                guild = bot.get_guild(vod["guild_id"])
+                if guild:
+                    try:
+                        await post_staff_log(guild, staff_log_embed("📺 Replay gone", [
+                            f"Twitch has deleted the **{vod['event']}** replay, so it's off the website. "
+                            "Add a Highlight link with `/vodset` to bring it back."]))
+                    except Exception:
+                        pass
 
 
 setup_database()
