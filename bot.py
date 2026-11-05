@@ -30548,6 +30548,20 @@ CARD_COLOURS = {
 }
 CARD_SELL = {"prospect": 50, "ranked": 100, "contender": 250, "champion": 500, "double": 1000}
 PACKS_PER_DAY = int(os.getenv("PACKS_PER_DAY", "5") or 5)
+# Where "Show off in chat" and website trades post (channel name or ID)
+CARDS_CHANNEL = os.getenv("CARDS_CHANNEL", "bot-commands").strip()
+
+
+def find_cards_channel(guild):
+    if not CARDS_CHANNEL:
+        return None
+    if CARDS_CHANNEL.isdigit():
+        return guild.get_channel(int(CARDS_CHANNEL))
+    wanted = role_key(CARDS_CHANNEL)
+    for channel in getattr(guild, "text_channels", []):
+        if role_key(channel.name) == wanted:
+            return channel
+    return None
 PACK_ITEMS = {"pack_common": "common", "pack_rare": "rare", "pack_champ": "champ"}
 PACK_NAMES = {"common": "Common Pack", "rare": "Rare Pack", "champ": "Champ Pack"}
 COMMON_ODDS = [("prospect", 55), ("ranked", 35), ("contender", 8.5), ("champion", 1.5)]
@@ -31220,10 +31234,13 @@ class PackResultView(discord.ui.View):
         embed = pack_embed(self.guild, self.user_id, self.pack_id)
         embed.title = f"🃏 {clean_card_name(interaction.user.display_name)} opened a {PACK_NAMES[discipline_query('SELECT pack FROM card_packs WHERE id = ?', (self.pack_id,))[0]['pack']]}"
         embed.set_footer(text="Get packs in /shop")
+        channel = find_cards_channel(self.guild) or interaction.channel
         try:
-            await interaction.channel.send(embed=embed, file=file)
+            await channel.send(embed=embed, file=file)
+            if channel != interaction.channel:
+                await interaction.followup.send(f"✅ Posted in {channel.mention}.", ephemeral=True)
         except Exception as error:
-            await interaction.followup.send(f"❌ Couldn't post here: {error}", ephemeral=True)
+            await interaction.followup.send(f"❌ Couldn't post it: {error}", ephemeral=True)
 
 
 async def send_pack_result(interaction, pack_id: int):
@@ -31607,11 +31624,12 @@ async def trade_command(interaction: discord.Interaction, person: discord.Member
 async def post_web_trade(guild, trade_id: int):
     """A trade made on the website gets posted in the shop channel, like /trade."""
     trade = get_trade(trade_id)
-    channel = None
-    try:
-        channel = find_shop_channel(guild)
-    except Exception:
-        channel = None
+    channel = find_cards_channel(guild)
+    if not channel:
+        try:
+            channel = find_shop_channel(guild)
+        except Exception:
+            channel = None
     channel = channel or find_rankings_update_channel(guild)
     if not channel:
         return False
