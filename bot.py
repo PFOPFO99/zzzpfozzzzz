@@ -30851,15 +30851,25 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     ratings = ratings if ratings is not None else card_rating_table(guild.id)
     entry = ratings.get(fighter_key(user_id, None)) if ratings else None
     rating = entry["rating"] if entry else RATING_START
-    raw_ovr = 70 + (rating - RATING_START) / 8
+    # Where their Elo sits in the league: 0 = lowest, 1 = highest. The spread
+    # of ratings is small, so this ranks fighters against each other instead
+    # of using the raw number.
+    league = sorted(e["rating"] for e in (ratings or {}).values() if e.get("fights"))
+    if league:
+        below = sum(1 for r in league if r < rating)
+        same = sum(1 for r in league if r == rating)
+        elo_place = (below + max(same - 1, 0) / 2) / max(len(league) - 1, 1)
+    else:
+        elo_place = 0.5
     run = stats["streak"] or ""
     length = int(run[1:]) if run[1:].isdigit() else 0
+    form = 0.0
     if run.startswith("W"):
-        raw_ovr += min(length, 4) if length < 5 else min(12, 6 + 1.5 * (length - 5))
+        form = 0.025 * min(length, 4) if length < 5 else min(0.2, 0.12 + 0.02 * (length - 5))
     elif run.startswith("L"):
-        raw_ovr -= min(6, 1.5 * length)
-    if fights < 5 and not champ_of and not goat:
-        raw_ovr = min(raw_ovr, 70 + 3 * fights)
+        form = -min(0.16, 0.04 * length)
+    score = max(0.0, min(1.0, 0.8 * elo_place + form))
+    new_fighter = fights < 5 and not champ_of and not goat
 
     if goat:
         tier = "goat"
@@ -30869,9 +30879,9 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
         tier = "champion"
     elif former:
         tier = "former"
-    elif raw_ovr >= 85 or (ranked and ranked[0]["rank"] <= 5):
+    elif (elo_place >= 0.85 and not new_fighter) or (ranked and ranked[0]["rank"] <= 5):
         tier = "contender"
-    elif ranked or raw_ovr >= 75:
+    elif ranked or (elo_place >= 0.5 and not new_fighter):
         tier = "ranked"
     else:
         tier = "prospect"
@@ -30957,8 +30967,7 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     sub = 30 + sub_share * 69
     finish = 30 + 0.69 * (stats["finish_rate"] or 0)
 
-    # ---- overall: skill rating (Elo) + streak, kept inside the tier's band ----
-    ovr = raw_ovr
+    # ---- overall: the tier sets the range, Elo (+ streak) sets where in it ----
     best_rank = ranked[0]["rank"] if ranked else None
     if tier == "goat":
         low, high = 99, 99
@@ -30969,12 +30978,14 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     elif tier == "former":
         low, high = 87, 89
     elif tier == "contender":
-        # #1 can't go below 80, #5 below 76; promoted on rating alone: 85+
-        low, high = (80 - (best_rank - 1)) if best_rank and best_rank <= 5 else 85, 89
+        low, high = 78, 89
     elif tier == "ranked":
-        low, high = (max(68, 74 - (best_rank - 6)) if best_rank else 75), 84   # #6 can't go below 74
+        low, high = 70, 84
     else:
         low, high = 58, 79
+    ovr = low + (high - low) * score
+    if new_fighter:
+        ovr = min(ovr, max(low, 70 + 3 * fights))
     ovr = round(max(low, min(high, ovr)))
 
     streak = stats["streak"] or ""

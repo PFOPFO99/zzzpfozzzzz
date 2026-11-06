@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "23"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "24"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -1631,10 +1631,15 @@ def render_fighter(ctx, user_id):
     like_html = fights_like_block(ctx, user_id, stats) if member else ""
     has_card = bool(member) and bool(getattr(ctx, "card_eligible", lambda m: bool(fights))(member))
     card_html = ""
+    card_info_now = None
     if has_card:
+        try:
+            card_info_now = ctx.fighter_card_data(ctx.guild, user_id, member)
+        except Exception:
+            card_info_now = None
         card_html = f"""
   <section class="block fcardsec" aria-label="Fighter card">
-    <div class="fcard-in">{fighter_card_img(user_id, name, "cardimg cardimg-lg", lazy=True)}
+    <div class="fcard-in">{fighter_card_img(user_id, name, "cardimg cardimg-lg", lazy=True, info=card_info_now)}
       <div class="fcard-t"><span class="eyebrow">FIGHTER CARD</span><h2 class="d h-m">{esc(name.upper())}</h2>
         <p class="muted">The tier and numbers update as they fight. Pull their card from packs in the shop.</p>
         <div class="btns"><a class="btn btn-gold btn-sm" href="/cardimg/fighter/{user_id}.png?download=1" download="{esc(re.sub(r'[^A-Za-z0-9]+', '-', name).strip('-').lower() or 'pfo')}-card.png">DOWNLOAD</a>
@@ -7360,8 +7365,16 @@ def card_bust():
     return int(time.time() // 600)
 
 
-def fighter_card_img(user_id, name="", cls="cardimg", lazy=True):
-    return (f'<img class="{cls}" src="/cardimg/fighter/{user_id}.png?v={card_bust()}" width="500" height="700" '
+def card_version(info):
+    """Changes whenever anything on the card changes, so browsers never show an old copy."""
+    if not info:
+        return str(card_bust())
+    raw = json.dumps({k: v for k, v in info.items() if k != "made"}, sort_keys=True, default=str) + SITE_VERSION
+    return hashlib.sha1(raw.encode()).hexdigest()[:10]
+
+
+def fighter_card_img(user_id, name="", cls="cardimg", lazy=True, info=None):
+    return (f'<img class="{cls}" src="/cardimg/fighter/{user_id}.png?v={card_version(info)}" width="500" height="700" '
             f'alt="{esc(name)} fighter card"{" loading=lazy" if lazy else ""}>')
 
 
@@ -7421,7 +7434,7 @@ def render_cards(ctx):
     tiles = ""
     for i, info in enumerate(order):
         tiles += (f'<a class="cardtile {stagger(i, 4)}" href="{fighter_url(info["user_id"])}#card" data-tier="{info["tier"]}">'
-                  f'{fighter_card_img(info["user_id"], info["name"])}</a>')
+                  f'{fighter_card_img(info["user_id"], info["name"], info=info)}</a>')
     counts = "".join(chip(CARD_TIER_TEXT[t], len(tiers.get(t, [])), "gold" if t in ("goat", "double", "champion") else "")
                      for t in CARD_TIER_ORDER if tiers.get(t))
     filters = '<div class="cardfilter" data-cardfilter><button type="button" class="on" data-ct="">ALL</button>' + "".join(
@@ -7656,7 +7669,7 @@ def add_page_routes(app, bot, g, serve, html_response):
         gd = guild()
         if gd is None:
             raise web.HTTPServiceUnavailable()
-        key = (kind, int(raw))
+        key = (kind, int(raw), request.query.get("v", ""))
         hit = _card_png.get(key)
         if hit and time.time() - hit[0] < 600:
             data = hit[1]
