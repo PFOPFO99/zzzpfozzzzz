@@ -5048,7 +5048,7 @@ CARDS_CSS = r"""
 .trade-sides>div{display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start}
 .trade-sides .num-l{width:100%}
 .tr-card{border:1px solid var(--line);border-radius:6px;padding:5px 9px;font-size:13px}
-.tr-card.tier-champion,.tr-card.tier-double,.tr-card.tier-goat{border-color:var(--gold)}
+.tr-card.tier-champion,.tr-card.tier-double,.tr-card.tier-goat,.tr-card.tier-former{border-color:var(--gold)}
 .tradeform{display:grid;gap:10px;max-width:760px}
 .tr-in{background:#0A0A0D;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:10px 12px;font:14px Inter,sans-serif;width:100%;box-sizing:border-box}
 .tr-cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
@@ -7351,8 +7351,8 @@ def render_staff_public(ctx):
 # Fighter cards  /cards, /me/cards and the card images
 # ------------------------------------------------------------
 
-CARD_TIER_ORDER = ["goat", "double", "champion", "contender", "ranked", "prospect"]
-CARD_TIER_TEXT = {"goat": "GOAT", "double": "DOUBLE CHAMP", "champion": "CHAMPION", "contender": "CONTENDER", "ranked": "RANKED", "prospect": "PROSPECT"}
+CARD_TIER_ORDER = ["goat", "double", "champion", "former", "contender", "ranked", "prospect"]
+CARD_TIER_TEXT = {"goat": "GOAT", "former": "FORMER CHAMP", "double": "DOUBLE CHAMP", "champion": "CHAMPION", "contender": "CONTENDER", "ranked": "RANKED", "prospect": "PROSPECT"}
 
 
 def card_bust():
@@ -7435,7 +7435,7 @@ def render_cards(ctx):
   <section class="block">{filters}<div class="cardgrid">{tiles or '<p class="empty">Cards appear for fighters with a weight class role or a UFC fighter name.</p>'}</div></section>
   <section class="block bt"><div class="head-t rv"><span class="eyebrow">IN THE SHOP</span><h2 class="d h-m">PACKS</h2></div>
     <div class="pgrid">{packs}</div>
-    <p class="note">Each card's tier comes from where the fighter stands: GOAT, Double Champ, Champion, Contender (#1 to #5), Ranked, Prospect.
+    <p class="note">Each card's tier comes from where the fighter stands: GOAT, Double Champ, Champion, Former Champ, Contender (#1 to #5), Ranked, Prospect.
     Cards you pull keep the tier they had that day. Duplicates sell for {', '.join(f'{CARD_TIER_TEXT[t].title()} {ctx.CARD_SELL[t]:,}' for t in reversed(CARD_TIER_ORDER))}.</p>
   </section>
 </div>"""

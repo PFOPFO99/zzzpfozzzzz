@@ -30628,9 +30628,10 @@ def fights_like_line(guild_id: int, member, stats, ranks):
 # Packs are in the shop (Cards). PACKS_PER_DAY (default 5).
 # ============================================================
 
-CARD_TIERS = ["prospect", "ranked", "contender", "champion", "double", "goat"]
-CARD_TIER_NAMES = {"prospect": "Prospect", "ranked": "Ranked", "contender": "Contender", "champion": "Champion", "double": "Double Champ", "goat": "GOAT"}
-CARD_TIER_ICONS = {"prospect": "🟢", "ranked": "🥉", "contender": "🥈", "champion": "👑", "double": "👑👑", "goat": "🐐"}
+CARD_TIERS = ["prospect", "ranked", "contender", "former", "champion", "double", "goat"]
+CARD_TIER_NAMES = {"prospect": "Prospect", "ranked": "Ranked", "contender": "Contender", "former": "Former Champ",
+                   "champion": "Champion", "double": "Double Champ", "goat": "GOAT"}
+CARD_TIER_ICONS = {"prospect": "🟢", "ranked": "🥉", "contender": "🥈", "former": "🎖️", "champion": "👑", "double": "👑👑", "goat": "🐐"}
 # frame colours: light, dark, mid, badge text
 CARD_COLOURS = {
     "prospect": ((159, 227, 194), (42, 58, 52), (88, 117, 106), (6, 20, 14)),
@@ -30639,8 +30640,9 @@ CARD_COLOURS = {
     "champion": ((243, 210, 122), (138, 100, 22), (212, 168, 67), (20, 16, 8)),
     "double": ((255, 231, 160), (58, 42, 8), (224, 181, 74), (20, 13, 0)),
     "goat": ((255, 255, 255), (14, 14, 16), (210, 36, 52), (10, 10, 12)),
+    "former": ((236, 204, 128), (16, 26, 54), (74, 112, 196), (12, 16, 30)),
 }
-CARD_SELL = {"prospect": 50, "ranked": 100, "contender": 250, "champion": 500, "double": 1000, "goat": 2000}
+CARD_SELL = {"prospect": 50, "ranked": 100, "contender": 250, "former": 350, "champion": 500, "double": 1000, "goat": 2000}
 PACKS_PER_DAY = int(os.getenv("PACKS_PER_DAY", "5") or 5)
 # Where "Show off in chat" and website trades post (channel name or ID)
 CARDS_CHANNEL = os.getenv("CARDS_CHANNEL", "bot-commands").strip()
@@ -30822,11 +30824,42 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     ranked = sorted([r for r in ranks if r["weight"] != P4P_WEIGHT and r["rank"] > 0], key=lambda r: r["rank"])
     p4p = next((r["rank"] for r in ranks if r["weight"] == P4P_WEIGHT and r["rank"] > 0), None)
     try:
-        former = [d for d in former_champions(guild.id).get(fighter_key(user_id, None), []) if d not in champ_of]
+        # Title fights logged by name (before they were linked to an account) are
+        # stored under the name, so check every name they've fought under too.
+        keys = {fighter_key(user_id, None)}
+        for name in [display, name_without_record(display), clean_card_name(display)]:
+            if name:
+                keys.add(fighter_key(None, name))
+        for row in discipline_query("SELECT DISTINCT winner_name AS n FROM fights WHERE guild_id = ? AND winner_id = ? "
+                                    "UNION SELECT DISTINCT loser_name FROM fights WHERE guild_id = ? AND loser_id = ?",
+                                    (guild.id, user_id, guild.id, user_id)):
+            if row["n"]:
+                keys.add(fighter_key(None, row["n"]))
+        held = former_champions(guild.id)
+        former = []
+        for key in keys:
+            for d in held.get(key, []):
+                if d not in champ_of and d not in former:
+                    former.append(d)
     except Exception as error:
         print(f"Former champion lookup failed: {error}")
         former = []
-    goat = bool(GOAT_ROLE) and member is not None and has_any_role(member, [GOAT_ROLE])
+    goat = has_goat_role(member)
+
+    # How good they are (Elo + streak), worked out before the tier so a
+    # high-rated fighter or ex-champ never sits on a bronze card.
+    ratings = ratings if ratings is not None else card_rating_table(guild.id)
+    entry = ratings.get(fighter_key(user_id, None)) if ratings else None
+    rating = entry["rating"] if entry else RATING_START
+    raw_ovr = 70 + (rating - RATING_START) / 8
+    run = stats["streak"] or ""
+    length = int(run[1:]) if run[1:].isdigit() else 0
+    if run.startswith("W"):
+        raw_ovr += min(length, 4) if length < 5 else min(12, 6 + 1.5 * (length - 5))
+    elif run.startswith("L"):
+        raw_ovr -= min(6, 1.5 * length)
+    if fights < 5 and not champ_of and not goat:
+        raw_ovr = min(raw_ovr, 70 + 3 * fights)
 
     if goat:
         tier = "goat"
@@ -30834,9 +30867,11 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
         tier = "double"
     elif champ_of:
         tier = "champion"
-    elif ranked and ranked[0]["rank"] <= 5:
+    elif former:
+        tier = "former"
+    elif raw_ovr >= 85 or (ranked and ranked[0]["rank"] <= 5):
         tier = "contender"
-    elif ranked:
+    elif ranked or raw_ovr >= 75:
         tier = "ranked"
     else:
         tier = "prospect"
@@ -30857,10 +30892,10 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
         badge = "DOUBLE CHAMP"
     elif tier == "champion" or champ_of:
         badge = "CHAMP"
-    elif ranked:
-        badge = f"#{ranked[0]['rank']}"
     elif former:
         badge = "FORMER CHAMP"
+    elif ranked:
+        badge = f"#{ranked[0]['rank']}"
     else:
         badge = "PROSPECT" if is_prospect(stats) else "UNRANKED"
 
@@ -30870,7 +30905,7 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     for d in former:
         chips.append(f"EX-CHAMP {WEIGHTS.get(d, d)}")
     for row in ranked:
-        if champ_of or row is not ranked[0]:
+        if champ_of or former or row is not ranked[0]:
             chips.append(f"#{row['rank']} {WEIGHTS.get(row['weight'], row['weight'])}")
     if p4p:
         chips.append(f"#{p4p} P4P")
@@ -30923,18 +30958,7 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     finish = 30 + 0.69 * (stats["finish_rate"] or 0)
 
     # ---- overall: skill rating (Elo) + streak, kept inside the tier's band ----
-    ratings = ratings if ratings is not None else card_rating_table(guild.id)
-    entry = ratings.get(fighter_key(user_id, None)) if ratings else None
-    rating = entry["rating"] if entry else RATING_START
-    ovr = 70 + (rating - RATING_START) / 8
-    run = stats["streak"] or ""
-    length = int(run[1:]) if run[1:].isdigit() else 0
-    if run.startswith("W"):
-        ovr += min(length, 4) if length < 5 else min(12, 6 + 1.5 * (length - 5))
-    elif run.startswith("L"):
-        ovr -= min(6, 1.5 * length)
-    if fights < 5 and tier not in ("champion", "double", "goat"):
-        ovr = min(ovr, 70 + 3 * fights)
+    ovr = raw_ovr
     best_rank = ranked[0]["rank"] if ranked else None
     if tier == "goat":
         low, high = 99, 99
@@ -30942,14 +30966,15 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
         low, high = 96, 98
     elif tier == "champion":
         low, high = 90, 97
+    elif tier == "former":
+        low, high = 87, 89
     elif tier == "contender":
-        low, high = 80 - (best_rank - 1), 89                 # #1 can't go below 80, #5 below 76
+        # #1 can't go below 80, #5 below 76; promoted on rating alone: 85+
+        low, high = (80 - (best_rank - 1)) if best_rank and best_rank <= 5 else 85, 89
     elif tier == "ranked":
-        low, high = max(68, 74 - (best_rank - 6)), 84        # #6 can't go below 74
+        low, high = (max(68, 74 - (best_rank - 6)) if best_rank else 75), 84   # #6 can't go below 74
     else:
         low, high = 58, 79
-    if former and tier not in ("champion", "double", "goat"):
-        low, high = max(low, 87), max(high, 89)
     ovr = round(max(low, min(high, ovr)))
 
     streak = stats["streak"] or ""
@@ -30971,6 +30996,13 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     }
 
 
+def has_goat_role(member):
+    """Any role with GOAT in its name ("GOAT", "🐐 | The GOAT", "G.O.A.T" ...)."""
+    goat_key = role_key(GOAT_ROLE) if GOAT_ROLE else ""
+    return bool(goat_key) and member is not None and any(
+        goat_key in role_key(getattr(r, "name", "") or "") for r in getattr(member, "roles", []))
+
+
 def card_eligible(member):
     """Cards are for fighters: a weight class role, a UFC fighter name, or the GOAT role."""
     if member is None or getattr(member, "bot", False):
@@ -30978,7 +31010,7 @@ def card_eligible(member):
     divisions = {role_key(w) for w in DIVISION_NAMES}
     if any(role_key(r.name) in divisions for r in getattr(member, "roles", []) if getattr(r, "name", None)):
         return True
-    if GOAT_ROLE and has_any_role(member, [GOAT_ROLE]):
+    if has_goat_role(member):
         return True
     try:
         return bool(ufc6_matches(getattr(member, "display_name", "") or ""))
@@ -31041,6 +31073,9 @@ def pack_slots(pack, tiers):
             tier = "contender" if random.random() < 0.85 else "champion"
         else:
             tier = _pick_tier(COMMON_ODDS)
+        if tier == "contender" and tiers.get("former"):
+            pick = random.choice(tiers["contender"] + tiers["former"]) if tiers["contender"] else random.choice(tiers["former"])
+            tier = "former" if pick in tiers["former"] else "contender"
         if tier == "champion" and champs:
             # Double champs and the GOAT are inside the Champion odds
             pick = random.choice(champs)
@@ -31181,25 +31216,28 @@ def draw_card_image(info, picture_bytes=None, serial=""):
         frame = _gradient((W, H), [(255, 231, 160), (184, 134, 42), (90, 61, 12), (255, 211, 107), (255, 243, 201), (184, 134, 42), (58, 42, 8)], 120)
     elif tier == "goat":
         frame = _gradient((W, H), [(250, 250, 252), (120, 122, 130), (20, 20, 24), (210, 36, 52), (20, 20, 24), (200, 202, 210), (250, 250, 252)], 125)
+    elif tier == "former":
+        frame = _gradient((W, H), [(236, 204, 128), (74, 112, 196), (16, 26, 54), (236, 204, 128), (16, 26, 54), (74, 112, 196)], 135)
     else:
         frame = _gradient((W, H), [f1, f2, f3, f2], 145)
     card.paste(frame, (0, 0), _round_mask((W, H), 30))
 
     inset = 13
     iw, ih = W - inset * 2, H - inset * 2
-    inner_top = (40, 8, 12) if tier == "goat" else (20, 16, 8) if tier == "double" else (34, 30, 24) if tier == "champion" else (26, 26, 30) if tier == "contender" else (30, 24, 20) if tier == "ranked" else (22, 28, 25)
+    inner_top = (40, 8, 12) if tier == "goat" else (14, 22, 46) if tier == "former" else (20, 16, 8) if tier == "double" else (34, 30, 24) if tier == "champion" else (26, 26, 30) if tier == "contender" else (30, 24, 20) if tier == "ranked" else (22, 28, 25)
     inner = _gradient((iw, ih), [inner_top, (10, 10, 9)], 180)
     glow = Image.new("RGBA", (iw, ih), (0, 0, 0, 0))
     gd = ImageDraw.Draw(glow)
-    gd.ellipse((-iw * .2, -ih * .25, iw * 1.2, ih * .55), fill=(f3 if tier == "goat" else f1) + (60 if tier == "goat" else 34 if tier in ("champion", "double") else 20,))
+    gd.ellipse((-iw * .2, -ih * .25, iw * 1.2, ih * .55), fill=(f3 if tier in ("goat", "former") else f1) + (60 if tier in ("goat", "former") else 34 if tier in ("champion", "double") else 20,))
     glow = glow.filter(ImageFilter.GaussianBlur(60))
     inner = inner.convert("RGBA")
     inner.alpha_composite(glow)
-    if tier in ("champion", "double", "goat"):
+    if tier in ("champion", "double", "goat", "former"):
         holo = Image.new("RGBA", (iw * 2, ih * 2), (0, 0, 0, 0))
         hd = ImageDraw.Draw(holo)
         bands = ([(255, 110, 200, 85), (255, 240, 150, 110), (110, 220, 255, 90), (150, 120, 255, 60)] if tier == "double"
-                 else [(255, 255, 255, 70), (255, 60, 80, 70), (255, 255, 255, 50)] if tier == "goat" else [(255, 240, 180, 50)])
+                 else [(255, 255, 255, 70), (255, 60, 80, 70), (255, 255, 255, 50)] if tier == "goat"
+                 else [(236, 204, 128, 60), (140, 180, 255, 50)] if tier == "former" else [(255, 240, 180, 50)])
         for k, colour in enumerate(bands):
             x = iw * 0.55 + k * 46
             hd.polygon([(x, 0), (x + 70, 0), (x - ih * 0.8 + 70, ih * 2), (x - ih * 0.8, ih * 2)], fill=colour)
@@ -31410,7 +31448,7 @@ def pack_embed(guild, user_id: int, pack_id: int, note: str = None):
     bits = []
     for r in rows:
         info = card_info(r)
-        name = f"**{info['name']}**" if r["tier"] in ("champion", "double", "goat") else info["name"]
+        name = f"**{info['name']}**" if r["tier"] in ("former", "champion", "double", "goat") else info["name"]
         tag = ""
         if r["status"] == "sold":
             tag = " · sold"
