@@ -434,6 +434,7 @@ def setup_database():
     setup_approved_members_table()
     setup_bet_leg_fixed()
     setup_contract_tables()
+    setup_card_edit_table()
     setup_fantasy_extras_table()
     setup_fantasy_tables()
 
@@ -25434,7 +25435,7 @@ HELP_SECTIONS = {
         ("Staff tools", ["rating", "fightername", "formername", "health", "staffreport", "approvemember"]),
     ],
     "moderator": [
-        ("Moderator+", ["editstats", "transferfighter", "halloffame", "shopadmin", "shoppost", "lootdrop", "contract"]),
+        ("Moderator+", ["editstats", "transferfighter", "halloffame", "shopadmin", "shoppost", "lootdrop", "contract", "cardedit"]),
     ],
     "senior": [
         ("Head Moderator+", ["admincoin", "betoverview", "fantasyoverview", "backup", "welcome", "payrates"]),
@@ -27786,6 +27787,7 @@ async def setup_hook():
     setup_approved_members_table()
     setup_bet_leg_fixed()
     setup_contract_tables()
+    setup_card_edit_table()
     setup_fantasy_extras_table()
     setup_fantasy_tables()
 
@@ -30989,7 +30991,7 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
     ovr = round(max(low, min(high, ovr)))
 
     streak = stats["streak"] or ""
-    return {
+    return apply_card_edits(guild.id, user_id, {
         "user_id": user_id,
         "name": clean_card_name(display or (stats["fights"][-1]["winner_name"] if stats["fights"] else "Fighter")),
         "tier": tier,
@@ -31004,7 +31006,107 @@ def fighter_card_data(guild, user_id: int, member=None, ratings=None):
                   ("POW", shape(power, max(sample_strikes, fights) if stat_fights else fights)), ("SUB", shape(sub, fights)),
                   ("FIN", shape(finish, fights))],
         "made": datetime.now(timezone.utc).strftime("%b %Y").upper(),
-    }
+    })
+
+
+# ---------------- card edits (Moderator+) ----------------
+
+CARD_EDIT_FIELDS = ["ovr", "STR", "ACC", "GRP", "POW", "SUB", "FIN"]
+
+
+def setup_card_edit_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS card_edits (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            field TEXT NOT NULL,
+            value INTEGER NOT NULL,
+            set_by INTEGER,
+            set_at INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, user_id, field)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def card_edits(guild_id: int, user_id: int):
+    try:
+        return {r["field"]: r["value"] for r in discipline_query(
+            "SELECT field, value FROM card_edits WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))}
+    except sqlite3.OperationalError:
+        return {}
+
+
+def apply_card_edits(guild_id: int, user_id: int, info: dict):
+    """Staff edits replace the worked-out numbers until they're reset."""
+    edits = card_edits(guild_id, user_id)
+    if not edits:
+        return info
+    if "ovr" in edits:
+        info["ovr"] = edits["ovr"]
+    info["stats"] = [(label, edits.get(label, value)) for label, value in info["stats"]]
+    info["edited"] = sorted(edits)
+    return info
+
+
+@bot.tree.command(name="cardedit", description="Moderator+: set a fighter's card overall or stats by hand (or reset them).")
+@app_commands.describe(fighter="Whose card", ovr="Overall (40-99)", str_="STR: output", acc="ACC: accuracy", grp="GRP: grappling",
+                       pow_="POW: power", sub="SUB: submissions", fin="FIN: finishing",
+                       reset="Go back to the worked-out numbers")
+@app_commands.rename(str_="str", pow_="pow")
+@app_commands.choices(reset=[app_commands.Choice(name="Everything", value="all")] +
+                      [app_commands.Choice(name=("Overall" if f == "ovr" else f), value=f) for f in CARD_EDIT_FIELDS])
+async def cardedit(interaction: discord.Interaction, fighter: discord.Member,
+                   ovr: app_commands.Range[int, 40, 99] = None, str_: app_commands.Range[int, 1, 99] = None,
+                   acc: app_commands.Range[int, 1, 99] = None, grp: app_commands.Range[int, 1, 99] = None,
+                   pow_: app_commands.Range[int, 1, 99] = None, sub: app_commands.Range[int, 1, 99] = None,
+                   fin: app_commands.Range[int, 1, 99] = None, reset: app_commands.Choice[str] = None):
+    if not is_moderator_plus(interaction):
+        await interaction.response.send_message("❌ Only Moderators and above can edit cards.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if not card_eligible(fighter):
+        await interaction.response.send_message(f"❌ {fighter.mention} doesn't have a card (no weight class role or UFC fighter name).",
+                                                ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        return
+    values = {"ovr": ovr, "STR": str_, "ACC": acc, "GRP": grp, "POW": pow_, "SUB": sub, "FIN": fin}
+    changes = {k: v for k, v in values.items() if v is not None}
+    if not changes and not reset:
+        info = fighter_card_data(guild, fighter.id, fighter)
+        edited = card_edits(guild.id, fighter.id)
+        text = (f"**{info['name']}** · OVR {info['ovr']} · " + " · ".join(f"{k} {v}" for k, v in info["stats"])
+                + (f"\n-# Set by hand: {', '.join('Overall' if f == 'ovr' else f for f in sorted(edited))}" if edited else "\n-# All worked out automatically."))
+        await interaction.response.send_message(text + "\nPick a stat to change it, or `reset` to undo edits.", ephemeral=True)
+        return
+    now = int(time.time())
+    log = []
+    if reset:
+        if reset.value == "all":
+            discipline_query("DELETE FROM card_edits WHERE guild_id = ? AND user_id = ?", (guild.id, fighter.id), write=True)
+            log.append("reset everything")
+        else:
+            discipline_query("DELETE FROM card_edits WHERE guild_id = ? AND user_id = ? AND field = ?", (guild.id, fighter.id, reset.value), write=True)
+            log.append(f"reset {'Overall' if reset.value == 'ovr' else reset.value}")
+    for field, value in changes.items():
+        discipline_query("INSERT OR REPLACE INTO card_edits (guild_id, user_id, field, value, set_by, set_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         (guild.id, fighter.id, field, value, interaction.user.id, now), write=True)
+        log.append(f"{'Overall' if field == 'ovr' else field} → {value}")
+    await interaction.response.defer(ephemeral=True)
+    file = await fighter_card_file(guild, fighter)
+    edited = card_edits(guild.id, fighter.id)
+    note = (f"✅ {fighter.mention}'s card: {', '.join(log)}."
+            + (f"\n-# Set by hand now: {', '.join('Overall' if f == 'ovr' else f for f in sorted(edited))}. These stay until reset."
+               if edited else "\n-# Everything is back to the worked-out numbers."))
+    if file:
+        await interaction.followup.send(note, file=file, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await interaction.followup.send(note, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    try:
+        await post_staff_log(guild, staff_log_embed("🃏 Card edited", [f"{interaction.user.mention} edited {fighter.mention}'s card: {', '.join(log)}."]))
+    except Exception:
+        pass
 
 
 def has_goat_role(member):
