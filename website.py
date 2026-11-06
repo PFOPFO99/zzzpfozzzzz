@@ -1629,7 +1629,7 @@ def render_fighter(ctx, user_id):
     </aside>"""
 
     like_html = fights_like_block(ctx, user_id, stats) if member else ""
-    has_card = bool(fights)
+    has_card = bool(member) and bool(getattr(ctx, "card_eligible", lambda m: bool(fights))(member))
     card_html = ""
     if has_card:
         card_html = f"""
@@ -4404,6 +4404,7 @@ V2_JS = r"""
         }).join('');
         var right = b.status === 'open' ? 'Returns <b>' + num(b.returns) + '</b>' : b.status === 'won' || b.status === 'cashed' ? 'Paid <b class="gold">' + num(b.payout) + '</b>' : '';
         var co = b.cashout ? '<button type="button" class="btn btn-gold btn-sm" data-cashout="' + b.id + '" data-amount="' + b.cashout + '">CASH OUT ' + num(b.cashout) + '</button>' : '';
+        if (b.refund !== null && b.refund !== undefined) co += '<button type="button" class="btn btn-ghost btn-sm" data-betrefund="' + b.id + '" data-stake="' + b.stake + '" title="' + b.refund + ' min left">REFUND</button>';
         return '<article class="mybet mybet-' + esc(b.status) + '"><div class="mybet-h"><span>' + (icons[b.status] || '') + ' ' +
           (b.legs.length > 1 ? b.legs.length + '-FOLD' : 'SINGLE') + ' · ' + esc(b.event) + '</span><span class="tab">' + num(b.stake) + ' @ ' +
           Number(b.odds).toFixed(2) + '</span></div><ol class="mybet-legs">' + legs + '</ol><div class="mybet-f"><span>' + right + '</span>' + co + '</div></article>';
@@ -4413,6 +4414,17 @@ V2_JS = r"""
   }
   P.loadMyBets = loadMyBets;
   P.onMe(function (me) { if (me.logged_in) loadMyBets(); else $$('[data-mybets]').forEach(function (s) { s.innerHTML = ''; }); });
+  document.addEventListener('click', function (e) {
+    var r = e.target.closest && e.target.closest('[data-betrefund]');
+    if (!r) return;
+    if (!confirm('Refund this bet? You get ' + num(r.getAttribute('data-stake')) + ' coins back and the bet is cancelled.')) return;
+    busy(r, true);
+    P.post('/api/bets/refund', { bet_id: r.getAttribute('data-betrefund') }).then(function (d) {
+      busy(r, false); P.toast(d.message, d.ok ? 'ok' : 'bad');
+      if (d.ok) showCoins(d.balance);
+      loadMyBets();
+    });
+  });
   document.addEventListener('click', function (e) {
     var b = e.target.closest && e.target.closest('[data-cashout]');
     if (!b) return;
@@ -5036,7 +5048,7 @@ CARDS_CSS = r"""
 .trade-sides>div{display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start}
 .trade-sides .num-l{width:100%}
 .tr-card{border:1px solid var(--line);border-radius:6px;padding:5px 9px;font-size:13px}
-.tr-card.tier-champion,.tr-card.tier-double{border-color:var(--gold)}
+.tr-card.tier-champion,.tr-card.tier-double,.tr-card.tier-goat{border-color:var(--gold)}
 .tradeform{display:grid;gap:10px;max-width:760px}
 .tr-in{background:#0A0A0D;border:1px solid var(--line2);border-radius:10px;color:var(--text);padding:10px 12px;font:14px Inter,sans-serif;width:100%;box-sizing:border-box}
 .tr-cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
@@ -5715,13 +5727,22 @@ def add_action_routes(app, bot, g):
             offer = None
             if bet_row["status"] == "open" and len(legs) > 1:
                 offer, _ = g["cashout_offer"](bet_row["id"])
+            can_refund = bet_row["status"] == "open" and len(legs) == 1 and g["refund_check"](bet_row["id"])[0]
             out.append({
                 "id": bet_row["id"], "event": bet_row["event"], "stake": bet_row["stake"], "odds": bet_row["odds"],
                 "status": bet_row["status"], "payout": bet_row["payout"], "returns": round(bet_row["stake"] * bet_row["odds"]),
                 "cashout": offer,
+                "refund": g["refund_minutes_left"](bet_row) if can_refund else None,
                 "legs": [{"label": g["pick_label"](leg, leg["pick"], leg["method"]), "odds": leg["odds"], "status": leg["status"]} for leg in legs],
             })
         return jres({"ok": True, "bets": out, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]})
+
+    @action_route(bot, g, bucket="cashout", limit=10, window=60)
+    async def bet_refund(viewer, body, request):
+        ok, message = g["refund_bet"](guild().id, viewer.user_id, _int(body.get("bet_id"), 0))
+        if not ok:
+            raise ActionError(message.replace("❌ ", ""))
+        return {"ok": True, "message": message.replace("↩️ ", ""), "balance": g["get_wallet"](guild().id, viewer.user_id)["balance"]}
 
     @action_route(bot, g, bucket="cashout", limit=10, window=60)
     async def cashout(viewer, body, request):
@@ -5760,7 +5781,7 @@ def add_action_routes(app, bot, g):
             "ok": True, "budget": g["FANTASY_BUDGET"], "size": g["FANTASY_TEAM_SIZE"],
             "bank": g["fantasy_bank"](gd.id, viewer.user_id), "points": players.get(viewer.user_id, 0), "rank": rank, "of": len(order),
             "round": {"event": current["event"], "locks_at": current["locks_at"], "locks_text": event_when(current["locks_at"])} if current else None,
-            "swaps_left": (g["FANTASY_SWAPS"] - g["swaps_used"](gd.id, viewer.user_id, current)) if current else None,
+            "swaps_left": g["swaps_left"](gd.id, viewer.user_id, current) if current else None,
             "captain_left": g["captain_changes_left"](gd.id, viewer.user_id, current) if current else None,
             "free_changes": (not current and not played),
             "team": [{"pick_id": pick["id"], "id": str(pick["fighter_id"]), "name": fighter_name(c, pick["fighter_id"]),
@@ -5967,7 +5988,7 @@ def add_action_routes(app, bot, g):
             raise web.HTTPNotFound()
         return web.FileResponse(path, headers={"Cache-Control": "public, max-age=604800", "X-Content-Type-Options": "nosniff"})
 
-    for path, handler in (("/api/signup", signup), ("/api/follow", follow), ("/api/bet", bet), ("/api/bets/cashout", cashout),
+    for path, handler in (("/api/signup", signup), ("/api/follow", follow), ("/api/bet", bet), ("/api/bets/cashout", cashout), ("/api/bets/refund", bet_refund),
                           ("/api/fantasy", fantasy_action), ("/api/shop/buy", shop_buy), ("/api/social/post", social_post),
                           ("/api/social/vote", social_vote), ("/api/social/comment", social_comment),
                           ("/api/social/report", social_report), ("/api/social/remove", social_remove)):
@@ -7330,8 +7351,8 @@ def render_staff_public(ctx):
 # Fighter cards  /cards, /me/cards and the card images
 # ------------------------------------------------------------
 
-CARD_TIER_ORDER = ["double", "champion", "contender", "ranked", "prospect"]
-CARD_TIER_TEXT = {"double": "DOUBLE CHAMP", "champion": "CHAMPION", "contender": "CONTENDER", "ranked": "RANKED", "prospect": "PROSPECT"}
+CARD_TIER_ORDER = ["goat", "double", "champion", "contender", "ranked", "prospect"]
+CARD_TIER_TEXT = {"goat": "GOAT", "double": "DOUBLE CHAMP", "champion": "CHAMPION", "contender": "CONTENDER", "ranked": "RANKED", "prospect": "PROSPECT"}
 
 
 def card_bust():
@@ -7401,7 +7422,7 @@ def render_cards(ctx):
     for i, info in enumerate(order):
         tiles += (f'<a class="cardtile {stagger(i, 4)}" href="{fighter_url(info["user_id"])}#card" data-tier="{info["tier"]}">'
                   f'{fighter_card_img(info["user_id"], info["name"])}</a>')
-    counts = "".join(chip(CARD_TIER_TEXT[t], len(tiers.get(t, [])), "gold" if t in ("double", "champion") else "")
+    counts = "".join(chip(CARD_TIER_TEXT[t], len(tiers.get(t, [])), "gold" if t in ("goat", "double", "champion") else "")
                      for t in CARD_TIER_ORDER if tiers.get(t))
     filters = '<div class="cardfilter" data-cardfilter><button type="button" class="on" data-ct="">ALL</button>' + "".join(
         f'<button type="button" data-ct="{t}">{CARD_TIER_TEXT[t]}</button>' for t in CARD_TIER_ORDER if tiers.get(t)) + '</div>'
@@ -7411,10 +7432,10 @@ def render_cards(ctx):
     body = page_hero("COLLECT THE LEAGUE", "CARDS", "CARD", f'<div class="evchips l-up">{chip("FIGHTERS", len(order))}{counts}</div>'
                      '<div class="btns l-up"><a class="btn btn-gold" href="/shop">GET PACKS</a><a class="btn btn-ghost" href="/me/cards">MY CARDS</a></div>') + f"""
 <div class="wrap">
-  <section class="block">{filters}<div class="cardgrid">{tiles or '<p class="empty">Cards appear once fights are logged.</p>'}</div></section>
+  <section class="block">{filters}<div class="cardgrid">{tiles or '<p class="empty">Cards appear for fighters with a weight class role or a UFC fighter name.</p>'}</div></section>
   <section class="block bt"><div class="head-t rv"><span class="eyebrow">IN THE SHOP</span><h2 class="d h-m">PACKS</h2></div>
     <div class="pgrid">{packs}</div>
-    <p class="note">Each card's tier comes from where the fighter stands: Double Champ, Champion, Contender (#1 to #5), Ranked, Prospect.
+    <p class="note">Each card's tier comes from where the fighter stands: GOAT, Double Champ, Champion, Contender (#1 to #5), Ranked, Prospect.
     Cards you pull keep the tier they had that day. Duplicates sell for {', '.join(f'{CARD_TIER_TEXT[t].title()} {ctx.CARD_SELL[t]:,}' for t in reversed(CARD_TIER_ORDER))}.</p>
   </section>
 </div>"""
