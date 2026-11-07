@@ -5293,6 +5293,23 @@ def traffic_source(referer, host):
     return "Other sites"
 
 
+def record_task_visit(bot, g, request):
+    """Weekly tasks: a logged-in visit counts as a website day, and opening the installed app counts once."""
+    try:
+        session = read_session(g, request)
+        if not session or "log_task_event" not in g:
+            return
+        gd = pick_guild(bot, g)
+        if gd is None:
+            return
+        uid = session["user_id"]
+        g["log_task_event"](gd.id, uid, "web_day", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        if request.query.get("source") == "app" or "standalone" in request.headers.get("Sec-CH-UA-Mode", ""):
+            g["log_task_event"](gd.id, uid, "app", "")
+    except Exception as error:
+        print(f"Task visit failed: {error}")
+
+
 def record_view(g, request, logged_in):
     agent = request.headers.get("User-Agent", "")
     if not agent or any(word in agent.lower() for word in BOT_WORDS):
@@ -5667,6 +5684,8 @@ def add_action_routes(app, bot, g):
         result = g["toggle_follow"](guild().id, viewer.user_id, fighter_id)
         if result is None:
             raise ActionError("You can follow up to 50 fighters.")
+        if result and "log_task_event" in g:
+            g["log_task_event"](guild().id, viewer.user_id, "web_follow", fighter_id)
         return {"ok": True, "following": result, "message": "Following" if result else "Unfollowed"}
 
     async def following(request):
@@ -5714,6 +5733,8 @@ def add_action_routes(app, bot, g):
         ok, message, bet_id = g["place_bet"](guild(), viewer.user_id, _int(body.get("market_id"), 0), legs, stake)
         if not ok:
             raise ActionError(message.replace("❌ ", "").replace("🔒 ", ""))
+        if "log_task_event" in g:
+            g["log_task_event"](guild().id, viewer.user_id, "web_bet", bet_id)
         return {"ok": True, "message": message.replace("✅ ", ""), "balance": g["get_wallet"](guild().id, viewer.user_id)["balance"]}
 
     async def my_bets(request):
@@ -5820,6 +5841,8 @@ def add_action_routes(app, bot, g):
         clean = re.sub(r"^[^\w\d(]+", "", message).replace("**", "")
         if bad:
             raise ActionError(clean)
+        if what in ("add", "remove", "captain") and "log_task_event" in g:
+            g["log_task_event"](gd.id, viewer.user_id, "web_fantasy", f"{what}:{int(time.time())}")
         return {"ok": True, "message": clean}
 
     # ---------------- shop ----------------
@@ -5839,6 +5862,8 @@ def add_action_routes(app, bot, g):
         clean = re.sub(r"<@!?(\d+)>", lambda m: "@" + player_name(ctx(), int(m.group(1))), message).replace("**", "")
         clean = clean.replace(g["COIN"], "").replace("  ", " ")
         out = {"ok": True, "message": clean, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+        if "log_task_event" in g:
+            g["log_task_event"](gd.id, viewer.user_id, "web_shop", f"{item}:{int(time.time())}")
         if item in g.get("PACK_ITEMS", {}):
             out["pack_id"] = g["_last_pack"].pop((gd.id, viewer.user_id), None)
         return out
@@ -5939,6 +5964,8 @@ def add_action_routes(app, bot, g):
                 image = save_upload(g, upload.file.read(5 * 1024 * 1024 + 1))
             gd = guild()
             ok, message, post_id = g["social_create"](gd, viewer.user_id, text, image, event)
+            if ok and "log_task_event" in g:
+                g["log_task_event"](gd.id, viewer.user_id, "web_social", post_id)
             if not ok:
                 raise ActionError(message)
             await g["post_social_to_discord"](gd, post_id)
@@ -6232,12 +6259,25 @@ def render_me(ctx, viewer, query):
             items += (f'<li class="task{" task-done" if finished else ""}"><span class="task-e" aria-hidden="true">{emoji}</span>'
                       f'<span class="task-t">{esc(text)}<span class="task-bar"><span style="width:{pct}%"></span></span></span>'
                       f'<span class="task-v tab">{"✓ " if claimed else ""}{done}/{needed} · {reward:,}</span></li>')
+        streak = ctx.task_streak(gid, uid, week) if getattr(ctx, "task_streak", None) else 0
         if bonus_ready and not bonus_claimed:
             claimable += ctx.WEEKLY_BONUS
+            if streak + 1 >= ctx.TASK_STREAK_WEEKS:
+                claimable += ctx.TASK_STREAK_BONUS
+        starter_html = ""
+        for key, emoji, text, done, needed, reward, finished, _ in (ctx.starter_status(gid, uid) if getattr(ctx, "starter_status", None) else []):
+            claimable += reward if finished else 0
+            starter_html += (f'<li class="task{" task-done" if finished else ""}"><span class="task-e" aria-hidden="true">{emoji}</span>'
+                             f'<span class="task-t">{esc(text)}<span class="task-bar"><span style="width:{100 if finished else 0}%"></span></span></span>'
+                             f'<span class="task-v tab">{"ready" if finished else "not yet"} · {reward:,}</span></li>')
         button = (f'<button class="btn btn-gold btn-sm" type="button" data-claim-tasks>CLAIM {claimable:,} COINS</button>' if claimable
                   else '<span class="muted">Nothing to claim right now.</span>')
-        blocks.append(("WEEKLY TASKS", "tasks", f'<p class="muted">Resets {when_html(end)}. Finish {ctx.WEEKLY_BONUS_TASKS} for a '
-                                                 f'{ctx.WEEKLY_BONUS:,} coin bonus.</p><ul class="tasks">{items}</ul><div class="btns">{button}</div>'))
+        streak_note = (f" You're on a {streak}-week streak: get this week's bonus for +{ctx.TASK_STREAK_BONUS:,} more." if streak + 1 >= ctx.TASK_STREAK_WEEKS
+                       else f" Get the bonus {ctx.TASK_STREAK_WEEKS} weeks running for +{ctx.TASK_STREAK_BONUS:,} each week.")
+        blocks.append(("WEEKLY TASKS", "tasks", f'<p class="muted">New tasks {when_html(end)}. Finish {ctx.WEEKLY_BONUS_TASKS} for a '
+                                                 f'{ctx.WEEKLY_BONUS:,} coin bonus.{streak_note}</p><ul class="tasks">{items}</ul>'
+                                                 + (f'<p class="num-l" style="margin-top:14px">STARTER TASKS (ONCE ONLY)</p><ul class="tasks">{starter_html}</ul>' if starter_html else "")
+                                                 + f'<div class="btns">{button}</div>'))
     except Exception:
         traceback.print_exc()
 
@@ -8028,6 +8068,8 @@ def make_app(bot, g):
                     and not request.path.startswith(("/api/", "/assets/", "/media/", "/auth/"))):
                 logged_in = SESSION_COOKIE in request.cookies
                 asyncio.get_running_loop().run_in_executor(None, record_view, g, request, logged_in)
+                if logged_in:
+                    asyncio.get_running_loop().run_in_executor(None, record_task_visit, bot, g, request)
         except Exception:
             pass
         if isinstance(response, web.HTTPException):

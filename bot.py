@@ -435,6 +435,8 @@ def setup_database():
     setup_bet_leg_fixed()
     setup_contract_tables()
     setup_card_edit_table()
+    setup_away_table()
+    setup_task_events_table()
     setup_fantasy_extras_table()
     setup_fantasy_tables()
 
@@ -13033,27 +13035,60 @@ def suspended_board_lines(
 # ------------------------------------------------------------
 # Inactivity
 #
-# Checks everyone with a record in their name, e.g. "Joe (3-1-0)".
-# Names with N/A in them are skipped. Each time a sign-up is
-# closed, anyone who didn't sign up is flagged in the staff bot
-# channel with their last fight and last sign-up, worst first
-# (most sign-ups missed in a row). /inactive shows the same any time.
+# Tracks everyone with a weight class role. Each time a sign-up is
+# closed, anyone who didn't sign up is flagged in the staff bot channel,
+# grouped by how many sign-ups they've missed in a row.
+#   - A fight counts as activity: missed sign-ups only count after their
+#     last sign-up AND their last fight.
+#   - Sign-ups posted before they joined don't count.
+#   - Suspended fighters and anyone marked away (/away) are left out.
+# /inactive shows the same any time (filter by division or how many missed).
 # ------------------------------------------------------------
 
 NA_IN_NAME = re.compile(r"n\s*/\s*a", re.IGNORECASE)
 
 
+def has_weight_role(member, division: str = None):
+    """Has a weight class role (or that division's role, if one is given)."""
+    wanted = {role_key(division)} if division else {role_key(w) for w in DIVISION_NAMES}
+    return any(role_key(getattr(r, "name", "") or "") in wanted for r in getattr(member, "roles", []))
+
+
 def is_tracked_fighter(
     member
 ):
-    """Has a record in their name and isn't N/A."""
+    """Fighters are people with a weight class role (names with N/A in them are skipped)."""
 
     if getattr(member, "bot", False):
         return False
 
-    name = member.display_name or ""
+    return has_weight_role(member) and not NA_IN_NAME.search(member.display_name or "")
 
-    return bool(RECORD_IN_NAME.search(name)) and not NA_IN_NAME.search(name)
+
+def setup_away_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS inactivity_away (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            until INTEGER NOT NULL,
+            reason TEXT,
+            set_by INTEGER,
+            set_at INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, user_id)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def away_now(guild_id: int):
+    """{user_id: row} for anyone marked away right now."""
+    try:
+        return {r["user_id"]: r for r in discipline_query(
+            "SELECT * FROM inactivity_away WHERE guild_id = ? AND until > ?", (guild_id, int(time.time())))}
+    except sqlite3.OperationalError:
+        return {}
 
 
 def parse_stamp(
@@ -13116,9 +13151,11 @@ def activity_data(
 def missed_in_a_row(
     member,
     sessions: list,
-    signed_ids: set
+    signed_ids: set,
+    last_fight=None
 ):
-    """Closed sign-ups missed since their last one (only ones posted after they joined)."""
+    """Closed sign-ups missed since they were last active: their last sign-up or their last
+    fight, whichever is later (only ones posted after they joined)."""
 
     joined = getattr(member, "joined_at", None)
     missed = 0
@@ -13131,6 +13168,9 @@ def missed_in_a_row(
         if joined and created and created < joined:
             break
 
+        if last_fight and created and created.date() <= last_fight:
+            break
+
         missed += 1
 
     return missed
@@ -13139,20 +13179,26 @@ def missed_in_a_row(
 def find_inactive_fighters(
     guild: discord.Guild,
     minimum_missed: int = 1,
-    only_session: int = None
+    only_session: int = None,
+    division: str = None
 ):
     """
     [(member, missed, last_fight, last_signup)] worst first.
     only_session: just the people who didn't sign up for that one.
+    division: only fighters with that weight class role.
     """
 
     sessions, signed, last_signup, last_fight = activity_data(guild.id)
     suspended = {row["user_id"] for row in all_active_suspensions(guild.id)}
+    away = away_now(guild.id)
     found = []
 
     for member in guild.members:
 
-        if not is_tracked_fighter(member) or member.id in suspended:
+        if not is_tracked_fighter(member) or member.id in suspended or member.id in away:
+            continue
+
+        if division and not has_weight_role(member, division):
             continue
 
         signed_ids = signed.get(member.id, set())
@@ -13160,7 +13206,7 @@ def find_inactive_fighters(
         if only_session is not None and only_session in signed_ids:
             continue
 
-        missed = missed_in_a_row(member, sessions, signed_ids)
+        missed = missed_in_a_row(member, sessions, signed_ids, last_fight.get(member.id))
 
         if missed < max(1, minimum_missed):
             continue
@@ -13175,8 +13221,8 @@ def find_inactive_fighters(
 
     oldest = datetime.min.date()
 
-    # Most missed in a row first, then the longest since their last fight.
-    found.sort(key=lambda row: (-row[1], row[2] or oldest, row[3] or oldest))
+    # Most missed in a row first, then the longest since they were last active.
+    found.sort(key=lambda row: (-row[1], max(row[2] or oldest, row[3] or oldest)))
 
     return found
 
@@ -13188,32 +13234,55 @@ def short_date(
     return f"{day.day} {day:%b %y}" if day else "never"
 
 
+def inactive_name(member):
+    """Their name without the record or tags; their username if that leaves nothing."""
+    name = clean_card_name(member.display_name or "")
+    if not name or name == "Fighter" or not re.search(r"[A-Za-z0-9]", name):
+        name = member.name
+    return name
+
+
+def days_quiet(last_fight, last_signup):
+    latest = max([d for d in (last_fight, last_signup) if d], default=None)
+    if not latest:
+        return None
+    return (datetime.now(timezone.utc).date() - latest).days
+
+
 def inactive_embeds(
     guild: discord.Guild,
     found: list,
     header: str
 ):
 
-    entries = []
+    groups = {"red": [], "orange": [], "yellow": []}
 
     for member, missed, last_fight, last_signup in found:
         warns = len(active_warnings(guild.id, member.id))
-        warn_tag = f"  ·  ⚠️ {warns}/{MAX_WARNINGS}" if warns else ""
-        badge = "🔴" if missed >= 3 else "🟠" if missed == 2 else "🟡"
-        entries.append(
-            f"{badge} **{name_without_record(member.display_name)}**  ·  missed {missed}{warn_tag}\n"
-            f"└ 🥊 {short_date(last_fight)}  ·  📝 {short_date(last_signup)}"
-        )
+        quiet = days_quiet(last_fight, last_signup)
+        bits = [f"missed **{missed}**"]
+        bits.append(f"quiet {quiet}d" if quiet is not None else "never active")
+        bits.append(f"🥊 {short_date(last_fight)}")
+        bits.append(f"📝 {short_date(last_signup)}")
+        if warns:
+            bits.append(f"⚠️ {warns}/{MAX_WARNINGS}")
+        line = f"**{inactive_name(member)}** · " + " · ".join(bits)
+        groups["red" if missed >= 3 else "orange" if missed == 2 else "yellow"].append(line)
 
+    titles = {"red": "🔴 Missed 3+ in a row", "orange": "🟠 Missed 2 in a row", "yellow": "🟡 Missed the last one"}
+    lines = [header]
+    for key in ("red", "orange", "yellow"):
+        if groups[key]:
+            lines += ["", f"**{titles[key]}** ({len(groups[key])})"] + groups[key]
+
+    away = away_now(guild.id)
     pages = []
-    current = [header, ""]
-
-    for entry in entries:
-        if len("\n".join(current)) + len(entry) > 3800:
+    current = []
+    for line in lines:
+        if len("\n".join(current)) + len(line) > 3900:
             pages.append(current)
             current = []
-        current.append(entry)
-
+        current.append(line)
     pages.append(current)
     pages = pages[:10]
 
@@ -13233,7 +13302,8 @@ def inactive_embeds(
         if index == len(pages) - 1:
             embed.timestamp = discord.utils.utcnow()
             embed.set_footer(
-                text="Missed = sign-ups missed in a row (🔴 3+ 🟠 2 🟡 1) • 🥊 last fight • 📝 last sign-up",
+                text="Fighters = weight class role • a fight counts as active • 🥊 last fight • 📝 last sign-up"
+                     + (f" • {len(away)} away" if away else ""),
                 icon_url=asset_url(LOGO_FILE)
             )
 
@@ -13270,14 +13340,19 @@ class MentionsCopyView(
 
 @bot.tree.command(
     name="inactive",
-    description="Fighters (record in their name) who've been missing sign-ups, worst first."
+    description="Fighters (weight class role) who've been missing sign-ups, worst first."
 )
 @app_commands.describe(
-    missed="Only show people who missed at least this many sign-ups in a row (default 1)"
+    missed="Only show people who missed at least this many sign-ups in a row (default 1)",
+    division="Only fighters in this division"
+)
+@app_commands.choices(
+    division=DIVISION_CHOICES
 )
 async def inactive(
     interaction: discord.Interaction,
-    missed: app_commands.Range[int, 1, 50] = None
+    missed: app_commands.Range[int, 1, 50] = None,
+    division: app_commands.Choice[str] = None
 ):
 
     if not is_staff(interaction):
@@ -13288,10 +13363,13 @@ async def inactive(
         return
 
     missed = missed or 1
-    found = find_inactive_fighters(interaction.guild, missed)
+    division_name = division.value if division else None
+    found = find_inactive_fighters(interaction.guild, missed, division=division_name)
 
     header = (
-        f"**{len(found)} fighter{'s' if len(found) != 1 else ''}** missed "
+        f"**{len(found)} fighter{'s' if len(found) != 1 else ''}**"
+        + (f" in **{division_name}**" if division_name else "")
+        + " missed "
         + ("the last sign-up" if missed == 1 else f"the last {missed}+ sign-ups")
         + " (closed sign-ups only)."
         if found else
@@ -13312,6 +13390,38 @@ async def inactive(
             embeds=embeds,
             ephemeral=True
         )
+
+
+@bot.tree.command(name="away", description="Staff: mark a fighter as away so the inactivity tracker skips them.")
+@app_commands.describe(fighter="Who's away", days="How many days (leave empty with clear to remove)", reason="Why (staff only see this)",
+                       clear="They're back: stop skipping them")
+async def away_command(interaction: discord.Interaction, fighter: discord.Member, days: app_commands.Range[int, 1, 180] = None,
+                       reason: str = None, clear: bool = False):
+    if not is_staff(interaction):
+        await interaction.response.send_message(f"❌ {STAFF_ONLY_TEXT} can mark fighters away.", ephemeral=True)
+        return
+    guild = interaction.guild
+    if clear:
+        discipline_query("DELETE FROM inactivity_away WHERE guild_id = ? AND user_id = ?", (guild.id, fighter.id), write=True)
+        text = f"✅ {fighter.mention} is back on the inactivity tracker."
+    elif not days:
+        row = away_now(guild.id).get(fighter.id)
+        if row:
+            text = f"{fighter.mention} is away until <t:{row['until']}:D>" + (f" ({row['reason']})" if row["reason"] else "") + "."
+        else:
+            text = f"{fighter.mention} isn't marked away. Add `days` to mark them."
+        await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        return
+    else:
+        until = int(time.time()) + days * 86400
+        discipline_query("INSERT OR REPLACE INTO inactivity_away (guild_id, user_id, until, reason, set_by, set_at) VALUES (?, ?, ?, ?, ?, ?)",
+                         (guild.id, fighter.id, until, (reason or "")[:200] or None, interaction.user.id, int(time.time())), write=True)
+        text = f"🏝️ {fighter.mention} is marked away until <t:{until}:D>. The inactivity tracker skips them until then."
+    await interaction.response.send_message(text, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    try:
+        await post_staff_log(guild, staff_log_embed("🏝️ Away", [f"{interaction.user.mention}: {text}"]))
+    except Exception:
+        pass
 
 
 async def report_missed_signup(
@@ -13348,8 +13458,9 @@ async def report_missed_signup(
 
     try:
         await channel.send(
-            content=f"📋 **Sign-up check: {title}** (run `/inactive` for a list you can copy @mentions from)",
-            embeds=inactive_embeds(guild, found, header)
+            content=f"📋 **Sign-up check: {title}**",
+            embeds=inactive_embeds(guild, found, header),
+            view=MentionsCopyView([member.id for member, *_ in found]) if found else None
         )
         return True
     except Exception as error:
@@ -16332,11 +16443,11 @@ async def share_slip(interaction: discord.Interaction, bet_id: int):
     if slip_shared(bet_id):
         return "📣 You've already shared that slip."
 
-    channel = interaction.channel
+    channel = find_named_channel(interaction.guild, SLIP_CHANNEL) or interaction.channel
     try:
         message = await channel.send(embed=slip_share_embed(interaction.guild, rows[0], interaction.user))
     except Exception:
-        return "❌ I can't post in this channel."
+        return f"❌ I can't post in {getattr(channel, 'mention', 'that channel')}."
 
     discipline_query("INSERT OR IGNORE INTO shared_slips (bet_id, channel_id, message_id, shared_at) VALUES (?, ?, ?, ?)",
                      (bet_id, channel.id, message.id, now_utc()), write=True)
@@ -16366,7 +16477,7 @@ class MyBetsView(
                 value=str(bet["id"]), emoji=state or None
             ))
         if options:
-            menu = discord.ui.Select(placeholder="📣 Share a bet slip in this channel…", options=options[:25], row=0)
+            menu = discord.ui.Select(placeholder="📣 Share a bet slip…", options=options[:25], row=0)
             menu.callback = self.share
             self.add_item(menu)
 
@@ -21833,6 +21944,18 @@ def setup_award_tables():
     db.close()
 
 
+def unpaid_awards(guild_id: int, event: str):
+    """Awards for this event that never paid out (added before award pay existed)."""
+    if AWARD_PAY <= 0:
+        return []
+    out = []
+    for row in awards_for_event(guild_id, event):
+        paid = discipline_query("SELECT 1 FROM coin_ledger WHERE guild_id = ? AND reason = ? LIMIT 1", (guild_id, f"award:{row['id']}"))
+        if not paid:
+            out.append(row)
+    return out
+
+
 def pay_award(guild_id: int, award_id: int):
     """AWARD_PAY coins to whoever gets the award (both fighters for FOTN). Returns who was paid."""
     if AWARD_PAY <= 0:
@@ -21960,7 +22083,11 @@ class AwardsPanel(
         if not lines:
             lines = ["Nothing logged yet. Pick an award and a fight below, then press **Add**.", ""]
 
-        lines.append("-# Logged only: nothing is posted and no coins are given.")
+        unpaid = unpaid_awards(self.guild.id, self.event)
+        if unpaid:
+            lines.append(f"⚠️ {len(unpaid)} award{'s' if len(unpaid) != 1 else ''} here {'were' if len(unpaid) != 1 else 'was'} added before award pay "
+                         f"and {'haven' if len(unpaid) != 1 else 'hasn'}'t paid out. Press **Pay unpaid** to pay {'them' if len(unpaid) != 1 else 'it'}.")
+        lines.append(f"-# Each award pays {coins_text(AWARD_PAY)} coins to the fighter (both fighters for FOTN). Nothing is posted.")
 
         if note:
             lines = [note, ""] + lines
@@ -22032,6 +22159,12 @@ class AwardsPanel(
             remove.callback = self.remove
             self.add_item(remove)
 
+        unpaid = unpaid_awards(self.guild.id, self.event)
+        if unpaid:
+            pay = discord.ui.Button(label=f"Pay unpaid ({len(unpaid)})", emoji="🪙", style=discord.ButtonStyle.blurple, row=2)
+            pay.callback = self.pay_unpaid
+            self.add_item(pay)
+
         done = discord.ui.Button(label="Done", style=discord.ButtonStyle.grey, row=2)
         done.callback = self.done
         self.add_item(done)
@@ -22064,6 +22197,25 @@ class AwardsPanel(
         self.build()
         note = f"✅ Added {icon} **{label}**." + (f" Paid {COIN} {coins_text(AWARD_PAY)} to " + ", ".join(f"<@{uid}>" for uid in paid) + "." if paid else "")
         await interaction.response.edit_message(embed=self.embed(note), view=self)
+
+    async def pay_unpaid(self, interaction):
+        paid_people = []
+        for row in unpaid_awards(self.guild.id, self.event):
+            people = pay_award(self.guild.id, row["id"])
+            if not people:
+                # Nobody to pay (they've left): mark it done so it isn't offered again
+                discipline_query("INSERT INTO coin_ledger (guild_id, user_id, amount, reason, created_at) VALUES (?, 0, 0, ?, ?)",
+                                 (self.guild.id, f"award:{row['id']}", now_utc()), write=True)
+            paid_people += people
+        self.build()
+        note = (f"🪙 Paid {coins_text(AWARD_PAY)} coins each to " + ", ".join(f"<@{uid}>" for uid in paid_people) + "."
+                if paid_people else "Nothing left to pay.")
+        await interaction.response.edit_message(embed=self.embed(note), view=self)
+        if paid_people:
+            try:
+                await post_staff_log(self.guild, staff_log_embed("🪙 Award pay", [f"{interaction.user.mention} paid the unpaid awards for **{self.event}**."]))
+            except Exception:
+                pass
 
     async def remove(self, interaction):
         award_id = int(interaction.data["values"][0])
@@ -25432,7 +25584,7 @@ HELP_SECTIONS = {
         ("Posts & media", ["mainvote", "leaderboard", "taleofthetape", "interview", "interviews", "vodset", "vodclear"]),
         ("Discipline", ["warn", "removewarning", "unsuspend", "warnings"]),
         ("Teams", ["teamcreate", "teamedit", "teamdelete"]),
-        ("Staff tools", ["rating", "fightername", "formername", "health", "staffreport", "approvemember"]),
+        ("Staff tools", ["rating", "fightername", "formername", "health", "staffreport", "approvemember", "away"]),
     ],
     "moderator": [
         ("Moderator+", ["editstats", "transferfighter", "halloffame", "shopadmin", "shoppost", "lootdrop", "contract", "cardedit"]),
@@ -25451,7 +25603,7 @@ HELP_NOTES = {
 }
 
 
-HELP_FUNCTION_NAMES = {"warnings": "warnings_command", "help": "help_command", "tasks": "tasks_command", "team": "team_command",
+HELP_FUNCTION_NAMES = {"warnings": "warnings_command", "help": "help_command", "tasks": "tasks_command", "team": "team_command", "away": "away_command",
                        "card": "card_command", "collection": "collection_command", "trade": "trade_command", "vod": "vod_command"}
 
 
@@ -25609,16 +25761,54 @@ async def help_command(
 # ============================================================
 
 # key: (emoji, task, how many, reward)
-WEEKLY_TASKS = {
-    "daily":   ("🎁", "Claim your daily bonus on 5 days", 5, 300),
-    "bets":    ("🎯", "Place 3 bets", 3, 250),
-    "bet_win": ("💸", "Win a bet", 1, 300),
-    "fantasy": ("🏆", "Have a full fantasy team (4 fighters)", 1, 200),
-    "shop":    ("🛒", "Buy something from the shop", 1, 100),
-    "fight":   ("🥊", "Fight on a PFO card", 1, 300),
+# Weekly tasks: a new mix every Monday, the same 6 for everyone.
+# 2 easy, 3 medium and 1 hard, with at least one website task and at
+# most one fighter-only task. key: (emoji, text, needed, reward, level, group)
+TASK_POOL = {
+    # easy
+    "daily3":      ("🎁", "Claim your daily bonus on 3 days", 3, 200, "easy", "coins"),
+    "web_days":    ("🌐", "Log in to the website on 3 different days", 3, 150, "easy", "web"),
+    "web_follow":  ("⭐", "Follow 3 fighters on the website", 3, 150, "easy", "web"),
+    "bets3":       ("🎯", "Place 3 bets", 3, 200, "easy", "bets"),
+    "fantasy":     ("🏆", "Have a full fantasy team (4 fighters)", 1, 200, "easy", "fantasy"),
+    "share_slip":  ("📣", "Share a bet slip", 1, 100, "easy", "bets"),
+    "pack":        ("🃏", "Open a card pack", 1, 150, "easy", "cards"),
+    "signup":      ("📝", "Sign up for a card", 1, 150, "easy", "fighter"),
+    # medium
+    "daily5":      ("🎁", "Claim your daily bonus on 5 days", 5, 300, "medium", "coins"),
+    "web_bet":     ("🌐", "Place a bet on the website", 1, 250, "medium", "web"),
+    "web_fantasy": ("🌐", "Pick or change your fantasy team on the website", 1, 200, "medium", "web"),
+    "web_shop":    ("🌐", "Buy something from the website shop", 1, 200, "medium", "web"),
+    "web_social":  ("💬", "Post on the website's social feed", 1, 150, "medium", "web"),
+    "bet_win":     ("💸", "Win a bet", 1, 300, "medium", "bets"),
+    "bet_fights":  ("🎲", "Bet on 3 different fights", 3, 250, "medium", "bets"),
+    "swap":        ("🔁", "Make a fantasy swap", 1, 150, "medium", "fantasy"),
+    "new_card":    ("✨", "Get a fighter card you didn't have", 1, 200, "medium", "cards"),
+    "show_pack":   ("📸", "Show off a pack in chat", 1, 150, "medium", "cards"),
+    "gift":        ("🎀", "Gift coins to someone", 1, 150, "medium", "coins"),
+    "shop":        ("🛒", "Buy something from the shop", 1, 150, "medium", "coins"),
+    "checkin":     ("✅", "Check in for your fight", 1, 250, "medium", "fighter"),
+    # hard
+    "acca_win":    ("🔥", "Win an accumulator (3+ picks)", 1, 500, "hard", "bets"),
+    "dog_win":     ("🐶", "Win a bet on an underdog (odds 2.50+)", 1, 400, "hard", "bets"),
+    "captain_win": ("👑", "Your fantasy captain wins a fight", 1, 300, "hard", "fantasy"),
+    "trade":       ("🤝", "Finish a card trade", 1, 300, "hard", "cards"),
+    "fight":       ("🥊", "Fight on a PFO card", 1, 300, "hard", "fighter"),
+    "finish_win":  ("💥", "Win a fight by KO or submission", 1, 500, "hard", "fighter"),
 }
+WEEKLY_TASK_MIX = {"easy": 2, "medium": 3, "hard": 1}
 WEEKLY_BONUS_TASKS = 5        # finish this many in a week for the bonus
 WEEKLY_BONUS = 500
+TASK_STREAK_WEEKS = 3         # bonus claimed this many weeks running...
+TASK_STREAK_BONUS = 300       # ...pays this on top, every week the streak carries on
+
+# One-off tasks for new members (paid once, ever)
+STARTER_TASKS = {
+    "start_web":   ("🌐", "Make your website account (log in once)", 1, 200),
+    "start_app":   ("📱", "Install the PFO app from the website", 1, 200),
+    "start_bet":   ("🎯", "Place your first bet", 1, 150),
+    "start_pack":  ("🃏", "Open your first card pack", 1, 150),
+}
 
 
 def setup_task_tables():
@@ -25647,13 +25837,56 @@ def task_week():
     return monday.isoformat(), int(start.timestamp()), int(end.timestamp())
 
 
-def task_progress(guild_id: int, user_id: int):
-    """{task: count so far this week}"""
+def weekly_task_keys(week: str):
+    """The 6 tasks for this week: the same for everyone, different each week."""
+    rng = random.Random(f"pfo-tasks-{week}")
+    for _ in range(200):
+        picks = []
+        for level, count in WEEKLY_TASK_MIX.items():
+            pool = sorted(k for k, v in TASK_POOL.items() if v[4] == level)
+            picks += rng.sample(pool, count)
+        groups = [TASK_POOL[k][5] for k in picks]
+        if "web" in groups and groups.count("fighter") <= 1 and len(set(groups)) >= 4:
+            if not ({"daily3", "daily5"} <= set(picks)):
+                return picks
+    return picks
 
-    _, start, end = task_week()
+
+def setup_task_events_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS task_events (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            ref TEXT NOT NULL DEFAULT '',
+            at INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, user_id, kind, ref)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def log_task_event(guild_id: int, user_id: int, kind: str, ref=""):
+    """Things the website (and a few buttons) do that tasks count. Same kind + ref only counts once."""
+    try:
+        discipline_query("INSERT OR IGNORE INTO task_events (guild_id, user_id, kind, ref, at) VALUES (?, ?, ?, ?, ?)",
+                         (guild_id, user_id, kind, str(ref), int(time.time())), write=True)
+    except Exception as error:
+        print(f"Task event failed: {error}")
+
+
+WEEKLY_TASKS = {k: TASK_POOL[k][:4] for k in TASK_POOL}   # kept for anything that lists every task
+
+
+def task_progress(guild_id: int, user_id: int, keys=None):
+    """{task: count so far this week} for this week's tasks (or the keys given)."""
+
+    week, start, end = task_week()
+    keys = keys or weekly_task_keys(week)
     start_iso = datetime.fromtimestamp(start, timezone.utc).isoformat()
     end_iso = datetime.fromtimestamp(end, timezone.utc).isoformat()
-    progress = {key: 0 for key in WEEKLY_TASKS}
 
     def count(sql, params):
         try:
@@ -25661,33 +25894,116 @@ def task_progress(guild_id: int, user_id: int):
         except sqlite3.OperationalError:
             return 0
 
-    progress["daily"] = count(
-        "SELECT COUNT(DISTINCT substr(created_at, 1, 10)) AS n FROM coin_ledger "
-        "WHERE guild_id = ? AND user_id = ? AND reason = 'daily' AND created_at >= ? AND created_at < ?",
-        (guild_id, user_id, start_iso, end_iso)
-    )
-    progress["bets"] = count(
-        "SELECT COUNT(*) AS n FROM bets WHERE guild_id = ? AND user_id = ? AND created_at >= ? AND created_at < ? "
-        "AND status != 'void'", (guild_id, user_id, start_iso, end_iso)
-    )
-    progress["bet_win"] = count(
-        "SELECT COUNT(*) AS n FROM bets WHERE guild_id = ? AND user_id = ? AND status = 'won' "
-        "AND created_at >= ? AND created_at < ?", (guild_id, user_id, start_iso, end_iso)
-    )
-    try:
-        progress["fantasy"] = 1 if len(fantasy_team(guild_id, user_id)) >= FANTASY_TEAM_SIZE else 0
-    except Exception:
-        progress["fantasy"] = 0
-    progress["shop"] = count(
-        "SELECT COUNT(*) AS n FROM shop_items WHERE guild_id = ? AND user_id = ? AND price > 0 AND created_at >= ? AND created_at < ?",
-        (guild_id, user_id, start, end)
-    )
-    progress["fight"] = count(
-        "SELECT COUNT(*) AS n FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?) "
-        "AND source = 'result' AND created_at >= ? AND created_at < ?",
-        (guild_id, user_id, user_id, start_iso, end_iso)
-    )
+    def events(kind):
+        return count("SELECT COUNT(*) AS n FROM task_events WHERE guild_id = ? AND user_id = ? AND kind = ? AND at >= ? AND at < ?",
+                     (guild_id, user_id, kind, start, end))
+
+    def daily_days():
+        return count("SELECT COUNT(DISTINCT substr(created_at, 1, 10)) AS n FROM coin_ledger "
+                     "WHERE guild_id = ? AND user_id = ? AND reason = 'daily' AND created_at >= ? AND created_at < ?",
+                     (guild_id, user_id, start_iso, end_iso))
+
+    def won_bets(extra=""):
+        return count("SELECT COUNT(*) AS n FROM bets WHERE guild_id = ? AND user_id = ? AND status = 'won' "
+                     f"AND created_at >= ? AND created_at < ? {extra}", (guild_id, user_id, start_iso, end_iso))
+
+    def full_team():
+        try:
+            return 1 if len(fantasy_team(guild_id, user_id)) >= FANTASY_TEAM_SIZE else 0
+        except Exception:
+            return 0
+
+    checks = {
+        "daily3": daily_days, "daily5": daily_days,
+        "web_days": lambda: events("web_day"),
+        "web_follow": lambda: events("web_follow"),
+        "web_bet": lambda: events("web_bet"),
+        "web_fantasy": lambda: events("web_fantasy"),
+        "web_shop": lambda: events("web_shop"),
+        "web_social": lambda: events("web_social"),
+        "show_pack": lambda: events("show_pack"),
+        "bets3": lambda: count("SELECT COUNT(*) AS n FROM bets WHERE guild_id = ? AND user_id = ? AND created_at >= ? AND created_at < ? "
+                               "AND status != 'void'", (guild_id, user_id, start_iso, end_iso)),
+        "bet_win": won_bets,
+        "acca_win": lambda: won_bets("AND leg_count >= 3"),
+        "dog_win": lambda: won_bets("AND leg_count = 1 AND odds >= 2.5"),
+        "bet_fights": lambda: count("SELECT COUNT(DISTINCT bets.market_id || ':' || bet_legs.position) AS n FROM bets "
+                                    "JOIN bet_legs ON bet_legs.bet_id = bets.id WHERE bets.guild_id = ? AND bets.user_id = ? "
+                                    "AND bets.created_at >= ? AND bets.created_at < ? AND bets.status != 'void'",
+                                    (guild_id, user_id, start_iso, end_iso)),
+        "share_slip": lambda: count("SELECT COUNT(*) AS n FROM shared_slips JOIN bets ON bets.id = shared_slips.bet_id "
+                                    "WHERE bets.guild_id = ? AND bets.user_id = ? AND shared_slips.shared_at >= ? AND shared_slips.shared_at < ?",
+                                    (guild_id, user_id, start_iso, end_iso)),
+        "fantasy": full_team,
+        "swap": lambda: count("SELECT COUNT(*) AS n FROM fantasy_picks WHERE guild_id = ? AND user_id = ? AND removed_at >= ? AND removed_at < ?",
+                              (guild_id, user_id, start, end)),
+        "captain_win": lambda: count("SELECT COUNT(*) AS n FROM fights JOIN fantasy_picks ON fantasy_picks.fighter_id = fights.winner_id "
+                                     "WHERE fights.guild_id = ? AND fantasy_picks.guild_id = ? AND fantasy_picks.user_id = ? "
+                                     "AND fantasy_picks.captain = 1 AND fantasy_picks.added_at < ? "
+                                     "AND (fantasy_picks.removed_at IS NULL OR fantasy_picks.removed_at > ?) "
+                                     "AND fights.created_at >= ? AND fights.created_at < ?",
+                                     (guild_id, guild_id, user_id, end, start, start_iso, end_iso)),
+        "pack": lambda: count("SELECT COUNT(*) AS n FROM card_packs WHERE guild_id = ? AND user_id = ? AND opened_at >= ? AND opened_at < ?",
+                              (guild_id, user_id, start, end)),
+        "new_card": lambda: count("SELECT COUNT(*) AS n FROM card_pulls p WHERE p.guild_id = ? AND p.owner_id = ? AND p.pulled_at >= ? AND p.pulled_at < ? "
+                                  "AND NOT EXISTS (SELECT 1 FROM card_pulls q WHERE q.guild_id = p.guild_id AND q.owner_id = p.owner_id "
+                                  "AND q.fighter_id = p.fighter_id AND q.id < p.id)", (guild_id, user_id, start, end)),
+        "trade": lambda: count("SELECT COUNT(*) AS n FROM card_trades WHERE guild_id = ? AND status = 'done' AND (from_id = ? OR to_id = ?) "
+                               "AND closed_at >= ? AND closed_at < ?", (guild_id, user_id, user_id, start, end)),
+        "gift": lambda: count("SELECT COUNT(*) AS n FROM shop_items WHERE guild_id = ? AND user_id = ? AND item = 'gift' AND created_at >= ? AND created_at < ?",
+                              (guild_id, user_id, start, end)),
+        "shop": lambda: count("SELECT COUNT(*) AS n FROM shop_items WHERE guild_id = ? AND user_id = ? AND price > 0 AND created_at >= ? AND created_at < ?",
+                              (guild_id, user_id, start, end)),
+        "signup": lambda: count("SELECT COUNT(*) AS n FROM signups JOIN signup_sessions ON signup_sessions.id = signups.session_id "
+                                "WHERE signup_sessions.guild_id = ? AND signups.discord_user_id = ? AND signups.created_at >= ? AND signups.created_at < ?",
+                                (guild_id, user_id, start_iso, end_iso)),
+        "checkin": lambda: count("SELECT COUNT(*) AS n FROM card_fighters JOIN card_notices ON card_notices.id = card_fighters.notice_id "
+                                 "WHERE card_notices.guild_id = ? AND card_fighters.user_id = ? AND card_fighters.checked_in_at >= ? AND card_fighters.checked_in_at < ?",
+                                 (guild_id, user_id, start_iso, end_iso)),
+        "fight": lambda: count("SELECT COUNT(*) AS n FROM fights WHERE guild_id = ? AND (winner_id = ? OR loser_id = ?) "
+                               "AND source = 'result' AND created_at >= ? AND created_at < ?", (guild_id, user_id, user_id, start_iso, end_iso)),
+        "finish_win": lambda: count("SELECT COUNT(*) AS n FROM fights WHERE guild_id = ? AND winner_id = ? AND method IN ('KO/TKO', 'SUB') "
+                                    "AND source = 'result' AND created_at >= ? AND created_at < ?", (guild_id, user_id, start_iso, end_iso)),
+    }
+    progress = {}
+    for key in keys:
+        try:
+            progress[key] = checks[key]() if key in checks else 0
+        except Exception as error:
+            print(f"Task {key} check failed: {error}")
+            progress[key] = 0
     return progress
+
+
+def starter_progress(guild_id: int, user_id: int):
+    def has(sql, params):
+        try:
+            return 1 if discipline_query(sql, params) else 0
+        except sqlite3.OperationalError:
+            return 0
+    return {
+        "start_web": has("SELECT 1 FROM web_accounts WHERE user_id = ?", (user_id,)),
+        "start_app": has("SELECT 1 FROM task_events WHERE guild_id = ? AND user_id = ? AND kind = 'app'", (guild_id, user_id)),
+        "start_bet": has("SELECT 1 FROM bets WHERE guild_id = ? AND user_id = ? LIMIT 1", (guild_id, user_id)),
+        "start_pack": has("SELECT 1 FROM card_packs WHERE guild_id = ? AND user_id = ? LIMIT 1", (guild_id, user_id)),
+    }
+
+
+def task_streak(guild_id: int, user_id: int, week: str):
+    """Weeks in a row (ending last week) that the weekly bonus was claimed."""
+    streak = 0
+    day = datetime.fromisoformat(week).date()
+    for _ in range(52):
+        day -= timedelta(days=7)
+        try:
+            claimed = discipline_query("SELECT 1 FROM coin_task_claims WHERE guild_id = ? AND user_id = ? AND week = ? AND task = 'bonus'",
+                                       (guild_id, user_id, day.isoformat()))
+        except sqlite3.OperationalError:
+            claimed = []
+        if not claimed:
+            break
+        streak += 1
+    return streak
 
 
 def task_claims(guild_id: int, user_id: int, week: str):
@@ -25703,14 +26019,29 @@ def task_status(guild_id: int, user_id: int):
     """(week, end unix, [(key, emoji, text, done, needed, reward, finished, claimed)], bonus ready, bonus claimed)"""
 
     week, _, end = task_week()
-    progress = task_progress(guild_id, user_id)
+    keys = weekly_task_keys(week)
+    progress = task_progress(guild_id, user_id, keys)
     claimed = task_claims(guild_id, user_id, week)
     rows = []
-    for key, (emoji, text, needed, reward) in WEEKLY_TASKS.items():
+    for key in keys:
+        emoji, text, needed, reward = TASK_POOL[key][:4]
         done = min(progress.get(key, 0), needed)
         rows.append((key, emoji, text, done, needed, reward, done >= needed, key in claimed))
     finished = sum(1 for row in rows if row[6])
     return week, end, rows, finished >= WEEKLY_BONUS_TASKS, "bonus" in claimed
+
+
+def starter_status(guild_id: int, user_id: int):
+    """[(key, emoji, text, done, needed, reward, finished, claimed)] for starter tasks not claimed yet."""
+    claimed = task_claims(guild_id, user_id, "starter")
+    progress = starter_progress(guild_id, user_id)
+    rows = []
+    for key, (emoji, text, needed, reward) in STARTER_TASKS.items():
+        if key in claimed:
+            continue
+        done = min(progress.get(key, 0), needed)
+        rows.append((key, emoji, text, done, needed, reward, done >= needed, False))
+    return rows
 
 
 def claim_tasks(guild_id: int, user_id: int):
@@ -25720,19 +26051,24 @@ def claim_tasks(guild_id: int, user_id: int):
     total = 0
     names = []
 
-    payouts = [(key, reward, text) for key, _, text, _, _, reward, finished, claimed in rows if finished and not claimed]
+    payouts = [(week, key, reward, text) for key, _, text, _, _, reward, finished, claimed in rows if finished and not claimed]
     if bonus_ready and not bonus_claimed:
-        payouts.append(("bonus", WEEKLY_BONUS, "Weekly bonus"))
+        payouts.append((week, "bonus", WEEKLY_BONUS, "Weekly bonus"))
+        if task_streak(guild_id, user_id, week) + 1 >= TASK_STREAK_WEEKS:
+            payouts.append((week, "streak", TASK_STREAK_BONUS, f"{task_streak(guild_id, user_id, week) + 1}-week streak"))
+    for key, _, text, _, _, reward, finished, _ in starter_status(guild_id, user_id):
+        if finished:
+            payouts.append(("starter", key, reward, text))
 
-    for key, reward, text in payouts:
+    for when, key, reward, text in payouts:
         try:
             discipline_query(
                 "INSERT INTO coin_task_claims (guild_id, user_id, week, task, amount, claimed_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (guild_id, user_id, week, key, reward, now_utc()), write=True
+                (guild_id, user_id, when, key, reward, now_utc()), write=True
             )
         except sqlite3.IntegrityError:
             continue        # already claimed (double click)
-        add_coins(guild_id, user_id, reward, f"task:{week}:{key}")
+        add_coins(guild_id, user_id, reward, f"task:{when}:{key}")
         total += reward
         names.append(text)
 
@@ -25754,8 +26090,18 @@ def tasks_embed(guild: discord.Guild, member, note: str = None):
         lines.append(f"{emoji} **{text}** · {COIN} {coins_text(reward)}\n-# {bar}  {state}")
 
     bonus_state = "✅ claimed" if bonus_claimed else ("🎉 **ready to claim**" if bonus_ready else f"{min(finished, WEEKLY_BONUS_TASKS)}/{WEEKLY_BONUS_TASKS}")
+    streak = task_streak(guild.id, member.id, week)
+    streak_text = (f"🔥 {streak}-week streak: finish this week for +{coins_text(TASK_STREAK_BONUS)} more" if streak + 1 >= TASK_STREAK_WEEKS
+                   else f"🔥 Get the bonus {TASK_STREAK_WEEKS} weeks running for +{coins_text(TASK_STREAK_BONUS)} each week"
+                   + (f" ({streak} so far)" if streak else ""))
     lines += ["", f"⭐ **Finish {WEEKLY_BONUS_TASKS} tasks** · {COIN} {coins_text(WEEKLY_BONUS)} bonus\n-# {bonus_state}",
-              "", f"🔄 New tasks <t:{end}:R>"]
+              f"-# {streak_text}"]
+    starters = starter_status(guild.id, member.id)
+    if starters:
+        lines += ["", "**🌱 Starter tasks** (once only)"]
+        for key, emoji, text, done, needed, reward, is_done, _ in starters:
+            lines.append(f"{emoji} {text} · {COIN} {coins_text(reward)} · " + ("🎉 **ready to claim**" if is_done else "not yet"))
+    lines += ["", f"🔄 New tasks <t:{end}:R>"]
 
     embed = discord.Embed(title=f"Weekly tasks · {name_without_record(member.display_name)}",
                           description="\n".join(lines)[:4000], color=PFO_GOLD)
@@ -25766,7 +26112,8 @@ def tasks_embed(guild: discord.Guild, member, note: str = None):
 
 def tasks_ready(guild_id: int, user_id: int):
     _, _, rows, bonus_ready, bonus_claimed = task_status(guild_id, user_id)
-    return any(row[6] and not row[7] for row in rows) or (bonus_ready and not bonus_claimed)
+    return (any(row[6] and not row[7] for row in rows) or (bonus_ready and not bonus_claimed)
+            or any(row[6] for row in starter_status(guild_id, user_id)))
 
 
 class TasksView(
@@ -27788,6 +28135,8 @@ async def setup_hook():
     setup_bet_leg_fixed()
     setup_contract_tables()
     setup_card_edit_table()
+    setup_away_table()
+    setup_task_events_table()
     setup_fantasy_extras_table()
     setup_fantasy_tables()
 
@@ -30650,16 +30999,26 @@ PACKS_PER_DAY = int(os.getenv("PACKS_PER_DAY", "5") or 5)
 CARDS_CHANNEL = os.getenv("CARDS_CHANNEL", "bot-commands").strip()
 
 
-def find_cards_channel(guild):
-    if not CARDS_CHANNEL:
+def find_named_channel(guild, setting: str):
+    """A channel from a Railway setting: its ID, or its name (emoji and | ignored)."""
+    setting = (setting or "").strip()
+    if not setting or guild is None:
         return None
-    if CARDS_CHANNEL.isdigit():
-        return guild.get_channel(int(CARDS_CHANNEL))
-    wanted = role_key(CARDS_CHANNEL)
+    if setting.isdigit():
+        return guild.get_channel(int(setting))
+    wanted = role_key(setting)
     for channel in getattr(guild, "text_channels", []):
         if role_key(channel.name) == wanted:
             return channel
     return None
+
+
+def find_cards_channel(guild):
+    return find_named_channel(guild, CARDS_CHANNEL)
+
+
+# Where "Share my slip" posts bet slips (channel name or ID)
+SLIP_CHANNEL = os.getenv("SLIP_CHANNEL", "bot-commands").strip()
 PACK_ITEMS = {"pack_common": "common", "pack_rare": "rare", "pack_champ": "champ"}
 PACK_NAMES = {"common": "Common Pack", "rare": "Rare Pack", "champ": "Champ Pack"}
 COMMON_ODDS = [("prospect", 55), ("ranked", 35), ("contender", 8.5), ("champion", 1.5)]
@@ -31039,11 +31398,47 @@ def card_edits(guild_id: int, user_id: int):
         return {}
 
 
+CARD_EDIT_FINISH_BONUS = 2      # per KO win (STR) or submission win (GRP) after a stat was edited
+CARD_EDIT_LOSS = {"finished": 3, "decision": 2}   # taken off every edited stat per loss after the edit
+
+
+def finish_wins_since(guild_id: int, user_id: int, method: str, since: int):
+    start = datetime.fromtimestamp(since, timezone.utc).isoformat()
+    rows = discipline_query("SELECT COUNT(*) AS n FROM fights WHERE guild_id = ? AND winner_id = ? AND method = ? AND created_at > ?",
+                            (guild_id, user_id, method, start))
+    return rows[0]["n"] if rows else 0
+
+
+def losses_since(guild_id: int, user_id: int, since: int):
+    """(times finished, decision losses) after this time."""
+    start = datetime.fromtimestamp(since, timezone.utc).isoformat()
+    rows = discipline_query("SELECT method FROM fights WHERE guild_id = ? AND loser_id = ? AND created_at > ? AND method NOT IN ('DRAW', 'NC')",
+                            (guild_id, user_id, start))
+    finished = sum(1 for r in rows if r["method"] in ("KO/TKO", "SUB"))
+    return finished, len(rows) - finished
+
+
 def apply_card_edits(guild_id: int, user_id: int, info: dict):
-    """Staff edits replace the worked-out numbers until they're reset."""
-    edits = card_edits(guild_id, user_id)
-    if not edits:
+    """Staff edits replace the worked-out numbers until they're reset. After the edit, an edited
+    STR goes up with every KO win and an edited GRP with every submission win, and every edited
+    stat drops with each loss (more if they were finished)."""
+    try:
+        rows = discipline_query("SELECT field, value, set_at FROM card_edits WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    except sqlite3.OperationalError:
         return info
+    if not rows:
+        return info
+    edits = {}
+    for row in rows:
+        value = row["value"]
+        if row["field"] == "STR":
+            value += CARD_EDIT_FINISH_BONUS * finish_wins_since(guild_id, user_id, "KO/TKO", row["set_at"])
+        elif row["field"] == "GRP":
+            value += CARD_EDIT_FINISH_BONUS * finish_wins_since(guild_id, user_id, "SUB", row["set_at"])
+        if row["field"] != "ovr":
+            finished, decisions = losses_since(guild_id, user_id, row["set_at"])
+            value -= CARD_EDIT_LOSS["finished"] * finished + CARD_EDIT_LOSS["decision"] * decisions
+        edits[row["field"]] = max(20 if row["field"] != "ovr" else 40, min(99, value))
     if "ovr" in edits:
         info["ovr"] = edits["ovr"]
     info["stats"] = [(label, edits.get(label, value)) for label, value in info["stats"]]
@@ -31634,6 +32029,7 @@ class PackResultView(discord.ui.View):
         embed.title = f"🃏 {clean_card_name(interaction.user.display_name)} opened a {PACK_NAMES[discipline_query('SELECT pack FROM card_packs WHERE id = ?', (self.pack_id,))[0]['pack']]}"
         embed.set_footer(text="Get packs in /shop")
         channel = find_cards_channel(self.guild) or interaction.channel
+        log_task_event(self.guild.id, self.user_id, "show_pack", self.pack_id)
         try:
             await channel.send(embed=embed, file=file)
             if channel != interaction.channel:
