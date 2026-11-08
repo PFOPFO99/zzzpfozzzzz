@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "25"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "27"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -1438,7 +1438,7 @@ def render_fighter(ctx, user_id):
     except Exception:
         former_html = ""
 
-    # Shop items: nickname, badge, quote and website style
+    # Shop items: nickname, badge, quote and profile theme
     cos_fn = getattr(ctx, "get_cosmetics", None)
     cosmetics = cos_fn(ctx.gid, user_id) if cos_fn else {}
     nick_html = f'<span class="fnick l-up">“{esc(cosmetics["nickname"])}”</span>' if cosmetics.get("nickname") else ""
@@ -2271,10 +2271,28 @@ def market_card(ctx, market, cache):
                         f'data-label="{esc(plain)} to win">{main}</button>')
             stats = stats_for(ctx, fighter_id, cache)
             record = ctx.stats_record(stats) if stats else ""
+            # Form guide: last 5 results, newest on the right
+            pills = ""
+            recent = (stats["fights"] if stats else [])[-5:]
+            for fight in recent:
+                if fight["method"] == "NC":
+                    r, pcls = "NC", "pill-nc"
+                elif fight["method"] == "DRAW":
+                    r, pcls = "D", "pill-d"
+                elif ctx.fight_is_win_for(fight, fighter_id):
+                    r, pcls = "W", "pill-w"
+                else:
+                    r, pcls = "L", "pill-l"
+                pills += f'<span class="pill {pcls}">{r}</span>'
+            letters = [p for p in re.findall(r">(W|L|D|NC)<", pills)]
+            hot = " 🔥" if letters[-3:] == ["W", "W", "W"] else " 🧊" if letters[-3:] == ["L", "L", "L"] else ""
+            if not pills and not (stats and (stats["wins"] + stats["losses"] + stats["draws"])):
+                pills = '<span class="pill pill-nc">DEBUT</span>'
+            form_html = f'<span class="sbform" title="Last 5 results, newest on the right">{pills}{hot}</span>' if pills else ""
             return (f'<div class="sb-side{cls}">{avatar_html(ctx, fighter_id, name, "av")}'
                     f'<span class="sb-who"><span class="d sb-name">{name_link(ctx, fighter_id, clean_name(ctx, name))}'
                     f'{f" <span class=sb-tag>{esc(tag)}</span>" if tag else ""}</span>'
-                    f'<span class="muted tab">{esc(record)}</span></span>'
+                    f'<span class="muted tab">{esc(record)}</span>{form_html}</span>'
                     f'<span class="sb-price">{main}{methods}</span></div>')
 
         money = (f'<div class="sb-money"><span class="sb-bar"><span style="width:{share_a}%"></span></span>'
@@ -3203,6 +3221,16 @@ img{max-width:100%}
 .fstyle-crimson .fhero-name{color:#FFE4E5}
 .fstyle-ice{background:radial-gradient(70% 90% at 15% 30%,rgba(127,176,255,.18),rgba(8,8,10,0) 60%)}
 .fstyle-ice .fhero-name{color:#E6F0FF}
+.fstyle-emerald{background:radial-gradient(70% 90% at 15% 30%,rgba(63,191,127,.18),rgba(8,8,10,0) 60%)}
+.fstyle-emerald .fhero-name{color:#E3FFF0}
+.fstyle-neon{background:radial-gradient(70% 90% at 15% 30%,rgba(224,79,216,.2),rgba(58,15,99,.12) 45%,rgba(8,8,10,0) 65%)}
+.fstyle-neon .fhero-name{color:#FFE6FD;text-shadow:0 0 24px rgba(224,79,216,.45)}
+.fstyle-royal{background:radial-gradient(70% 90% at 15% 30%,rgba(139,124,240,.2),rgba(8,8,10,0) 60%)}
+.fstyle-royal .fhero-name{color:#EEEAFF}
+.fstyle-royal .av-hero{box-shadow:0 0 0 3px #8B7CF0,0 0 0 7px rgba(201,162,74,.35)}
+.fstyle-blackout{background:linear-gradient(180deg,#000,rgba(8,8,10,0))}
+.fstyle-blackout .fhero-name{color:#FFFFFF}
+.fstyle-blackout .av-hero{filter:grayscale(1);box-shadow:0 0 0 3px #D4D4D4}
 .spot{display:flex;flex-wrap:wrap;align-items:center;gap:22px 32px;padding:30px 34px;border:1px solid #3A311B;border-radius:20px;color:var(--text);background:radial-gradient(120% 120% at 0% 0%,rgba(201,162,74,.16),rgba(8,8,10,0) 55%),var(--panel);transition:border-color .35s,transform .35s var(--ease)}
 .spot:hover{color:var(--text);border-color:#5A4A22;transform:translateY(-3px)}
 .spot-name{font-size:48px;line-height:.9}
@@ -3640,6 +3668,8 @@ img{max-width:100%}
 .sb-price{flex-direction:row;flex-wrap:wrap;justify-content:center;max-width:150px}
 .sb-methods{display:flex;flex-wrap:wrap;gap:6px 8px;font-size:10px;letter-spacing:.08em;color:var(--dim);width:100%;justify-content:center}
 .sb-methods b{color:var(--muted);font-weight:700}
+.sbform{display:inline-flex;flex-wrap:wrap;align-items:center;gap:3px;margin-top:3px;font-size:11px}
+.sbform .pill{min-width:20px;height:18px;padding:0 4px;border-radius:5px;font-size:10px}
 .sb-vs{font-size:18px;color:var(--dim)}
 .sb-money{display:flex;flex-direction:column;gap:6px;margin-top:14px}
 .sb-money .muted{font-size:12px;text-align:center}
@@ -6437,8 +6467,11 @@ def render_me(ctx, viewer, query):
             f'<span class="prank-v">{esc(states.get(r["status"], r["status"]))}{(" until " + when_html(r["expires_at"])) if r["expires_at"] else ""}</span></li>'
             for r in owned if r["item"] in ctx.SHOP_ITEMS)
         cos = ctx.get_cosmetics(gid, uid) or {}
+        if cos.get("style"):
+            cos = dict(cos)
+            cos["style"] = ctx.PROFILE_STYLES.get(cos["style"], cos["style"]) + " (Discord and website)"
         extras = "".join(f'<span class="tpick">{esc(label)}: {esc(cos[key])}</span>' for key, label in
-                         (("nickname", "Nickname"), ("badge", "Badge"), ("quote", "Quote"), ("style", "Style")) if cos.get(key))
+                         (("nickname", "Nickname"), ("badge", "Badge"), ("quote", "Quote"), ("style", "Profile theme")) if cos.get(key))
         blocks.append(("MY ITEMS", "items", (f'<ol class="prank prank-plain">{item_rows}</ol>' if item_rows else '<p class="muted">No items right now.</p>')
                        + (f'<div class="tpicks">{extras}</div>' if extras else "") + '<p class="note"><a href="/shop">Visit the shop →</a></p>'))
     except Exception:
@@ -6538,7 +6571,7 @@ def render_shop(ctx):
         if not enabled:
             continue
         groups.setdefault(category, []).append((key, name, emoji, price, needs_staff, about))
-    choices = {"badge": {b: b for b in ctx.BADGES}, "profile_style": dict(ctx.PROFILE_STYLES), "name_colour": {c: c for c in ctx.NAME_COLOURS}}
+    choices = {"badge": {b: b for b in ctx.BADGES}, "profile_style": dict(getattr(ctx, "PROFILE_THEMES", None) or ctx.PROFILE_STYLES), "name_colour": {c: c for c in ctx.NAME_COLOURS}}
     sections = ""
     for category in SHOP_ORDER + [c for c in groups if c not in SHOP_ORDER]:
         items = groups.get(category)

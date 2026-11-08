@@ -4304,6 +4304,14 @@ async def create_profile_embed(
         timestamp=discord.utils.utcnow()
     )
 
+    # Profile Theme from the shop recolours the profile (no theme: PFO gold).
+    try:
+        theme = (get_cosmetics(guild.id, member.id) or {}).get("style") if member.id else None
+        if theme in PROFILE_THEME_COLOURS:
+            embed.colour = PROFILE_THEME_COLOURS[theme]
+    except Exception as error:
+        print(f"Profile theme lookup failed: {error}")
+
     apply_branding(
         embed,
         banner_file=PROFILE_BANNER_FILE,
@@ -16043,6 +16051,36 @@ def pick_odds(bout, pick: str, method: str = None):
     return odds
 
 
+def fight_form(guild_id: int, user_id: int, name: str = None, size: int = 5):
+    """Last results oldest → newest, e.g. ["W", "W", "L", "W", "W"] (D = draw, NC = no contest)."""
+    try:
+        stats = get_fighter_stats(guild_id, user_id, name)
+    except Exception:
+        return [], 0
+    out = []
+    for fight in stats["fights"][-size:]:
+        if fight["method"] == "NC":
+            out.append("NC")
+        elif fight["method"] == "DRAW":
+            out.append("D")
+        else:
+            out.append("W" if fight_is_win_for(fight, user_id, name) else "L")
+    return out, stats["wins"] + stats["losses"] + stats["draws"]
+
+
+def form_text(guild_id: int, user_id: int, name: str = None):
+    """Form guide for the sportsbook: "W W L W W 🔥", "DEBUT" or "–" (record typed in, no logged fights)."""
+    form, total = fight_form(guild_id, user_id, name)
+    if not form:
+        return "DEBUT" if not total else "–"
+    hot = ""
+    if len(form) >= 3 and form[-3:] == ["W", "W", "W"]:
+        hot = " 🔥"
+    elif len(form) >= 3 and form[-3:] == ["L", "L", "L"]:
+        hot = " 🧊"
+    return " ".join(form) + hot
+
+
 def pick_label(bout, pick: str, method: str = None):
 
     name = bout["name_a"] if pick == "a" else bout["name_b"]
@@ -16160,6 +16198,14 @@ def sportsbook_embeds(market):
             f"`{odds['a']:.2f}`  **{bout['name_a']}**" + (f" {tag_a}" if tag_a else "") + arrow(odds["a"], odds["open_a"]),
             f"`{odds['b']:.2f}`  **{bout['name_b']}**" + (f" {tag_b}" if tag_b else "") + arrow(odds["b"], odds["open_b"]),
         ]
+
+        try:
+            surname_a = bout["name_a"].split()[-1] if bout["name_a"] else "A"
+            surname_b = bout["name_b"].split()[-1] if bout["name_b"] else "B"
+            lines.append(f"-# Form · {surname_a} {form_text(market['guild_id'], bout['fighter_a'], bout['name_a'])}"
+                         f" · {surname_b} {form_text(market['guild_id'], bout['fighter_b'], bout['name_b'])}")
+        except Exception as error:
+            print(f"Form guide failed: {error}")
 
         if odds["pool"]:
             favourite = "a" if pools["a"] >= pools["b"] else "b"
@@ -16602,6 +16648,15 @@ class BetSlipView(
                 lines.append(f"-# Bets pay at most {MAX_BET_ODDS:g}× your stake")
         else:
             lines.append("1) Choose a fight  2) choose your pick. Add picks from other fights for an accumulator.")
+
+        chosen = bouts.get(self.chosen)
+        if chosen:
+            try:
+                lines += ["", f"**Form** (last 5, newest on the right)",
+                          f"{chosen['name_a']}: `{form_text(self.guild.id, chosen['fighter_a'], chosen['name_a'])}`",
+                          f"{chosen['name_b']}: `{form_text(self.guild.id, chosen['fighter_b'], chosen['name_b'])}`"]
+            except Exception as error:
+                print(f"Slip form guide failed: {error}")
 
         lines += ["", f"Your balance: {COIN} **{coins_text(balance)}**"]
 
@@ -23583,8 +23638,9 @@ SHOP_ITEMS = {
                   f"Your profile featured on the website home page for {SPOTLIGHT_DAYS} days."),
     "nickname": ("Fighter Nickname", "🏷️", 2500, "Profile & looks", True,
                  "A fighter nickname like \"The Diamond\" on your /profile, Tale of the Tape and website page."),
-    "profile_style": ("Website Profile Style", "✨", 2000, "Profile & looks", False,
-                      "A gold frame, glow or colour accent on your website fighter page."),
+    "profile_style": ("Profile Theme", "✨", 2000, "Profile & looks", False,
+                      "A colour theme for your profile on Discord (/profile) AND your fighter page on the website. "
+                      "Crimson, Ice, Emerald, Neon, Royal or Blackout."),
     "name_colour": ("Name Colour", "🎨", 1500, "Profile & looks", False,
                     f"A colour for your name in the server for {NAME_COLOUR_DAYS} days."),
     "badge": ("Profile Badge", "🏅", 1000, "Profile & looks", False,
@@ -23618,7 +23674,14 @@ SHOP_ITEMS = {
 BADGES = ["The Finisher", "Knockout Artist", "Sub Specialist", "Underdog King", "Iron Chin",
           "Fan Favourite", "The Prospect", "The Veteran", "Road Warrior", "Pressure Fighter"]
 
-PROFILE_STYLES = {"gold": "Gold frame", "glow": "Gold glow", "crimson": "Crimson accent", "ice": "Ice accent"}
+# Every theme someone can have (gold frame and glow were sold before themes, and still work for them).
+PROFILE_STYLES = {"gold": "Gold frame", "glow": "Gold glow", "crimson": "Crimson", "ice": "Ice", "emerald": "Emerald",
+                  "neon": "Neon", "royal": "Royal", "blackout": "Blackout"}
+# The ones on sale now (Profile Theme in the shop).
+PROFILE_THEMES = {key: PROFILE_STYLES[key] for key in ("crimson", "ice", "emerald", "neon", "royal", "blackout")}
+# The /profile embed colour for each theme (no theme: PFO gold).
+PROFILE_THEME_COLOURS = {"crimson": 0xD2453A, "ice": 0x6CC6EA, "emerald": 0x3FBF7F, "neon": 0xE04FD8,
+                         "royal": 0x8B7CF0, "blackout": 0xD4D4D4}
 
 NAME_COLOURS = {
     "Gold": 0xD4A84C, "Red": 0xE5484D, "Blue": 0x3B82F6, "Green": 0x3DD68C, "Purple": 0xA855F7,
@@ -24422,8 +24485,8 @@ async def buy_item(interaction: discord.Interaction, item: str, target=None, cho
 
     if item == "badge" and choice not in BADGES:
         return "❌ Pick a badge."
-    if item == "profile_style" and choice not in PROFILE_STYLES:
-        return "❌ Pick a style."
+    if item == "profile_style" and choice not in PROFILE_THEMES:
+        return "❌ Pick a theme."
     if item == "name_colour" and choice not in NAME_COLOURS:
         return "❌ Pick a colour."
 
@@ -24530,11 +24593,11 @@ async def use_item(interaction: discord.Interaction, item_id: int, choice: str =
         return f"🏅 Your badge is now **{choice}**."
 
     if item == "profile_style":
-        if choice not in PROFILE_STYLES:
-            return "❌ Pick a style."
+        if choice not in PROFILE_THEMES:
+            return "❌ Pick a theme."
         set_cosmetic(guild.id, row["user_id"], style=choice)
         set_item(item_id, status="used", data={"style": choice})
-        return f"✨ Your website profile now has the **{PROFILE_STYLES[choice]}**."
+        return f"✨ Your profile theme is now **{PROFILE_STYLES[choice]}**, on Discord (`/profile`) and on the website."
 
     if item == "name_colour":
         if choice not in NAME_COLOURS:
@@ -24782,7 +24845,7 @@ class ShopPanel(
                 amount_menu.callback = self.pick_amount
                 self.add_item(amount_menu)
 
-            choices = {"badge": BADGES, "profile_style": list(PROFILE_STYLES), "name_colour": list(NAME_COLOURS)}.get(self.item)
+            choices = {"badge": BADGES, "profile_style": list(PROFILE_THEMES), "name_colour": list(NAME_COLOURS)}.get(self.item)
             if choices:
                 labels = PROFILE_STYLES if self.item == "profile_style" else {c: c for c in choices}
                 menu = discord.ui.Select(
@@ -24841,7 +24904,7 @@ class ShopPanel(
         if cosmetics.get("quote"):
             extras.append(f"💬 Quote: *“{cosmetics['quote']}”*")
         if cosmetics.get("style"):
-            extras.append(f"✨ Website style: **{PROFILE_STYLES.get(cosmetics['style'], cosmetics['style'])}**")
+            extras.append(f"✨ Profile theme: **{PROFILE_STYLES.get(cosmetics['style'], cosmetics['style'])}** (Discord and website)")
 
         bounty = open_bounty_total(self.guild.id, self.user_id)
         if bounty:
@@ -24880,7 +24943,7 @@ class ShopPanel(
 
         if self.item and self.item.startswith("use:"):
             row = discipline_query("SELECT * FROM shop_items WHERE id = ?", (int(self.item[4:]),))[0]
-            choices = {"badge": BADGES, "profile_style": list(PROFILE_STYLES), "name_colour": list(NAME_COLOURS)}.get(row["item"])
+            choices = {"badge": BADGES, "profile_style": list(PROFILE_THEMES), "name_colour": list(NAME_COLOURS)}.get(row["item"])
             if choices:
                 labels = PROFILE_STYLES if row["item"] == "profile_style" else {c: c for c in choices}
                 pick = discord.ui.Select(placeholder="Choose one",
@@ -27418,7 +27481,7 @@ LOOT_PRIZES = [
     ("📈", "Higher Bet Limit", 3, "epic", "bet_limit"),
     ("🏅", "Profile Badge", 2, "epic", "badge"),
     ("🎨", "Name Colour", 1.5, "epic", "name_colour"),
-    ("✨", "Website Profile Style", 0.5, "legendary", "profile_style"),
+    ("✨", "Profile Theme", 0.5, "legendary", "profile_style"),
 ]
 
 RARITY_STYLE = {
