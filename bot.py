@@ -4305,6 +4305,7 @@ async def create_profile_embed(
     )
 
     # Profile Theme from the shop recolours the profile (no theme: PFO gold).
+    theme = None
     try:
         theme = (get_cosmetics(guild.id, member.id) or {}).get("style") if member.id else None
         if theme in PROFILE_THEME_COLOURS:
@@ -4318,6 +4319,13 @@ async def create_profile_embed(
         author_text="PFO • FIGHTER PROFILE",
         show_thumbnail=False
     )
+
+    # Profile Theme: the theme's own colour of the banner, made by the website.
+    try:
+        if theme in PROFILE_THEME_TINTS and ASSET_BASE_URL and BOT_SITE_URL and website_running():
+            embed.set_image(url=f"{BOT_SITE_URL}/theme-banner/{theme}.gif?v={ASSET_VERSION}")
+    except Exception as error:
+        print(f"Theme banner failed: {error}")
 
     avatar = getattr(member, "display_avatar", None)
 
@@ -23682,6 +23690,69 @@ PROFILE_THEMES = {key: PROFILE_STYLES[key] for key in ("crimson", "ice", "emeral
 # The /profile embed colour for each theme (no theme: PFO gold).
 PROFILE_THEME_COLOURS = {"crimson": 0xD2453A, "ice": 0x6CC6EA, "emerald": 0x3FBF7F, "neon": 0xE04FD8,
                          "royal": 0x8B7CF0, "blackout": 0xD4D4D4}
+
+# ---------------- theme banners ----------------
+# A Profile Theme also gets its own colour of the /profile banner. The website
+# makes it from the normal profile.gif (gold parts turn the theme's colour, plus a
+# soft glow of it) and serves it at /theme-banner/<theme>.gif, so nothing has to be
+# uploaded. If the website isn't running, /profile keeps the normal banner.
+# (Pillow HSV hue 0-255, saturation boost)
+PROFILE_THEME_TINTS = {"crimson": (2, 1.15), "ice": (138, 1.0), "emerald": (104, 1.05), "neon": (213, 1.35),
+                       "royal": (178, 1.15), "blackout": (None, 0)}
+
+
+def website_running():
+    try:
+        import website as _site
+        return getattr(_site, "_runner", None) is not None
+    except Exception:
+        return False
+
+
+def themed_banner_gif(source: bytes, theme: str) -> bytes:
+    """Recolours an animated banner for a profile theme. Returns GIF bytes."""
+    import io as _io
+    from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageSequence
+    hue, boost = PROFILE_THEME_TINTS[theme]
+    colour = PROFILE_THEME_COLOURS[theme]
+    rgb = ((colour >> 16) & 255, (colour >> 8) & 255, colour & 255)
+    src = Image.open(_io.BytesIO(source))
+    frames, durations = [], []
+    glow = keep = None
+    for frame in ImageSequence.Iterator(src):
+        durations.append(frame.info.get("duration", src.info.get("duration", 60)))
+        img = frame.convert("RGB")
+        original = img
+        if keep is None:
+            # The PFO logo (the circle on the left of every banner) keeps its real colours.
+            w, h = img.size
+            keep = Image.new("L", (w, h), 0)
+            cx, cy, r = w * 108 / 800, h / 2, h * 0.46
+            ImageDraw.Draw(keep).ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+            keep = keep.filter(ImageFilter.GaussianBlur(max(1, h // 100)))
+        if glow is None:
+            # The theme colour, strongest on the left, fading out to the right.
+            w, h = img.size
+            fade = Image.linear_gradient("L").rotate(90).resize((w, h))
+            fade = fade.point(lambda v: int(v * 0.30))
+            glow = Image.composite(Image.new("RGB", (w, h), rgb), Image.new("RGB", (w, h), (0, 0, 0)), fade)
+        if hue is None:
+            grey = img.convert("L").point(lambda v: min(255, int((v - 128) * 1.15 + 128)) if v > 0 else 0)
+            img = Image.merge("RGB", (grey, grey, grey))
+        else:
+            h_, s_, v_ = img.convert("HSV").split()
+            h_ = h_.point(lambda x: (hue + x - 29) % 256 if 6 <= x <= 54 else x)
+            s_ = s_.point(lambda x: min(255, int(x * boost)))
+            img = Image.merge("HSV", (h_, s_, v_)).convert("RGB")
+            img = ImageChops.screen(img, glow)
+        frames.append(Image.composite(original, img, keep))
+    # One shared palette for every frame keeps the file small (about the size of the original).
+    first = frames[0].quantize(colors=255, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
+    palette_frames = [first] + [f.quantize(palette=first, dither=Image.Dither.NONE) for f in frames[1:]]
+    out = _io.BytesIO()
+    palette_frames[0].save(out, format="GIF", save_all=True, append_images=palette_frames[1:], duration=durations,
+                           loop=0, optimize=True, disposal=1)
+    return out.getvalue()
 
 NAME_COLOURS = {
     "Gold": 0xD4A84C, "Red": 0xE5484D, "Blue": 0x3B82F6, "Green": 0x3DD68C, "Purple": 0xA855F7,
