@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "24"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "25"            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -2225,6 +2225,11 @@ def market_card(ctx, market, cache):
             lose_name = bout["name_b"] if winner == "a" else bout["name_a"]
             upset = odds[winner] > odds["b" if winner == "a" else "a"]
             how = ctx.METHOD_NAMES.get(bout["method"], bout["method"] or "") if getattr(ctx, "METHOD_NAMES", None) else ""
+            try:
+                if how and bout["method"] in ("KO/TKO", "SUB") and bout["rnd"]:
+                    how += f" R{bout['rnd']}"
+            except (IndexError, KeyError):
+                pass
             rows += (f'<div class="sbfight sb-done {stagger(i)}">{head}<div class="sb-result">'
                      f'<span class="d"><span class="gold">{esc(win_name)}</span> <span class="def">DEF.</span> {esc(lose_name)}</span>'
                      f'<span class="muted">{esc(how.upper())} · WON AT {odds[winner]:.2f}{" · " if upset else ""}'
@@ -2247,10 +2252,12 @@ def market_card(ctx, market, cache):
             plain = clean_name(ctx, name)
             try:
                 parts = []
-                for method, short in (("KO/TKO", "KO"), ("SUB", "SUB"), ("DEC", "DEC")):
+                round_picks = list(getattr(ctx, "ROUND_PICKS", {}) or {})
+                for method, short in (("KO/TKO", "KO"), ("SUB", "SUB"), ("DEC", "DEC"), *((r, r) for r in round_picks)):
                     value = ctx.pick_odds(bout, pick, method)
                     if is_open:
-                        label = f"{plain} by {ctx.METHOD_NAMES.get(method, method)}"
+                        label = (f"{plain} to finish in Round {ctx.ROUND_PICKS[method]}" if method in round_picks
+                                 else f"{plain} by {ctx.METHOD_NAMES.get(method, method)}")
                         parts.append(f'<button type="button" class="obtn obtn-m" data-pos="{pos}" data-pick="{pick}" data-method="{method}" '
                                      f'data-o="{pos}:{pick}:{method}" data-label="{esc(label)}">{short} <b>{value:.2f}</b></button>')
                     else:
@@ -3631,7 +3638,7 @@ img{max-width:100%}
 .odds{font-size:30px;line-height:1;color:var(--gold2);background:rgba(201,162,74,.08);border:1px solid rgba(201,162,74,.28);border-radius:10px;padding:6px 10px;min-width:74px;text-align:center}
 .omove{font-size:10px;margin-left:4px}.omove.down{color:var(--green)}.omove.up{color:var(--red)}
 .sb-price{flex-direction:row;flex-wrap:wrap;justify-content:center;max-width:150px}
-.sb-methods{display:flex;gap:8px;font-size:10px;letter-spacing:.08em;color:var(--dim);width:100%;justify-content:center}
+.sb-methods{display:flex;flex-wrap:wrap;gap:6px 8px;font-size:10px;letter-spacing:.08em;color:var(--dim);width:100%;justify-content:center}
 .sb-methods b{color:var(--muted);font-weight:700}
 .sb-vs{font-size:18px;color:var(--dim)}
 .sb-money{display:flex;flex-direction:column;gap:6px;margin-top:14px}
@@ -3783,6 +3790,13 @@ time[title]{text-decoration:underline dotted rgba(161,161,170,.45);text-underlin
 .mejump{display:flex;flex-wrap:wrap;gap:6px 18px;padding:22px 0;font-size:12px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;border-bottom:1px solid var(--line)}
 .mejump a{color:var(--muted)}.mejump a:hover{color:var(--gold2)}
 .mesec{scroll-margin-top:90px}
+.spinbox{display:grid;grid-template-columns:minmax(0,320px) minmax(0,1fr);gap:24px;align-items:center}
+@media (max-width:700px){.spinbox{grid-template-columns:minmax(0,1fr)}}
+.spinwheel{position:relative;max-width:320px;width:100%;margin:0 auto}
+.spinwheel canvas{width:100%;height:auto;aspect-ratio:1;display:block}
+.spinptr{position:absolute;top:-6px;left:50%;transform:translateX(-50%);width:0;height:0;border-left:13px solid transparent;border-right:13px solid transparent;border-top:24px solid var(--gold);z-index:2}
+.spinside{display:flex;flex-direction:column;gap:10px;align-items:flex-start;min-width:0}
+.upglist li{align-items:center}
 .mesec .head-t{margin-bottom:20px}
 .nextfight{border:1px solid rgba(201,162,74,.5);border-radius:18px;background:linear-gradient(135deg,rgba(201,162,74,.12),transparent 60%),var(--panel);padding:24px;display:flex;flex-direction:column;gap:12px;align-items:flex-start;margin-bottom:16px}
 .nf-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap;font-size:26px}
@@ -4522,7 +4536,7 @@ V2_JS = r"""
             ['a', 'b'].forEach(function (pick) {
               var main = $('[data-o="' + pos + ':' + pick + ':"] .odds', section);
               if (main) flash(main, o[pick].toFixed(2), +main.textContent);
-              ['KO/TKO', 'SUB', 'DEC'].forEach(function (m) {
+              ['KO/TKO', 'SUB', 'DEC', 'R1', 'R2', 'R3'].forEach(function (m) {
                 var el = $('[data-o="' + pos + ':' + pick + ':' + m + '"] b', section);
                 if (el && o.methods[pick + m]) flash(el, o.methods[pick + m].toFixed(2), +el.textContent);
               });
@@ -4957,8 +4971,57 @@ CARDS_JS = r"""
       post('/api/cards/sell', {}, b, true); return;
     }
     b = e.target.closest('[data-trade]');
-    if (b) { post('/api/cards/trade/respond', { trade_id: b.getAttribute('data-trade'), action: b.getAttribute('data-a') }, b, true); }
+    if (b) { post('/api/cards/trade/respond', { trade_id: b.getAttribute('data-trade'), action: b.getAttribute('data-a') }, b, true); return; }
+    b = e.target.closest('[data-upgrade]');
+    if (b) {
+      if (b.getAttribute('data-sure') !== '1') { b.setAttribute('data-sure', '1'); b.textContent = 'TAP AGAIN · ' + (+b.getAttribute('data-price')).toLocaleString() + ' COINS'; return; }
+      post('/api/cards/upgrade', { card_id: b.getAttribute('data-upgrade') }, b, true);
+    }
   });
+
+  // ---- daily spin ----
+  var wheel = $('[data-spinwheel]');
+  if (wheel) {
+    var prizes = []; try { prizes = JSON.parse(wheel.getAttribute('data-spinwheel')); } catch (err) {}
+    var cx = wheel.getContext('2d'), N = prizes.length, SEG = 2 * Math.PI / Math.max(N, 1), rot = 0;
+    var draw = function () {
+      var r = 270; cx.clearRect(0, 0, 560, 560); cx.save(); cx.translate(280, 280); cx.rotate(rot);
+      prizes.forEach(function (p, i) {
+        cx.beginPath(); cx.moveTo(0, 0); cx.arc(0, 0, r, i * SEG, (i + 1) * SEG); cx.closePath();
+        cx.fillStyle = p[1]; cx.fill(); cx.strokeStyle = '#08080a'; cx.lineWidth = 3; cx.stroke();
+        cx.save(); cx.rotate(i * SEG + SEG / 2); cx.textAlign = 'right'; cx.fillStyle = '#f4f4f5';
+        cx.font = '600 22px Inter, system-ui, sans-serif'; cx.fillText(p[0], r - 18, 8); cx.restore();
+      });
+      cx.beginPath(); cx.arc(0, 0, r, 0, 2 * Math.PI); cx.strokeStyle = '#c9a24a'; cx.lineWidth = 9; cx.stroke();
+      cx.rotate(-rot); cx.beginPath(); cx.arc(0, 0, 44, 0, 2 * Math.PI); cx.fillStyle = '#08080a'; cx.fill();
+      cx.strokeStyle = '#c9a24a'; cx.lineWidth = 4; cx.stroke(); cx.fillStyle = '#c9a24a'; cx.textAlign = 'center';
+      cx.font = '800 30px Inter, system-ui, sans-serif'; cx.fillText('PFO', 0, 11); cx.restore();
+    };
+    draw();
+    var spinBtn = $('[data-spin]');
+    if (spinBtn) spinBtn.addEventListener('click', function () {
+      if (spinBtn.disabled) return;
+      spinBtn.disabled = true;
+      P.post('/api/spin', {}).then(function (d) {
+        if (!d.ok) { P.toast(d.message, 'bad'); spinBtn.disabled = false; return; }
+        var target = -Math.PI / 2 - (d.index * SEG + SEG / 2) + (Math.random() - 0.5) * SEG * 0.6, end = target;
+        while (end < rot + 2 * Math.PI * 5) end += 2 * Math.PI;
+        var start = rot, t0 = performance.now(), quick = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+        var dur = quick ? 1 : 3400;
+        (function step(now) {
+          var k = Math.min(1, (now - t0) / dur), ease = 1 - Math.pow(1 - k, 4);
+          rot = start + (end - start) * ease; draw();
+          if (k < 1) { requestAnimationFrame(step); return; }
+          rot = rot % (2 * Math.PI);
+          P.toast(d.message, 'ok');
+          var st = $('[data-spinstate]'); if (st) st.textContent = d.message;
+          if (d.again) { spinBtn.disabled = false; spinBtn.textContent = 'SPIN AGAIN'; }
+          else { spinBtn.textContent = 'COME BACK TOMORROW'; }
+          if (d.pack_id) setTimeout(function () { location.href = '/me/cards?pack=' + d.pack_id; }, 1600);
+        })(t0);
+      }).catch(function () { spinBtn.disabled = false; P.toast('Something went wrong. Try again.', 'bad'); });
+    });
+  }
 
   var form = $('[data-tradeform]');
   if (form) {
@@ -5707,7 +5770,7 @@ def add_action_routes(app, bot, g):
             live = g["live_odds"](bout)
             methods = {}
             for pick in ("a", "b"):
-                for method in ("KO/TKO", "SUB", "DEC"):
+                for method in ("KO/TKO", "SUB", "DEC", *(g.get("ROUND_PICKS") or {})):
                     try:
                         methods[f"{pick}{method}"] = g["pick_odds"](bout, pick, method)
                     except Exception:
@@ -5726,7 +5789,7 @@ def add_action_routes(app, bot, g):
             method = leg.get("method") or None
             if position is None or pick not in ("a", "b"):
                 continue
-            if method not in g["METHOD_NAMES"]:
+            if method not in g["METHOD_NAMES"] and method not in (g.get("ROUND_PICKS") or {}):
                 method = None
             legs[position] = (pick, method)
         stake = _int(body.get("stake"), 0)
@@ -6093,7 +6156,7 @@ def coin_reason(reason):
     """A friendly label for a coin ledger line."""
     r = reason or ""
     table = [
-        ("daily", "Daily bonus"), ("task:", "Weekly task"), ("bet:", "Bet paid out"), ("stake:", "Bet placed"),
+        ("daily", "Daily spin"), ("cards:upgrade", "Card upgrade"), ("cards:sell", "Sold cards"), ("task:", "Weekly task"), ("bet:", "Bet paid out"), ("stake:", "Bet placed"),
         ("shoprefund:", "Shop refund"), ("shop:", "Shop"), ("loot:", "Loot drop"), ("fight:", "Fight pay"),
         ("ach:", "Achievement"), ("fantasy", "Fantasy prize"), ("gift", "Gift"), ("bounty", "Bounty"),
         ("jackpot", "Jackpot"), ("staff:", "From staff"), ("admin:", "From staff"), ("box", "Mystery box"),
@@ -6193,6 +6256,24 @@ def render_me(ctx, viewer, query):
 
     blocks = []
 
+    # ---------- daily spin ----------
+    if "do_spin" in ctx.g:
+        try:
+            can, _, streak = ctx.spin_status(gid, uid)
+            prizes = json.dumps([[p[2], "#%02x%02x%02x" % c] for p, c in zip(ctx.SPIN_PRIZES, ctx.SPIN_COLOURS)])
+            odds = " · ".join(f"{p[2]} {p[3]:g}%" for p in ctx.SPIN_PRIZES)
+            state = ("Your free spin is ready." if can else f"You've spun today. Next spin {when_html(ctx.next_spin_unix())}.")
+            blocks.append(("DAILY SPIN", "spin",
+                           f'<div class="spinbox"><div class="spinwheel"><span class="spinptr" aria-hidden="true"></span>'
+                           f'<canvas data-spinwheel=\'{esc(prizes)}\' width="560" height="560" aria-label="Daily spin wheel"></canvas></div>'
+                           f'<div class="spinside"><p class="muted" data-spinstate>{state}</p>'
+                           f'<p class="muted">Spin streak <b class="gold">{streak}</b> · every {ctx.SPIN_STREAK_DAYS}th day in a row, '
+                           f'nothing below {ctx.SPIN_STREAK_MIN} coins.</p>'
+                           f'<button class="btn btn-gold" type="button" data-spin{"" if can else " disabled"}>{"SPIN" if can else "COME BACK TOMORROW"}</button>'
+                           f'<p class="note">{esc(odds)}</p></div></div>'))
+        except Exception:
+            traceback.print_exc()
+
     # ---------- next fight + sign-ups ----------
     nxt = find_next_fight(ctx, uid)
     fight_html = ""
@@ -6234,6 +6315,42 @@ def render_me(ctx, viewer, query):
     # ---------- bets ----------
     blocks.append(("MY BETS", "bets", '<div data-mybets><p class="muted">Loading your bets…</p></div>'
                    '<p class="note"><a href="/sportsbook">Go to the sportsbook →</a> Coins are points only and have no money value.</p>'))
+
+    # ---------- bet stats ----------
+    if "bet_stats" in ctx.g:
+        try:
+            bs = ctx.bet_stats(gid, uid)
+            if bs["won"] + bs["lost"] + bs["cashed"]:
+                place, total = ctx.bet_profit_rank(gid, uid)
+                sign = "+" if bs["profit"] >= 0 else ""
+                tiles = "".join(f'<div class="ftile"><span class="d ftile-v">{esc(v)}</span><span class="num-l">{label}</span></div>' for label, v in (
+                    ("PROFIT", f"{sign}{bs['profit']:,}"), ("HIT RATE", f"{bs['hit']}%"),
+                    ("RETURN", f"{'+' if (bs['roi'] or 0) >= 0 else ''}{bs['roi']}%" if bs["roi"] is not None else "–"),
+                    ("BEST RUN", bs["best_run"])))
+
+                def rate(won, lost):
+                    return f"{won}-{lost} · {round(100 * won / (won + lost))}%" if won + lost else "–"
+                rows_html = "".join(f'<li><span class="prank-who">{esc(k)}</span><span class="prank-v tab">{rate(*v)}</span></li>'
+                                    for k, v in list(bs["kinds"].items()) + list(bs["picks"].items()))
+                high = []
+                if bs["biggest"]:
+                    b = bs["biggest"]
+                    high.append(f'Biggest win <b class="gold">+{b["payout"] - b["stake"]:,}</b> ({b["stake"]:,} @ {b["odds"]:.2f})')
+                if bs["best_odds"]:
+                    high.append(f'Best odds landed <b class="gold">{bs["best_odds"]["odds"]:.2f}</b>')
+                if bs["favourite"]:
+                    f = bs["favourite"]
+                    high.append(f'Backs most <b>{esc(clean_name(ctx, f["name"]))}</b> ({f["times"]}×, {f["won"]}-{f["lost"]})')
+                cashed_text = f", cashed out {bs['cashed']}" if bs["cashed"] else ""
+                blocks.append(("BET STATS", "betstats",
+                               f'<div class="ftiles ftiles-4">{tiles}</div>'
+                               f'<p class="muted" style="margin-top:12px">{" · ".join(high)}</p>'
+                               f'<ol class="prank prank-plain">{rows_html}</ol>'
+                               f'<p class="note">{f"#{place} of {total} for profit in PFO. " if place else ""}'
+                               f'Won {bs["won"]}, lost {bs["lost"]}{cashed_text}. '
+                               'Settled bets only, refunds don\'t count. Same as /betstats in Discord.</p>'))
+        except Exception:
+            traceback.print_exc()
 
     # ---------- fantasy ----------
     team = ctx.fantasy_team(gid, uid)
@@ -7418,9 +7535,16 @@ def fighter_card_img(user_id, name="", cls="cardimg", lazy=True, info=None):
             f'alt="{esc(name)} fighter card"{" loading=lazy" if lazy else ""}>')
 
 
-def pull_card_img(pull_id, name="", cls="cardimg"):
-    return (f'<img class="{cls}" src="/cardimg/pull/{pull_id}.png" width="500" height="700" '
+def pull_card_img(pull_id, name="", cls="cardimg", info=None):
+    version = f"?v={card_version(info)}" if info else ""   # an upgraded card gets a new picture straight away
+    return (f'<img class="{cls}" src="/cardimg/pull/{pull_id}.png{version}" width="500" height="700" '
             f'alt="{esc(name)} card" loading="lazy">')
+
+
+def card_sell_value(ctx, row):
+    """Spare value: the bot's card_sell (upgrades don't raise it), or the tier price on an older bot."""
+    sell = getattr(ctx, "card_sell", None) if "card_sell" in ctx.g else None
+    return sell(row) if sell else ctx.CARD_SELL[row["tier"]]
 
 
 def fights_like_block(ctx, user_id, stats):
@@ -7500,7 +7624,7 @@ def render_my_cards(ctx, viewer, query):
     gid = ctx.gid
     have, total = ctx.collection_progress(ctx.guild, uid)
     spares = ctx.spare_cards(gid, uid)
-    worth = sum(ctx.CARD_SELL[r["tier"]] for r in spares)
+    worth = sum(card_sell_value(ctx, r) for r in spares)
 
     # Pack just opened
     pack_html = ""
@@ -7517,7 +7641,7 @@ def render_my_cards(ctx, viewer, query):
                                  for i, r in enumerate(pulls))
             buttons = ""
             if dupes and not pack["decided"]:
-                value = sum(ctx.CARD_SELL[r["tier"]] for r in dupes)
+                value = sum(card_sell_value(ctx, r) for r in dupes)
                 buttons = (f'<div class="btns"><button class="btn btn-ghost" type="button" data-packdecide="{pack["id"]}" data-d="keep">KEEP DUPLICATES</button>'
                            f'<button class="btn btn-gold" type="button" data-packdecide="{pack["id"]}" data-d="sell">SELL DUPLICATES (+{value:,})</button></div>')
             pack_html = f"""
@@ -7563,9 +7687,24 @@ def render_my_cards(ctx, viewer, query):
     for i, rows in enumerate(ordered):
         info = ctx.card_info(rows[-1])
         held = any(r["status"] == "held" for r in rows)
-        grid += (f'<div class="cardtile {stagger(i, 4)}" data-tier="{rows[0]["tier"]}">{pull_card_img(rows[-1]["id"], info["name"])}'
+        grid += (f'<div class="cardtile {stagger(i, 4)}" data-tier="{rows[0]["tier"]}">{pull_card_img(rows[-1]["id"], info["name"], info=info)}'
                  + (f'<span class="cardcount">×{len(rows)}</span>' if len(rows) > 1 else "")
                  + ('<span class="cardheld">IN A TRADE</span>' if held else "") + '</div>')
+    upgrade_html = ""
+    if "card_upgrades" in ctx.g:
+        try:
+            for row, now, price in ctx.card_upgrades(ctx.guild, uid)[:30]:
+                old = ctx.card_info(row)
+                tier_note = f" · becomes {CARD_TIER_TEXT[now['tier']].title()}" if now["tier"] != row["tier"] else ""
+                upgrade_html += (f'<li><span class="prank-who"><b>{esc(now["name"])}</b> <span class="tab">{old.get("ovr")} → {now["ovr"]}</span>'
+                                 f'<span class="muted">Card No. {row["id"]:04d}{esc(tier_note)}</span></span>'
+                                 f'<button class="btn btn-gold btn-sm" type="button" data-upgrade="{row["id"]}" data-price="{price}">UPGRADE · {price:,}</button></li>')
+        except Exception:
+            traceback.print_exc()
+    upgrade_section = (f'<section class="block bt" id="upgrades"><div class="head-t rv"><span class="eyebrow">FIGHTERS WHO HAVE IMPROVED</span>'
+                       f'<h2 class="d h-m">UPGRADE CARDS</h2></div><ol class="prank prank-plain upglist">{upgrade_html}</ol>'
+                       '<p class="note">Upgrading brings a card up to the fighter\'s current rating. The price depends on the new overall. '
+                       'An upgraded card still sells as a spare for what it was pulled as.</p></section>') if upgrade_html else ""
     mine_options = "".join(
         f'<label class="tr-pick"><input type="checkbox" name="give" value="{r["id"]}"> {esc(ctx.card_label(r))}</label>'
         for r in reversed(ctx.owned_cards(gid, uid)))
@@ -7577,6 +7716,7 @@ def render_my_cards(ctx, viewer, query):
 <div class="wrap">
   {pack_html}
   {f'<section class="block bt"><div class="head-t rv"><h2 class="d h-m">OPEN TRADES</h2></div>{trade_rows}</section>' if trade_rows else ''}
+  {upgrade_section}
   <section class="block bt"><div class="head-t rv"><span class="eyebrow">{have} OF {total} FIGHTERS</span><h2 class="d h-m">COLLECTION</h2></div>
     <div class="cardgrid">{grid or '<p class="empty">No cards yet. Packs are in the shop.</p>'}</div></section>
   <section class="block bt" id="newtrade"><div class="head-t rv"><span class="eyebrow">UP TO {ctx.TRADE_MAX_CARDS} CARDS A SIDE</span><h2 class="d h-m">MAKE A TRADE</h2></div>
@@ -7750,6 +7890,43 @@ def add_page_routes(app, bot, g, serve, html_response):
             total, message = 0, "Kept. You can sell spares any time."
         g["discipline_query"]("UPDATE card_packs SET decided = ? WHERE id = ?", ("sell" if body.get("decision") == "sell" else "keep", pack_id), write=True)
         return {"ok": True, "message": message, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+
+    @action_route(bot, g, bucket="cards", limit=20, window=60)
+    async def cards_upgrade(viewer, body, request):
+        gd = guild()
+        if "upgrade_card" not in g:
+            raise ActionError("Card upgrades aren't switched on yet.")
+        ok, message = g["upgrade_card"](gd, viewer.user_id, _int(body.get("card_id"), 0))
+        if not ok:
+            raise ActionError(message.replace("❌ ", ""))
+        return {"ok": True, "message": message.replace("⬆️ ", "").replace("**", "").replace(g.get("COIN", ""), "").replace("  ", " "),
+                "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
+
+    @action_route(bot, g, bucket="spin", limit=10, window=60)
+    async def daily_spin(viewer, body, request):
+        gd = guild()
+        if "do_spin" not in g:
+            raise ActionError("The daily spin isn't switched on yet.")
+        blocked = g["member_too_new"](gd, viewer.user_id) if "member_too_new" in g else None
+        if blocked:
+            raise ActionError(re.sub(r"[*_`]", "", blocked))
+        result = g["do_spin"](gd.id, viewer.user_id)
+        if not result["claimed"]:
+            raise ActionError("You've already spun today. The wheel resets at midnight UK time.")
+        key, emoji, label, _, reward = result["prize"]
+        if key == "again":
+            message = "Spin again! You get one more spin today."
+        else:
+            message = f"You won {label}!"
+            if result.get("pack_id"):
+                message += " Your cards are on My cards."
+            elif not isinstance(reward, int) and reward not in g.get("PACK_ITEMS", {}):
+                message += " It's in My items and is used on your next bet."
+        if result.get("top_up"):
+            message += f" You were nearly out, so you got topped up to {g['BROKE_TOP_UP']:,}."
+        return {"ok": True, "message": message, "index": result["index"], "again": key == "again",
+                "pack_id": result.get("pack_id"), "streak": result["streak"],
+                "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
 
     @action_route(bot, g, bucket="cards", limit=20, window=60)
     async def cards_sell_spares(viewer, body, request):
@@ -7952,7 +8129,8 @@ def add_page_routes(app, bot, g, serve, html_response):
     for path, handler in (("/me/cards", my_cards_page), ("/cards", cards_page), ("/cardimg/{kind}/{ident}.png", card_image),
                           ("/api/cards/of", cards_of)):
         app.router.add_get(path, handler)
-    for path, handler in (("/api/cards/pack", cards_pack), ("/api/cards/sell", cards_sell_spares), ("/api/cards/trade", cards_trade),
+    for path, handler in (("/api/cards/pack", cards_pack), ("/api/cards/sell", cards_sell_spares), ("/api/cards/upgrade", cards_upgrade),
+                          ("/api/spin", daily_spin), ("/api/cards/trade", cards_trade),
                           ("/api/cards/trade/respond", cards_trade_respond)):
         app.router.add_post(path, handler)
     for path, handler in (("/me", me_page), ("/dashboard", staff_page), ("/staff", staff_public), ("/teams", teams_page),
