@@ -63,7 +63,8 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "27"            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "28"
+_THEME_BANNERS = {}             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -1662,6 +1663,13 @@ def render_fighter(ctx, user_id):
   {f'<div data-fpanel="card">{card_html}</div>' if has_card else ''}
 </div>"""
 
+    # Profile Theme: the whole page takes the theme's colour (not just the top).
+    theme = cosmetics.get("style") if cosmetics else None
+    if theme in (getattr(ctx, "PROFILE_THEME_COLOURS", None) or {}):
+        banner = (f'<div class="wrap"><img class="themebanner" src="/theme-banner/{esc(theme)}.gif" width="800" height="200" '
+                  f'alt="" loading="lazy" onerror="this.remove()"></div>') if "themed_banner_gif" in ctx.g else ""
+        body = f'<div class="ftheme ftheme-{esc(theme)}">{body}{banner}</div>'
+
     description = f"{name}: {ctx.stats_record(stats)} in PFO." + (f" {badge.title()}." if badge_bits else "")
     return page(ctx, name, "fighters", body, description)
 
@@ -3231,6 +3239,17 @@ img{max-width:100%}
 .fstyle-blackout{background:linear-gradient(180deg,#000,rgba(8,8,10,0))}
 .fstyle-blackout .fhero-name{color:#FFFFFF}
 .fstyle-blackout .av-hero{filter:grayscale(1);box-shadow:0 0 0 3px #D4D4D4}
+/* Profile Theme across the whole fighter page: accents, tabs, numbers and links use the theme colour */
+.ftheme-crimson{--gold:#E5534B;--gold2:#FF9A92}
+.ftheme-ice{--gold:#6CC6EA;--gold2:#B8E6F8}
+.ftheme-emerald{--gold:#3FBF7F;--gold2:#8EE6B8}
+.ftheme-neon{--gold:#E04FD8;--gold2:#F7A3F2}
+.ftheme-royal{--gold:#8B7CF0;--gold2:#C3B9FF}
+.ftheme-blackout{--gold:#D4D4D4;--gold2:#FFFFFF}
+.ftheme .tiles,.ftheme .ftabs{border-color:color-mix(in srgb,var(--gold) 35%,transparent)}
+.ftheme .ftile,.ftheme .tile{box-shadow:inset 0 2px 0 color-mix(in srgb,var(--gold) 55%,transparent)}
+.ftheme a{color:var(--gold2)}
+.themebanner{display:block;width:100%;height:auto;max-width:800px;margin:32px auto 0;border-radius:10px;border:1px solid color-mix(in srgb,var(--gold) 40%,transparent)}
 .spot{display:flex;flex-wrap:wrap;align-items:center;gap:22px 32px;padding:30px 34px;border:1px solid #3A311B;border-radius:20px;color:var(--text);background:radial-gradient(120% 120% at 0% 0%,rgba(201,162,74,.16),rgba(8,8,10,0) 55%),var(--panel);transition:border-color .35s,transform .35s var(--ease)}
 .spot:hover{color:var(--text);border-color:#5A4A22;transform:translateY(-3px)}
 .spot-name{font-size:48px;line-height:.9}
@@ -7872,6 +7891,60 @@ def add_page_routes(app, bot, g, serve, html_response):
     async def cards_page(request):
         return await serve(request, "cards", render_cards)
 
+    # Profile Theme banners: the normal profile banner in the theme's colour (used by /profile in Discord).
+    _theme_banners = _THEME_BANNERS
+    _theme_lock = asyncio.Lock()
+
+    async def make_theme_banner(theme):
+        hit = _theme_banners.get(theme)
+        if hit and time.time() - hit[0] < 6 * 3600:
+            return hit[1]
+        async with _theme_lock:
+            hit = _theme_banners.get(theme)
+            if hit and time.time() - hit[0] < 6 * 3600:
+                return hit[1]
+            url = g["asset_url"](g["PROFILE_BANNER_FILE"]) if g.get("asset_url") else None
+            if not url:
+                return None
+            import aiohttp
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        print(f"Theme banner: couldn't load {url} ({response.status})")
+                        return None
+                    source = await response.read()
+            data = await asyncio.to_thread(g["themed_banner_gif"], source, theme)
+            _theme_banners[theme] = (time.time(), data)
+            print(f"Theme banner ready: {theme} ({len(data) // 1024} KB)")
+            return data
+
+    async def theme_banner(request):
+        theme = request.match_info.get("theme", "")
+        if theme not in (g.get("PROFILE_THEME_TINTS") or {}) or "themed_banner_gif" not in g:
+            raise web.HTTPNotFound()
+        try:
+            data = await make_theme_banner(theme)
+        except Exception as error:
+            print(f"Theme banner {theme} failed: {error}")
+            data = None
+        if not data:
+            raise web.HTTPNotFound()
+        return web.Response(body=data, content_type="image/gif", headers={"Cache-Control": "public, max-age=86400"})
+
+    async def warm_theme_banners():
+        await asyncio.sleep(30)
+        for theme in (g.get("PROFILE_THEME_TINTS") or {}):
+            try:
+                await make_theme_banner(theme)
+            except Exception as error:
+                print(f"Theme banner warm-up {theme} failed: {error}")
+
+    if "themed_banner_gif" in g:
+        try:
+            asyncio.get_event_loop().create_task(warm_theme_banners())
+        except Exception as error:
+            print(f"Theme banner warm-up not started: {error}")
+
     _card_png = {}
 
     async def card_image(request):
@@ -8160,6 +8233,7 @@ def add_page_routes(app, bot, g, serve, html_response):
                      "loser": fighter_name(Ctx(g, guild()), fight["loser_id"], fight["loser_name"])})
 
     for path, handler in (("/me/cards", my_cards_page), ("/cards", cards_page), ("/cardimg/{kind}/{ident}.png", card_image),
+                          ("/theme-banner/{theme}.gif", theme_banner),
                           ("/api/cards/of", cards_of)):
         app.router.add_get(path, handler)
     for path, handler in (("/api/cards/pack", cards_pack), ("/api/cards/sell", cards_sell_spares), ("/api/cards/upgrade", cards_upgrade),

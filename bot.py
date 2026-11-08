@@ -4320,10 +4320,14 @@ async def create_profile_embed(
         show_thumbnail=False
     )
 
-    # Profile Theme: the theme's own colour of the banner, made by the website.
+    # Profile Theme: the theme's own colour of the banner, made by the website. Only used once
+    # the website has it ready, otherwise the normal banner stays (so there's never a blank space).
     try:
         if theme in PROFILE_THEME_TINTS and ASSET_BASE_URL and BOT_SITE_URL and website_running():
-            embed.set_image(url=f"{BOT_SITE_URL}/theme-banner/{theme}.gif?v={ASSET_VERSION}")
+            import sys as _sys
+            ready = getattr(_sys.modules.get("website"), "_THEME_BANNERS", {}).get(theme)
+            if ready:
+                embed.set_image(url=f"{BOT_SITE_URL}/theme-banner/{theme}.gif?v={ASSET_VERSION}-{int(ready[0])}")
     except Exception as error:
         print(f"Theme banner failed: {error}")
 
@@ -23747,8 +23751,13 @@ def themed_banner_gif(source: bytes, theme: str) -> bytes:
             img = ImageChops.screen(img, glow)
         frames.append(Image.composite(original, img, keep))
     # One shared palette for every frame keeps the file small (about the size of the original).
-    first = frames[0].quantize(colors=255, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE)
-    palette_frames = [first] + [f.quantize(palette=first, dither=Image.Dither.NONE) for f in frames[1:]]
+    # (Works on older and newer Pillow versions.)
+    median = getattr(getattr(Image, "Quantize", None), "MEDIANCUT", None) or getattr(Image, "MEDIANCUT", 0)
+    no_dither = getattr(getattr(Image, "Dither", None), "NONE", None)
+    if no_dither is None:
+        no_dither = getattr(Image, "NONE", 0)
+    first = frames[0].quantize(colors=255, method=median, dither=no_dither)
+    palette_frames = [first] + [f.quantize(palette=first, dither=no_dither) for f in frames[1:]]
     out = _io.BytesIO()
     palette_frames[0].save(out, format="GIF", save_all=True, append_images=palette_frames[1:], duration=durations,
                            loop=0, optimize=True, disposal=1)
