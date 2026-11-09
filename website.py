@@ -63,8 +63,9 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "30"
-_THEME_BANNERS = {}             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
+SITE_VERSION = "31"
+_THEME_BANNERS = {}
+COMMENTARY_ROLE = os.getenv("COMMENTARY_ROLE", "[COMMENTARY]").strip()    # who can open /commentary (plus Helper+)             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
 RESULTS_PER_PAGE = 6          # events per page on /results
@@ -2072,6 +2073,373 @@ def render_live(ctx):
 
 
 # ============================================================
+# COMMENTARY DESK  /commentary   (Helper+ and the [COMMENTARY] role)
+#
+# The card in running order (prelims first, main event last; only on
+# this page). Each fight opens a tale of the tape for commentators:
+# talking points, record, last 5, strike stats from /addstrikes, head to
+# head, sportsbook odds and bet split, and shared notes that every
+# commentator can see and edit. ?card=<id> picks a past card.
+# ============================================================
+
+def _comm_pct(a, b):
+    return round(100 * a / b) if b else None
+
+
+def _comm_points(ctx, a, b, na, nb, sa, sb, h2h, title_holder, arch_a, arch_b, odds):
+    """Talking points worked out from the data, most interesting first."""
+    out = []
+    if h2h:
+        last = h2h[-1]
+        if last["method"] in ("DRAW", "NC"):
+            result = "draw" if last["method"] == "DRAW" else "no contest"
+            out.append(f"Rematch: their last fight ended in a {result}" + (f" at {last['event']}." if last["event"] else "."))
+        else:
+            winner = na if last["winner_id"] == a else nb
+            loser = nb if last["winner_id"] == a else na
+            how = method_short(ctx, last)
+            out.append(f"Rematch: {winner} beat {loser} by {how}" + (f" at {last['event']}" if last["event"] else "") + "."
+                       + (f" That's {len(h2h)} meetings between them." if len(h2h) > 1 else ""))
+    if title_holder:
+        holder = na if title_holder == a else nb
+        out.append(f"Title fight: {holder} puts the belt on the line.")
+    for name, s in ((na, sa), (nb, sb)):
+        if not s:
+            continue
+        total = s["wins"] + s["losses"] + s["draws"]
+        streak = s.get("streak") or ""
+        if total == 0:
+            out.append(f"{name} makes their PFO debut.")
+            continue
+        if streak.startswith("W") and streak[1:].isdigit() and int(streak[1:]) >= 3:
+            out.append(f"{name} is on a {streak[1:]}-fight win streak.")
+        elif streak.startswith("L") and streak[1:].isdigit() and int(streak[1:]) >= 3:
+            out.append(f"{name} has lost {streak[1:]} in a row and needs this one.")
+        rate = s.get("finish_rate")
+        ko = s.get("wins_by", {}).get("KO/TKO", 0)
+        sub = s.get("wins_by", {}).get("SUB", 0)
+        if rate is not None and rate >= 70 and s["wins"] >= 3:
+            out.append(f"{name} finishes {rate}% of their wins ({ko} KO, {sub} SUB).")
+        if s.get("title_wins"):
+            out.append(f"{name} has won {s['title_wins']} title fight{'s' if s['title_wins'] != 1 else ''} in PFO.")
+    if arch_a and arch_b and arch_a != arch_b:
+        out.append(f"Style clash: {arch_a} vs {arch_b}.")
+    if odds:
+        oa, ob = odds
+        if abs(oa - ob) >= 0.6:
+            fav, dog = (na, nb) if oa < ob else (nb, na)
+            out.append(f"{fav} is the favourite on the sportsbook ({min(oa, ob):.2f}), {dog} is the underdog ({max(oa, ob):.2f}).")
+        else:
+            out.append(f"The sportsbook has this close: {oa:.2f} vs {ob:.2f}.")
+    return out[:6]
+
+
+def render_commentary(ctx, viewer, query):
+    gid = ctx.gid
+    notices = ctx.q("SELECT * FROM card_notices WHERE guild_id = ? ORDER BY id DESC LIMIT 20", (gid,))
+    if not notices:
+        body = page_hero("COMMENTARY DESK", "NO CARDS YET", "MIC") + (
+            '<div class="wrap"><section class="block"><p class="muted">Cards show here once one has been sent out with the bot.</p></section></div>')
+        return page(ctx, "Commentary", "", body)
+    wanted = _int(query.get("card"), 0)
+    notice = next((n for n in notices if n["id"] == wanted), None) or live_notice(ctx) or notices[0]
+    name = row_get(notice, "event") or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
+
+    layout = list(ctx.notice_layout(notice))
+    called_off = card_cancelled(ctx, notice)
+    logged, total = ctx.notice_fights(gid, notice) if getattr(ctx, "notice_fights", None) else ([], len(layout))
+    by_pair = {}
+    for f in logged:
+        by_pair.setdefault(frozenset((f["winner_id"], f["loser_id"])), f)
+    pending = [i for i, (a, b, _) in enumerate(layout) if frozenset((a, b)) not in by_pair and frozenset((a, b)) not in called_off]
+    started = bool(by_pair)
+    up_next = pending[-1] if pending and started else None
+
+    try:
+        strikes = ctx.fight_stat_totals(gid)
+    except Exception:
+        strikes = {}
+    try:
+        notes = {r["pair"]: r for r in ctx.q("SELECT * FROM commentary_notes WHERE guild_id = ? AND card_id = ?", (gid, notice["id"]))}
+    except Exception:
+        notes = {}
+    try:
+        titles = {r["pair"] for r in ctx.q("SELECT pair FROM commentary_titles WHERE guild_id = ? AND card_id = ?", (gid, notice["id"]))}
+    except Exception:
+        titles = set()
+    can_mark = viewer.levels.get("staff")
+    markets = ctx.q("SELECT * FROM bet_markets WHERE guild_id = ? ORDER BY (status = 'open') DESC, id DESC LIMIT 6", (gid,))
+    market_bouts = []
+    for m in markets:
+        try:
+            market_bouts += list(ctx.market_bouts(m["id"]))
+        except Exception:
+            pass
+
+    cache = {}
+    rows = ""
+    last_group = None
+    count = len(layout)
+    # Prelims first, main event last (this page only).
+    for shown, i in enumerate(reversed(range(count)), 1):
+        a, b, spot = layout[i]
+        label = spot_label(spot)
+        group = "MAIN CARD" if label in ("MAIN EVENT", "CO-MAIN EVENT") else label
+        if group != last_group:
+            rows += f'<div class="cm-sec"><h2 class="d">{esc(group)}</h2><span></span></div>'
+            last_group = group
+        pair = frozenset((a, b))
+        fight = by_pair.get(pair)
+        cancelled = not fight and pair in called_off
+        na, nb = clean_name(ctx, fighter_name(ctx, a)), clean_name(ctx, fighter_name(ctx, b))
+        sa, sb = stats_for(ctx, a, cache), stats_for(ctx, b, cache)
+
+        # Division and belts
+        ranks_a = ctx.get_user_rankings(gid, a) if a else []
+        ranks_b = ctx.get_user_rankings(gid, b) if b else []
+        weight = None
+        try:
+            weight = ctx.fighter_division(gid, a, ranks_a) or ctx.fighter_division(gid, b, ranks_b)
+        except Exception:
+            pass
+
+        def rank_text(ranks):
+            div = [r for r in ranks if r["weight"] == weight] if weight else []
+            if div:
+                return "C" if div[0]["rank"] == 0 else f"#{div[0]['rank']}"
+            return "–"
+
+        def p4p(ranks):
+            p = [r for r in ranks if r["weight"] == ctx.P4P_WEIGHT]
+            return f"#{p[0]['rank']}" if p else "–"
+
+        # Title fights are marked by staff on this page (main card only).
+        pair_key = "-".join(str(x) for x in sorted((a or 0, b or 0)))
+        on_main = group == "MAIN CARD"
+        is_title = on_main and pair_key in titles
+        title_holder = None
+        if is_title:
+            for uid, ranks in ((a, ranks_a), (b, ranks_b)):
+                if any(r["rank"] == 0 and r["weight"] == weight for r in ranks):
+                    title_holder = uid
+        short = ctx.WEIGHTS.get(weight, "") if weight else ""
+
+        # Head to head
+        h2h = ctx.q("SELECT * FROM fights WHERE guild_id = ? AND ((winner_id = ? AND loser_id = ?) OR (winner_id = ? AND loser_id = ?)) "
+                    "ORDER BY id", (gid, a, b, b, a)) if a and b else []
+        if fight:
+            h2h = [f for f in h2h if f["id"] != fight["id"]]
+
+        # Sportsbook
+        odds = pools = None
+        for bout in market_bouts:
+            if {bout["fighter_a"], bout["fighter_b"]} == {a, b}:
+                try:
+                    live = ctx.live_odds(bout)
+                    pool = ctx.fight_pools(bout["market_id"], bout["position"])
+                    flip = bout["fighter_a"] != a
+                    odds = (live["b"], live["a"]) if flip else (live["a"], live["b"])
+                    pools = (pool["b"], pool["a"]) if flip else (pool["a"], pool["b"])
+                except Exception:
+                    pass
+                break
+
+        arch_a = arch_b = None
+        if "get_archetype" in ctx.g:
+            ka, kb = ctx.get_archetype(gid, a), ctx.get_archetype(gid, b)
+            arch_a = ctx.ARCHETYPES[ka][1] if ka else None
+            arch_b = ctx.ARCHETYPES[kb][1] if kb else None
+
+        points = _comm_points(ctx, a, b, na, nb, sa, sb, h2h, title_holder, arch_a, arch_b, odds)
+        if is_title and not title_holder:
+            points.insert(0, "Title fight: the belt is on the line.")
+
+        def last5(uid, s, side):
+            if not s or not s.get("fights"):
+                return '<p class="muted">No logged PFO fights yet.</p>'
+            out = ""
+            for f in list(reversed(s["fights"]))[:5]:
+                if f["method"] == "NC":
+                    r = "NC"
+                elif f["method"] == "DRAW":
+                    r = "D"
+                else:
+                    r = "W" if ctx.fight_is_win_for(f, uid) else "L"
+                opp = f["loser_id"] if f["winner_id"] == uid else f["winner_id"]
+                opp_name = clean_name(ctx, fighter_name(ctx, opp, f["loser_name"] if f["winner_id"] == uid else f["winner_name"]))
+                how = method_short(ctx, f) if r not in ("D", "NC") else r
+                cls = {"W": "W", "L": "L"}.get(r, "D")
+                cells = [f'<span class="cp {cls}">{r}</span>', f'<span class="o">{esc(opp_name)}</span>', f'<span class="m">{esc(how)}</span>']
+                if side == "b":
+                    cells.reverse()
+                out += f'<div class="ch">{"".join(cells)}</div>'
+            return out
+
+        def like(s, uid, ranks):
+            try:
+                match = ctx.fights_like(s, ctx.fighter_division(gid, uid, ranks), top=1) if s else []
+                return f"{esc(match[0][0])} <span class='muted'>({match[0][1]}%)</span>" if match else "<span class='muted'>Not enough fights</span>"
+            except Exception:
+                return "<span class='muted'>–</span>"
+
+        def nick(uid):
+            try:
+                c = ctx.get_cosmetics(gid, uid) if uid else {}
+                return f'<div class="cnick">“{esc(c["nickname"])}”</div>' if c.get("nickname") else ""
+            except Exception:
+                return ""
+
+        def column(uid, nm, s, ranks, arch, side):
+            arch_html = f'<span class="carch">{esc(arch.upper())}</span>' if arch else ""
+            return (f'<div class="ccol {side}"><div class="chead {side}">{avatar_html(ctx, uid, nm, "av cav")}'
+                    f'<div><div class="cname d">{esc(nm.upper())}</div>{nick(uid)}{arch_html}</div></div>'
+                    f'<span class="clab">LAST 5 · NEWEST FIRST</span><div class="chist">{last5(uid, s, side)}</div>'
+                    f'<span class="clab">FIGHTS LIKE</span><div>{like(s, uid, ranks)}</div>'
+                    f'<div class="clinks"><a href="/fighter/{uid}" target="_blank" rel="noopener">Profile</a>'
+                    f'<a href="/fighter/{uid}#history" target="_blank" rel="noopener">Fight history</a>'
+                    f'<a href="/cardimg/fighter/{uid}.png" target="_blank" rel="noopener">Fighter card</a></div></div>')
+
+        def per(uid, key, fights_key="fights", fmt="{:.1f}"):
+            t = strikes.get(uid)
+            if not t or not t.get(fights_key):
+                return "–"
+            return fmt.format((t.get(key) or 0) / t[fights_key])
+
+        def acc(uid, landed, thrown):
+            t = strikes.get(uid)
+            value = _comm_pct(t.get(landed) or 0, t.get(thrown) or 0) if t else None
+            return f"{value}%" if value is not None else "–"
+
+        def ctrl(uid):
+            t = strikes.get(uid)
+            if not t or not t.get("fights"):
+                return "–"
+            secs = round((t.get("control") or 0) / t["fights"])
+            return f"{secs // 60}:{secs % 60:02d}"
+
+        def tape_row(label, va, vb, better=None):
+            ca = cb = bars = ""
+            try:
+                fa, fb = float(str(va).rstrip("%")), float(str(vb).rstrip("%"))
+                if better and fa != fb:
+                    if (fa > fb) == (better == "up"):
+                        ca = " better"
+                    else:
+                        cb = " better"
+                if better and fa + fb > 0:
+                    pa = round(100 * fa / (fa + fb))
+                    bars = f'<div class="cbars"><i class="ba" style="width:{pa}%"></i><i class="bb" style="width:{100 - pa}%"></i></div>'
+            except (TypeError, ValueError):
+                pass
+            return (f'<div class="ctr"><span class="l{ca}">{esc(str(va))}</span><span class="c">{esc(label)}{bars}</span>'
+                    f'<span class="r{cb}">{esc(str(vb))}</span></div>')
+
+        def wb(s, key):
+            return (s or {}).get("wins_by", {}).get(key, 0)
+
+        tape = (f'<div class="ctape"><div class="ctr chr"><span class="l">{esc(na.upper())}</span><span class="c">TALE OF THE TAPE</span>'
+                f'<span class="r">{esc(nb.upper())}</span></div>'
+                + tape_row("RECORD", ctx.stats_record(sa) if sa else "0-0-0", ctx.stats_record(sb) if sb else "0-0-0")
+                + tape_row(f"RANK{f' ({short})' if short else ''}", rank_text(ranks_a), rank_text(ranks_b))
+                + tape_row("P4P", p4p(ranks_a), p4p(ranks_b))
+                + tape_row("STREAK", (sa or {}).get("streak") or "–", (sb or {}).get("streak") or "–")
+                + tape_row("KO / TKO WINS", wb(sa, "KO/TKO"), wb(sb, "KO/TKO"), "up")
+                + tape_row("SUB WINS", wb(sa, "SUB"), wb(sb, "SUB"), "up")
+                + tape_row("DECISION WINS", wb(sa, "DEC"), wb(sb, "DEC"), "up")
+                + tape_row("FINISH RATE", f"{sa['finish_rate']}%" if sa and sa.get("finish_rate") is not None else "–",
+                           f"{sb['finish_rate']}%" if sb and sb.get("finish_rate") is not None else "–", "up")
+                + tape_row("TITLE FIGHT WINS", (sa or {}).get("title_wins", 0), (sb or {}).get("title_wins", 0), "up")
+                + tape_row("SIG. STRIKES / FIGHT", per(a, "sig_landed"), per(b, "sig_landed"), "up")
+                + tape_row("STRIKING ACCURACY", acc(a, "sig_landed", "sig_thrown"), acc(b, "sig_landed", "sig_thrown"), "up")
+                + tape_row("TAKEDOWNS / FIGHT", per(a, "td_landed"), per(b, "td_landed"), "up")
+                + tape_row("TAKEDOWN ACCURACY", acc(a, "td_landed", "td_attempted"), acc(b, "td_landed", "td_attempted"), "up")
+                + tape_row("CONTROL TIME / FIGHT", ctrl(a), ctrl(b))
+                + tape_row("KNOCKDOWNS / FIGHT", per(a, "knockdowns"), per(b, "knockdowns"), "up")
+                + '<p class="cfoot">Strike numbers come from fights logged with /addstrikes.</p></div>')
+
+        if h2h:
+            h2h_html = "".join(
+                f'<div>{esc(f["event"] or (f["fight_date"] or str(f["created_at"]))[:10])} · '
+                + (f'{esc(f["method"].title() if f["method"] == "DRAW" else f["method"])}' if f["method"] in ("DRAW", "NC")
+                   else f'{esc(clean_name(ctx, fighter_name(ctx, f["winner_id"])))} def. {esc(clean_name(ctx, fighter_name(ctx, f["loser_id"])))} · {esc(method_short(ctx, f))}')
+                + ('' if not f["title_fight"] else ' · title fight') + '</div>' for f in h2h)
+        else:
+            h2h_html = '<p class="muted">They haven\'t fought before in PFO.</p>'
+
+        if odds:
+            ta, tb = pools or (0, 0)
+            pa = round(100 * ta / (ta + tb)) if ta + tb else 50
+            book = (f'<div class="codds d"><span class="ca">{odds[0]:.2f}</span><span class="cb">{odds[1]:.2f}</span></div>'
+                    f'<div class="csplit"><i style="width:{pa}%"></i><i style="width:{100 - pa}%"></i></div>'
+                    f'<div class="muted small">{pa}% / {100 - pa}% of {ta + tb:,} coins bet</div>')
+        else:
+            book = '<p class="muted">This fight isn\'t on the sportsbook.</p>'
+
+        note = notes.get(pair_key)
+        note_meta = ""
+        if note and note["updated_at"]:
+            note_meta = f'Last edited by {esc(player_name(ctx, note["updated_by"]))} {when_html(note["updated_at"])}'
+        notes_box = (f'<textarea class="cnotes" data-cnote="{esc(pair_key)}" data-card="{notice["id"]}" maxlength="3000" rows="4" '
+                     f'aria-label="Commentator notes for {esc(na)} vs {esc(nb)}" placeholder="Notes every commentator can see…">'
+                     f'{esc(note["text"]) if note else ""}</textarea><span class="small muted" data-cnote-status>{note_meta or "Saves by itself as you type"}</span>')
+
+        points_html = "".join(f"<li>{esc(p)}</li>" for p in points) or "<li>No standout facts found yet. Check the tape below.</li>"
+        panel = (f'<div class="ctalk"><h3 class="d">🎙️ TALKING POINTS</h3><ul>{points_html}</ul></div>'
+                 f'<div class="cgrid">{column(a, na, sa, ranks_a, arch_a, "a")}{tape}{column(b, nb, sb, ranks_b, arch_b, "b")}</div>'
+                 f'<div class="cextra"><div class="cbox"><h3 class="d">HEAD TO HEAD</h3>{h2h_html}</div>'
+                 f'<div class="cbox"><h3 class="d">SPORTSBOOK</h3>{book}</div>'
+                 f'<div class="cbox"><h3 class="d">COMMENTATOR NOTES</h3>{notes_box}</div></div>'
+                 f'<p class="clink"><a href="/compare?a={a}&amp;b={b}" target="_blank" rel="noopener">Open the full head-to-head page →</a></p>'
+                 + (f'<div class="ctitlebar"><span class="muted small">{"This is marked as a title fight." if is_title else "Staff: mark this as a title fight so commentators know before the result."}</span>'
+                    f'<button class="btn btn-sm {"btn-ghost" if is_title else "btn-gold"}" type="button" data-ctitle="{esc(pair_key)}" data-card="{notice["id"]}" '
+                    f'data-on="{0 if is_title else 1}">{"REMOVE TITLE FIGHT" if is_title else "MARK AS TITLE FIGHT"}</button></div>'
+                    if can_mark and on_main and not fight else ""))
+
+        if cancelled:
+            status = '<span class="cst cancel">CANCELLED</span>'
+        elif fight:
+            status = f'<span class="cst done">✓ {esc(clean_name(ctx, fighter_name(ctx, fight["winner_id"])) if fight["method"] not in ("DRAW", "NC") else "")} {esc(method_short(ctx, fight))}</span>'
+        elif i == up_next:
+            status = '<span class="cst now">● UP NEXT</span>'
+        else:
+            status = ""
+        main = label == "MAIN EVENT"
+        tags = (f'<span class="cw">{"MAIN EVENT · " if main else "CO-MAIN · " if label == "CO-MAIN EVENT" else ""}{esc(weight.upper() if weight else "")}</span>'
+                + ('<span class="ctitle">TITLE FIGHT</span>' if is_title else "") + status)
+        sub_a = f'{ctx.stats_record(sa) if sa else "0-0-0"} · {rank_text(ranks_a)}{f" {short}" if short and rank_text(ranks_a) != "–" else ""}'
+        sub_b = f'{ctx.stats_record(sb) if sb else "0-0-0"} · {rank_text(ranks_b)}{f" {short}" if short and rank_text(ranks_b) != "–" else ""}'
+        rows += (f'<div class="cbout{" main" if main else ""}{" next" if i == up_next else ""}{" cancelled" if cancelled else ""}"'
+                 f'{" id=up-next" if i == up_next else ""}>'
+                 f'<button class="cbout-h" type="button" aria-expanded="false">'
+                 f'<span class="cnum d">{shown}</span>'
+                 f'<span class="cside a">{avatar_html(ctx, a, na, "av")}<span class="cmin"><span class="cn d">{esc(na)}</span><span class="cs">{esc(sub_a)}</span></span></span>'
+                 f'<span class="cvs">{tags}</span>'
+                 f'<span class="cside b"><span class="cmin"><span class="cn d">{esc(nb)}</span><span class="cs">{esc(sub_b)}</span></span>{avatar_html(ctx, b, nb, "av")}</span>'
+                 f'<span class="cchev" aria-hidden="true">▾</span></button>'
+                 f'<div class="cpanel" hidden>{panel}</div></div>')
+
+    options = "".join(
+        f'<option value="{n["id"]}"{" selected" if n["id"] == notice["id"] else ""}>'
+        f'{esc(row_get(n, "event") or ("Live Card" if n["kind"] == "live_card" else "Fight Night"))} · {esc(str(n["created_at"])[:10])}</option>'
+        for n in notices)
+    status = "FINISHED" if not pending else ("LIVE NOW" if started else "UP NEXT")
+    extra = (f'<div class="evchips l-up">{chip("STATUS", esc(status), "red" if status == "LIVE NOW" else "gold")}'
+             f'{chip("FIGHTS", str(count))}{chip("RESULTS IN", f"{len(by_pair)}/{count - len(called_off)}")}</div>')
+    body = page_hero("COMMENTARY DESK", name.upper(), "MIC", extra) + f"""
+<div class="wrap">
+  <section class="block ctools">
+    <form method="get" action="/commentary" class="cpick"><label class="eyebrow-grey" for="cardpick">CARD</label>
+      <select id="cardpick" name="card" onchange="this.form.submit()">{options}</select></form>
+    <div class="btns"><button class="btn btn-ghost btn-sm" type="button" data-copen>OPEN ALL</button>
+      {'<a class="btn btn-gold btn-sm" href="#up-next">JUMP TO THE FIGHT UP NEXT</a>' if up_next is not None else ''}</div>
+  </section>
+  <section class="block ccard" aria-label="The card, prelims first">{rows}</section>
+  <p class="note">Only Helpers and above and the [COMMENTARY] role can see this page. Results show as they're logged; refresh for the latest.</p>
+</div>"""
+    return page(ctx, f"{name} · Commentary", "", body, f"Commentary desk for {name}.")
+
+
+# ============================================================
 # HEAD TO HEAD  /compare?a=ID&b=ID
 # ============================================================
 
@@ -3277,6 +3645,88 @@ img{max-width:100%}
 .pod-name{font-weight:700;overflow-wrap:anywhere}
 .pod-prize{font-size:12px;color:var(--gold2);font-weight:700}
 .pullweek{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+/* ---------- commentary desk ---------- */
+.ctools{display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;padding-bottom:0}
+.cpick{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1 1 260px;max-width:460px}
+.cpick select{background:#111115;border:1px solid var(--line2,#24242A);border-radius:8px;color:var(--text,#F4F4F5);padding:9px 12px;font:14px Inter,system-ui,sans-serif;max-width:100%}
+.ccard{display:flex;flex-direction:column;gap:10px}
+.cm-sec{display:flex;align-items:center;gap:10px;margin:14px 0 2px}
+.cm-sec h2{font-size:22px;letter-spacing:.06em;color:var(--muted,#A1A1AA)}
+.cm-sec span{flex:1;height:1px;background:var(--line,#1C1C21)}
+.cbout{background:var(--panel,#0C0C0F);border:1px solid var(--line,#1C1C21);border-radius:12px;overflow:hidden}
+.cbout.main{border-color:rgba(201,162,74,.55)}
+.cbout.next{box-shadow:0 0 0 2px #E5484D}
+.cbout.cancelled{opacity:.55}
+.cbout-h{width:100%;display:grid;grid-template-columns:40px minmax(0,1fr) auto minmax(0,1fr) 26px;gap:12px;align-items:center;padding:14px 16px;background:none;border:0;color:inherit;cursor:pointer;text-align:left;font:inherit}
+.cbout-h:focus-visible{outline:2px solid var(--gold2,#E2C27A);outline-offset:-2px}
+.cnum{font-size:24px;color:var(--dim,#868690);text-align:center}
+.cside{display:flex;align-items:center;gap:10px;min-width:0}
+.cside.b{justify-content:flex-end;text-align:right}
+.cside.a .av{box-shadow:0 0 0 2px #E5484D}.cside.b .av{box-shadow:0 0 0 2px #4C8DFF}
+.cmin{min-width:0;display:flex;flex-direction:column}
+.cn{font-size:22px;line-height:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.cs{font-size:12px;color:var(--muted,#A1A1AA)}
+.cvs{display:flex;flex-direction:column;align-items:center;gap:4px;min-width:100px}
+.cw{font-size:11px;letter-spacing:.12em;color:var(--muted,#A1A1AA);font-weight:700;text-align:center}
+.ctitle{font-size:10px;font-weight:800;letter-spacing:.12em;color:#111;background:var(--gold,#C9A24A);border-radius:999px;padding:2px 8px}
+.cst{font-size:11px;font-weight:700;letter-spacing:.04em;text-align:center}
+.cst.done{color:#3DD68C}.cst.now{color:#E5484D}.cst.cancel{color:#F07A7E}
+.cchev{color:var(--dim,#868690);transition:transform .2s;text-align:center}
+.cbout.open .cchev{transform:rotate(180deg)}
+@media (max-width:720px){
+  .cbout-h{grid-template-columns:28px minmax(0,1fr) 22px;grid-template-areas:"n a c" "n v c" "n b c";gap:6px 10px}
+  .cbout-h .cnum{grid-area:n}.cbout-h .cside.a{grid-area:a}.cbout-h .cvs{grid-area:v;align-items:flex-start}
+  .cbout-h .cside.b{grid-area:b;justify-content:flex-start;text-align:left;flex-direction:row-reverse}.cbout-h .cchev{grid-area:c}
+}
+.cpanel{border-top:1px solid var(--line,#1C1C21);padding:18px 16px 20px;display:flex;flex-direction:column;gap:18px}
+.ctalk{background:linear-gradient(180deg,rgba(201,162,74,.09),rgba(201,162,74,0));border:1px solid rgba(201,162,74,.3);border-radius:10px;padding:14px 16px}
+.ctalk h3{font-size:18px;color:var(--gold,#C9A24A);letter-spacing:.06em;margin:0 0 8px}
+.ctalk ul{margin:0;padding-left:18px;display:flex;flex-direction:column;gap:5px;font-size:14px}
+.cgrid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr) minmax(0,1fr);gap:16px;align-items:start}
+@media (max-width:900px){.cgrid{grid-template-columns:minmax(0,1fr)}}
+.ccol{display:flex;flex-direction:column;gap:10px;min-width:0}
+.chead{display:flex;gap:12px;align-items:center}
+.chead.b{flex-direction:row-reverse;text-align:right}
+.cav{width:60px;height:60px}
+.cname{font-size:30px;line-height:1}
+.cnick{font-size:13px;color:var(--gold2,#E2C27A);font-style:italic}
+.carch{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--gold2,#E2C27A);background:rgba(201,162,74,.12);border:1px solid rgba(201,162,74,.4);border-radius:999px;padding:2px 9px;margin-top:4px}
+.clab{font-size:11px;letter-spacing:.14em;color:var(--dim,#868690);font-weight:700}
+.ccol.b .clab,.ccol.b > div{text-align:right}
+.chist{display:flex;flex-direction:column;gap:5px}
+.ch{display:grid;grid-template-columns:26px minmax(0,1fr) auto;gap:8px;align-items:center;font-size:13px;background:#111115;border:1px solid var(--line,#1C1C21);border-radius:7px;padding:6px 9px}
+.ccol.b .ch{grid-template-columns:auto minmax(0,1fr) 26px}
+.ch .o{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ch .m{color:var(--dim,#868690);font-size:12px;white-space:nowrap}
+.cp{display:inline-grid;place-items:center;min-width:24px;height:22px;padding:0 3px;border-radius:6px;font-weight:800;font-size:11px}
+.cp.W{background:rgba(61,214,140,.14);color:#3DD68C;border:1px solid rgba(61,214,140,.4)}
+.cp.L{background:rgba(240,122,126,.12);color:#F07A7E;border:1px solid rgba(240,122,126,.4)}
+.cp.D{background:rgba(161,161,170,.12);color:#A1A1AA;border:1px solid rgba(161,161,170,.4)}
+.clinks{display:flex;gap:6px;flex-wrap:wrap}
+.ccol.b .clinks{justify-content:flex-end}
+.clinks a{font-size:12px;color:var(--gold2,#E2C27A);text-decoration:none;border:1px solid var(--line2,#24242A);border-radius:6px;padding:4px 9px}
+.ctape{display:flex;flex-direction:column;background:#111115;border:1px solid var(--line,#1C1C21);border-radius:10px;overflow:hidden}
+.ctr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.3fr) minmax(0,1fr);align-items:center;padding:8px 12px;border-bottom:1px solid var(--line,#1C1C21);font-size:14px;font-variant-numeric:tabular-nums}
+.ctr .l{text-align:right}.ctr .r{text-align:left}
+.ctr .c{text-align:center;font-size:11px;letter-spacing:.12em;color:var(--dim,#868690);font-weight:700}
+.ctr .better{color:var(--gold2,#E2C27A);font-weight:700}
+.ctr.chr{background:var(--panel,#0C0C0F);font:800 16px "Barlow Condensed",Impact,sans-serif;letter-spacing:.04em}
+.ctr.chr .l{color:#E5484D}.ctr.chr .r{color:#4C8DFF}
+.cbars{display:grid;grid-template-columns:1fr 1fr;gap:2px;height:5px;margin-top:4px}
+.cbars i{display:block;height:100%;border-radius:3px}
+.cbars .ba{background:#E5484D;justify-self:end}.cbars .bb{background:#4C8DFF}
+.cfoot{font-size:11px;color:var(--dim,#868690);padding:8px 12px;margin:0}
+.cextra{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+.cbox{background:#111115;border:1px solid var(--line,#1C1C21);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:6px;font-size:14px;min-width:0}
+.cbox h3{font-size:16px;letter-spacing:.08em;color:var(--muted,#A1A1AA);margin:0}
+.codds{display:flex;justify-content:space-between;font-size:24px}
+.codds .ca{color:#E5484D}.codds .cb{color:#4C8DFF}
+.csplit{display:flex;height:8px;border-radius:4px;overflow:hidden}
+.csplit i:first-child{background:#E5484D}.csplit i:last-child{background:#4C8DFF}
+.cnotes{width:100%;resize:vertical;background:#08080A;border:1px solid var(--line2,#24242A);border-radius:8px;color:var(--text,#F4F4F5);font:14px Inter,system-ui,sans-serif;padding:9px}
+.small{font-size:12px}
+.ctitlebar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;border-top:1px dashed var(--line2,#24242A);padding-top:12px}
+.clink{margin:0;font-size:13px}.clink a{color:var(--gold2,#E2C27A)}
 .snotes{margin-top:22px}
 .snotes-in{border:1px solid rgba(240,122,126,.35);background:linear-gradient(180deg,rgba(240,122,126,.06),rgba(240,122,126,0) 140px);border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px}
 .snotes-h{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
@@ -5323,11 +5773,61 @@ CARDS_CSS = r"""
 }
 """
 
+COMMENTARY_JS = r"""
+(function () {
+  var card = document.querySelector('.ccard');
+  if (!card) return;
+  var P = window.PFO = window.PFO || { me: null, waiting: [] };
+  function toggle(b, open) {
+    var panel = b.querySelector('.cpanel'), head = b.querySelector('.cbout-h');
+    if (open === undefined) open = panel.hidden;
+    panel.hidden = !open; b.classList.toggle('open', open); head.setAttribute('aria-expanded', open ? 'true' : 'false');
+  }
+  card.addEventListener('click', function (e) {
+    var h = e.target.closest('.cbout-h'); if (h) { toggle(h.parentElement); return; }
+    var t = e.target.closest('[data-ctitle]');
+    if (t) {
+      t.disabled = true;
+      P.post('/api/commentary/title', { card_id: t.getAttribute('data-card'), pair: t.getAttribute('data-ctitle'), on: t.getAttribute('data-on') === '1' }).then(function (d) {
+        P.toast(d.message, d.ok ? 'ok' : 'bad');
+        if (d.ok) setTimeout(function () { location.reload(); }, 500); else t.disabled = false;
+      });
+    }
+  });
+  var all = document.querySelector('[data-copen]');
+  if (all) all.addEventListener('click', function () {
+    var boxes = Array.prototype.slice.call(card.querySelectorAll('.cbout'));
+    var open = boxes.some(function (b) { return b.querySelector('.cpanel').hidden; });
+    boxes.forEach(function (b) { toggle(b, open); });
+    all.textContent = open ? 'CLOSE ALL' : 'OPEN ALL';
+  });
+  // Open the fight up next straight away
+  var next = document.getElementById('up-next');
+  if (next) toggle(next, true);
+  if (location.hash === '#up-next' && next) next.scrollIntoView({ block: 'center' });
+  // Shared notes save by themselves
+  Array.prototype.slice.call(card.querySelectorAll('[data-cnote]')).forEach(function (t) {
+    var timer = null, status = t.parentElement.querySelector('[data-cnote-status]'), last = t.value;
+    function save() {
+      if (t.value === last) return;
+      var value = t.value;
+      if (status) status.textContent = 'Saving…';
+      P.post('/api/commentary/note', { card_id: t.getAttribute('data-card'), pair: t.getAttribute('data-cnote'), text: value }).then(function (d) {
+        if (d.ok) { last = value; if (status) status.textContent = 'Saved'; }
+        else if (status) { status.textContent = d.message || 'Couldn\'t save. Check your connection.'; }
+      }).catch(function () { if (status) status.textContent = 'Couldn\'t save. Check your connection.'; });
+    }
+    t.addEventListener('input', function () { clearTimeout(timer); if (status) status.textContent = 'Typing…'; timer = setTimeout(save, 1200); });
+    t.addEventListener('blur', save);
+  });
+})();
+"""
 SITE_JS += EXTRA_JS
 SITE_JS += NAV_JS
 SITE_JS += ACCOUNT_JS
 SITE_JS += V2_JS
 SITE_JS += CARDS_JS
+SITE_JS += COMMENTARY_JS
 SITE_CSS += V2_CSS
 SITE_CSS += CARDS_CSS
 
@@ -5409,6 +5909,28 @@ def setup_web_tables(g):
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS staff_notes_user ON staff_notes(guild_id, user_id)")
+    # Commentary desk: shared notes per fight on a card
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS commentary_notes (
+            guild_id INTEGER NOT NULL,
+            card_id INTEGER NOT NULL,
+            pair TEXT NOT NULL,
+            text TEXT NOT NULL,
+            updated_by INTEGER,
+            updated_at INTEGER,
+            PRIMARY KEY(guild_id, card_id, pair)
+        )
+    """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS commentary_titles (
+            guild_id INTEGER NOT NULL,
+            card_id INTEGER NOT NULL,
+            pair TEXT NOT NULL,
+            set_by INTEGER,
+            set_at INTEGER,
+            PRIMARY KEY(guild_id, card_id, pair)
+        )
+    """)
     db.commit()
     db.close()
 
@@ -5451,14 +5973,15 @@ def read_session(g, request):
 def member_levels(g, guild, member):
     """What this member can see on the site."""
     if member is None:
-        return {"fighter": False, "staff": False, "mod": False, "senior": False}
+        return {"fighter": False, "staff": False, "mod": False, "senior": False, "commentary": False}
     owner = getattr(guild, "owner_id", None) == member.id
     has = g["has_any_role"]
     senior = owner or has(member, g["SENIOR_ROLE_NAMES"])
     mod = senior or has(member, g["MODERATOR_ROLE_NAMES"])
     staff = mod or has(member, g["STAFF_ROLE_NAMES"])
     fighter = has(member, g["FIGHTER_ROLE_NAMES"])
-    return {"fighter": fighter, "staff": staff, "mod": mod, "senior": senior}
+    commentary = staff or has(member, [COMMENTARY_ROLE])     # the commentary desk
+    return {"fighter": fighter, "staff": staff, "mod": mod, "senior": senior, "commentary": commentary}
 
 
 class Viewer:
@@ -7392,7 +7915,8 @@ def render_staff(ctx, viewer, query):
         except Exception:
             traceback.print_exc()
 
-    links = '<a class="btn btn-ghost btn-sm" href="/results">RESULTS (EDIT)</a><a class="btn btn-ghost btn-sm" href="/rankings">RANKINGS (EDIT)</a>'
+    links = ('<a class="btn btn-gold btn-sm" href="/commentary">🎙️ COMMENTARY DESK</a>'
+             '<a class="btn btn-ghost btn-sm" href="/results">RESULTS (EDIT)</a><a class="btn btn-ghost btn-sm" href="/rankings">RANKINGS (EDIT)</a>')
     if viewer.levels["senior"]:
         links += '<a class="btn btn-ghost btn-sm" href="/stats">SITE STATS</a>'
     level = "HEAD MODERATOR+" if viewer.levels["senior"] else "MODERATOR" if viewer.levels["mod"] else "HELPER"
@@ -8327,6 +8851,36 @@ def add_page_routes(app, bot, g, serve, html_response):
     async def staff_page(request):
         return await personal(request, "Staff", render_staff, "staff", "The staff dashboard is for Helpers and above.")
 
+    async def commentary_page(request):
+        return await personal(request, "Commentary", render_commentary, "commentary",
+                              "The commentary desk is for Helpers and above and the [COMMENTARY] role.")
+
+    @action_route(bot, g, need="commentary", bucket="cnotes", limit=60, window=60)
+    async def commentary_note(viewer, body, request):
+        gd = guild()
+        card_id = _int(body.get("card_id"), 0)
+        pair = str(body.get("pair") or "")
+        if not card_id or not re.fullmatch(r"\d+-\d+", pair):
+            raise ActionError("That fight couldn't be found.")
+        text = str(body.get("text") or "")[:3000]
+        g["discipline_query"]("INSERT OR REPLACE INTO commentary_notes (guild_id, card_id, pair, text, updated_by, updated_at) "
+                              "VALUES (?, ?, ?, ?, ?, ?)", (gd.id, card_id, pair, text, viewer.user_id, int(time.time())), write=True)
+        return {"ok": True, "message": "Saved"}
+
+    @action_route(bot, g, need="staff", bucket="ctitle", limit=30, window=60)
+    async def commentary_title(viewer, body, request):
+        gd = guild()
+        card_id = _int(body.get("card_id"), 0)
+        pair = str(body.get("pair") or "")
+        if not card_id or not re.fullmatch(r"\d+-\d+", pair):
+            raise ActionError("That fight couldn't be found.")
+        if body.get("on"):
+            g["discipline_query"]("INSERT OR REPLACE INTO commentary_titles (guild_id, card_id, pair, set_by, set_at) VALUES (?, ?, ?, ?, ?)",
+                                  (gd.id, card_id, pair, viewer.user_id, int(time.time())), write=True)
+            return {"ok": True, "message": "Marked as a title fight."}
+        g["discipline_query"]("DELETE FROM commentary_titles WHERE guild_id = ? AND card_id = ? AND pair = ?", (gd.id, card_id, pair), write=True)
+        return {"ok": True, "message": "No longer a title fight."}
+
     async def stats_page(request):
         return await personal(request, "Site stats", render_stats, "senior", "Site stats are for Head Moderators and above.")
 
@@ -8518,10 +9072,11 @@ def add_page_routes(app, bot, g, serve, html_response):
                           ("/records", records), ("/awards", awards), ("/week", week), ("/app", app_page), ("/offline", offline),
                           ("/manifest.webmanifest", manifest), ("/sw.js", service_worker), ("/icon.svg", icon_svg),
                           ("/icon-192.png", icon), ("/icon-512.png", icon), ("/api/home", home_panel), ("/api/staff/fight", staff_fight_info),
-                          ("/api/staff/notes", staff_notes_list)):
+                          ("/api/staff/notes", staff_notes_list), ("/commentary", commentary_page)):
         app.router.add_get(path, handler)
     for path, handler in (("/api/tasks/claim", claim_tasks), ("/api/staff/fight", staff_fight), ("/api/staff/rank", staff_rank),
-                          ("/api/staff/shop", staff_shop), ("/api/staff/notes", staff_notes_change)):
+                          ("/api/staff/shop", staff_shop), ("/api/staff/notes", staff_notes_change),
+                          ("/api/commentary/note", commentary_note), ("/api/commentary/title", commentary_title)):
         app.router.add_post(path, handler)
 
 
