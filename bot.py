@@ -15373,8 +15373,9 @@ NEW_FIGHTER_METHOD_ODDS = 6.0   # KO / SUB / DEC pick on a fighter with little h
 ROUND_PICKS = {"R1": 1, "R2": 2, "R3": 3}
 ROUND_SHARE = {1: 0.45, 2: 0.32, 3: 0.23}   # default split of finishes by round
 ROUND_PRIOR_FIGHTS = 10         # "average" finishes mixed in so a few fights don't swing it
-MAX_ROUND_ODDS = 12.0           # any round pick
-NEW_FIGHTER_ROUND_ODDS = 8.0    # round pick on a fighter with little history
+MAX_ROUND_ODDS = float(os.getenv("MAX_ROUND_ODDS", "6.0"))          # any round pick
+NEW_FIGHTER_ROUND_ODDS = float(os.getenv("NEW_FIGHTER_ROUND_ODDS", "4.5"))   # round pick on a fighter with little history
+ROUND_ODDS_SCALE = float(os.getenv("ROUND_ODDS_SCALE", "0.45"))     # how much of the "true" extra price is paid (lower = tamer)
 MIN_ROUND_SHARE = 0.06          # never prices a round pick longer than this chance allows
 
 _markets_to_refresh = set()
@@ -16058,8 +16059,10 @@ def round_pick_odds(bout, pick: str, method: str):
         cap = NEW_FIGHTER_ROUND_ODDS
 
     share = max(share, MIN_ROUND_SHARE)
-    # Always pays more than just picking the winner, never more than the cap.
-    return max(round(odds * 1.5, 2), min(cap, round(odds / share, 2)))
+    # Only part of the extra price over the win odds is paid, so round picks stay sensible.
+    tamed = odds + (odds / share - odds) * ROUND_ODDS_SCALE
+    # Always pays a bit more than just picking the winner, never more than the cap.
+    return max(round(odds * 1.25, 2), min(cap, round(tamed, 2)))
 
 
 def pick_odds(bout, pick: str, method: str = None):
