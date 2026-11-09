@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "28"
+SITE_VERSION = "30"
 _THEME_BANNERS = {}             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
 MAX_BUILDS_AT_ONCE = 2        # pages built at the same time (keeps the bot responsive)
@@ -1445,7 +1445,23 @@ def render_fighter(ctx, user_id):
     nick_html = f'<span class="fnick l-up">“{esc(cosmetics["nickname"])}”</span>' if cosmetics.get("nickname") else ""
     quote_html = f'<blockquote class="fquote l-up">“{esc(cosmetics["quote"])}”</blockquote>' if cosmetics.get("quote") else ""
     badge_html = f'<span class="fshopbadge">{esc(cosmetics["badge"].upper())}</span>' if cosmetics.get("badge") else ""
+    try:
+        if "is_booster" in ctx.g and ctx.is_booster(ctx.gid, user_id):
+            badge_html += '<span class="fboost" title="Server Booster">💎 BOOSTER</span>'
+    except Exception:
+        pass
     style_cls = f' fstyle-{esc(cosmetics["style"])}' if cosmetics.get("style") else ""
+
+    # Fighter archetype (/archetype)
+    arch_html = ""
+    try:
+        key = ctx.get_archetype(ctx.gid, user_id) if "get_archetype" in ctx.g else None
+        if key:
+            emoji, arch_name, _, about = ctx.ARCHETYPES[key]
+            arch_html = (f'<p class="farch l-up"><span class="farch-tag">{esc(emoji)} {esc(arch_name.upper())}</span>'
+                         f'<span class="farch-about">{esc(about)}</span></p>')
+    except Exception:
+        arch_html = ""
 
     hero = f"""
 <section class="fhero{style_cls}" aria-label="{esc(name)}">
@@ -1455,6 +1471,7 @@ def render_fighter(ctx, user_id):
       <div class="fhero-top l-badge">{avatar_html(ctx, user_id, name, 'av av-hero')}<span class="fbadge">{esc(badge)}</span>{badge_html}</div>
       <h1 class="d fhero-name l-title">{esc(first)}{'<br>' + esc(last) if last else ''}</h1>
       {nick_html}
+      {arch_html}
       {handle_html}
       {team_html}
       {former_html}
@@ -3239,6 +3256,10 @@ img{max-width:100%}
 .fstyle-blackout{background:linear-gradient(180deg,#000,rgba(8,8,10,0))}
 .fstyle-blackout .fhero-name{color:#FFFFFF}
 .fstyle-blackout .av-hero{filter:grayscale(1);box-shadow:0 0 0 3px #D4D4D4}
+.fstyle-booster{background:radial-gradient(70% 90% at 15% 30%,rgba(244,127,255,.22),rgba(88,101,242,.1) 45%,rgba(8,8,10,0) 65%)}
+.fstyle-booster .fhero-name{color:#FFE9FF;text-shadow:0 0 22px rgba(244,127,255,.4)}
+.ftheme-booster{--gold:#F47FFF;--gold2:#FFC2FF}
+.fboost{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;color:#FFC2FF;background:rgba(244,127,255,.14);border:1px solid rgba(244,127,255,.5);border-radius:999px;padding:3px 10px;margin-left:6px;vertical-align:middle}
 /* Profile Theme across the whole fighter page: accents, tabs, numbers and links use the theme colour */
 .ftheme-crimson{--gold:#E5534B;--gold2:#FF9A92}
 .ftheme-ice{--gold:#6CC6EA;--gold2:#B8E6F8}
@@ -3249,6 +3270,46 @@ img{max-width:100%}
 .ftheme .tiles,.ftheme .ftabs{border-color:color-mix(in srgb,var(--gold) 35%,transparent)}
 .ftheme .ftile,.ftheme .tile{box-shadow:inset 0 2px 0 color-mix(in srgb,var(--gold) 55%,transparent)}
 .ftheme a{color:var(--gold2)}
+.podium{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;align-items:end;max-width:720px}
+.pod{background:var(--panel,#0C0C0F);border:1px solid var(--line2,#24242A);border-radius:12px;padding:14px 10px;text-align:center;display:flex;flex-direction:column;gap:4px;min-width:0}
+.pod1{border-color:var(--gold);padding-block:22px}
+.pod-place{font-size:28px;line-height:1;color:var(--gold)}
+.pod-name{font-weight:700;overflow-wrap:anywhere}
+.pod-prize{font-size:12px;color:var(--gold2);font-weight:700}
+.pullweek{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.snotes{margin-top:22px}
+.snotes-in{border:1px solid rgba(240,122,126,.35);background:linear-gradient(180deg,rgba(240,122,126,.06),rgba(240,122,126,0) 140px);border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px}
+.snotes-h{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.nlock{font-size:11px;font-weight:800;letter-spacing:.1em;color:#F07A7E;border:1px solid rgba(240,122,126,.4);border-radius:999px;padding:3px 10px}
+.nadd{display:flex;flex-direction:column;gap:8px;background:var(--panel,#0C0C0F);border:1px solid var(--line2,#24242A);border-radius:10px;padding:12px}
+.nadd textarea,.nedit{width:100%;resize:vertical;background:#111115;border:1px solid var(--line2,#24242A);border-radius:8px;color:var(--text,#F4F4F5);font:14px Inter,system-ui,sans-serif;padding:10px}
+.nrow{display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between}
+.ntags{display:flex;gap:6px;flex-wrap:wrap}
+.ntag{font-size:11px;font-weight:700;letter-spacing:.06em;padding:3px 10px;border-radius:999px;border:1px solid var(--line2,#24242A);color:var(--muted,#A1A1AA);background:none;cursor:pointer;text-decoration:none;display:inline-block}
+.ntag.on{color:#111}
+.nt-general.on,.nt-all.on{background:#A1A1AA;border-color:#A1A1AA}
+.nt-behaviour.on{background:#F07A7E;border-color:#F07A7E}
+.nt-matchmaking.on{background:#7FB0FF;border-color:#7FB0FF}
+.nt-watch.on{background:#F5B455;border-color:#F5B455}
+.nt-positive.on{background:#3DD68C;border-color:#3DD68C}
+.nlist{display:flex;flex-direction:column;gap:10px}
+.nitem{background:var(--panel,#0C0C0F);border:1px solid var(--line,#1C1C21);border-radius:10px;padding:12px 14px;display:flex;flex-direction:column;gap:6px}
+.nitem.pinned{border-color:rgba(201,162,74,.5)}
+.nmeta{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--dim,#868690)}
+.nmeta b{color:var(--text,#F4F4F5);font-weight:600}
+.ntext{font-size:14px;white-space:pre-wrap;overflow-wrap:anywhere}
+.nacts{display:flex;gap:6px;flex-wrap:wrap}
+.nfilter{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.ninput{flex:1 1 220px;min-width:0;background:#111115;border:1px solid var(--line2,#24242A);border-radius:8px;color:var(--text,#F4F4F5);padding:8px 12px;font:14px Inter,system-ui,sans-serif}
+.ntable{overflow-x:auto;border:1px solid var(--line2,#24242A);border-radius:10px;margin-top:12px}
+.ntable table{border-collapse:collapse;width:100%;min-width:640px;font-size:14px}
+.ntable th,.ntable td{text-align:left;padding:10px 14px;border-bottom:1px solid var(--line,#1C1C21);vertical-align:top}
+.ntable th{font-size:11px;letter-spacing:.12em;color:var(--dim,#868690)}
+.ntable tr:last-child td{border-bottom:0}
+.nwho{white-space:nowrap;font-weight:600}
+.farch{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:8px 0 2px;max-width:60ch}
+.farch-tag{font-size:12px;font-weight:800;letter-spacing:.08em;color:var(--gold2);background:color-mix(in srgb,var(--gold) 14%,transparent);border:1px solid color-mix(in srgb,var(--gold) 45%,transparent);border-radius:999px;padding:3px 11px;white-space:nowrap}
+.farch-about{font-size:13px;color:var(--muted)}
 .themebanner{display:block;width:100%;height:auto;max-width:800px;margin:32px auto 0;border-radius:10px;border:1px solid color-mix(in srgb,var(--gold) 40%,transparent)}
 .spot{display:flex;flex-wrap:wrap;align-items:center;gap:22px 32px;padding:30px 34px;border:1px solid #3A311B;border-radius:20px;color:var(--text);background:radial-gradient(120% 120% at 0% 0%,rgba(201,162,74,.16),rgba(8,8,10,0) 55%),var(--panel);transition:border-color .35s,transform .35s var(--ease)}
 .spot:hover{color:var(--text);border-color:#5A4A22;transform:translateY(-3px)}
@@ -4916,8 +4977,83 @@ V2_JS = r"""
       fb.hidden = false;
       fb.innerHTML = '<span class="eyebrow-grey">STAFF</span><span class="muted">Edit fights from the list below. Records, stats, belts, transfers and warnings: ' +
         '/editstats, /belt, /transfer and /warn in Discord.</span>' + (me.levels.mod ? '' : '');
+      if (me.levels.mod) staffNotes(fb.getAttribute('data-staff-fighter'), fb);
     }
   });
+
+  // Staff fighter notes (Moderator+ only; the server checks this too)
+  function staffNotes(uid, bar) {
+    var box = document.createElement('section'); box.className = 'snotes wrap'; box.id = 'staff-notes';
+    var hero = bar.closest('section'); (hero || bar).insertAdjacentElement('afterend', box);
+    var kinds = {}, chosen = 'general';
+    function load() {
+      fetch('/api/staff/notes?user_id=' + encodeURIComponent(uid), { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (r) { return r.json(); }).then(function (d) { if (d.ok) { kinds = d.kinds; draw(d.notes); } });
+    }
+    function tagButtons(sel) {
+      return Object.keys(kinds).map(function (k) {
+        return '<button type="button" class="ntag nt-' + k + (k === sel ? ' on' : '') + '" data-kind="' + k + '">' + esc(kinds[k]) + '</button>';
+      }).join('');
+    }
+    function draw(notes) {
+      box.innerHTML = '<div class="snotes-in"><div class="snotes-h"><div><h2 class="d h-s">STAFF NOTES</h2>' +
+        '<p class="muted">Only Moderators and above can see this. The fighter can\'t.</p></div><span class="nlock">🔒 MOD+ ONLY</span></div>' +
+        '<div class="nadd"><label class="muted" for="nnew">Add a note</label><textarea id="nnew" maxlength="1000" rows="3"></textarea>' +
+        '<div class="nrow"><div class="ntags" data-newkinds>' + tagButtons(chosen) + '</div><button type="button" class="btn btn-gold btn-sm" data-nadd>ADD NOTE</button></div></div>' +
+        '<div class="nlist">' + (notes.length ? notes.map(function (n) {
+          return '<div class="nitem' + (n.pinned ? ' pinned' : '') + '" data-note="' + n.id + '"><div class="nmeta">' + (n.pinned ? '📌 ' : '') +
+            '<span class="ntag on nt-' + esc(n.kind) + '">' + esc(n.kind_name) + '</span><b>' + esc(n.author) + '</b> · ' +
+            new Date(n.at * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }) + (n.edited ? ' · edited' : '') + '</div>' +
+            '<div class="ntext">' + esc(n.text) + '</div><div class="nacts"><button type="button" class="btn btn-ghost btn-sm" data-npin>' + (n.pinned ? 'Unpin' : 'Pin') + '</button>' +
+            (n.can_edit ? '<button type="button" class="btn btn-ghost btn-sm" data-nedit>Edit</button><button type="button" class="btn btn-ghost btn-sm" data-ndel>Delete</button>' : '') +
+            '</div></div>';
+        }).join('') : '<p class="muted">No notes on this fighter yet.</p>') + '</div></div>';
+      box._notes = notes;
+    }
+    box.addEventListener('click', function (e) {
+      var t = e.target.closest('button'); if (!t) return;
+      if (t.hasAttribute('data-kind') && t.closest('[data-newkinds]')) {
+        chosen = t.getAttribute('data-kind');
+        $$('[data-newkinds] .ntag', box).forEach(function (b) { b.classList.toggle('on', b === t); });
+        return;
+      }
+      if (t.hasAttribute('data-nadd')) {
+        var text = $('#nnew', box).value.trim(); if (!text) { P.toast('Write a note first.', 'bad'); return; }
+        busy(t, true);
+        P.post('/api/staff/notes', { action: 'add', user_id: uid, text: text, kind: chosen }).then(function (d) {
+          busy(t, false); P.toast(d.message, d.ok ? 'ok' : 'bad'); if (d.ok) load();
+        });
+        return;
+      }
+      var item = t.closest('[data-note]'); if (!item) return;
+      var id = item.getAttribute('data-note');
+      var note = (box._notes || []).filter(function (n) { return String(n.id) === id; })[0];
+      if (t.hasAttribute('data-npin')) { P.post('/api/staff/notes', { action: 'pin', note_id: id }).then(function (d) { P.toast(d.message, d.ok ? 'ok' : 'bad'); if (d.ok) load(); }); return; }
+      if (t.hasAttribute('data-ndel')) {
+        if (t.getAttribute('data-sure') !== '1') { t.setAttribute('data-sure', '1'); t.textContent = 'Tap again to delete'; return; }
+        P.post('/api/staff/notes', { action: 'delete', note_id: id }).then(function (d) { P.toast(d.message, d.ok ? 'ok' : 'bad'); if (d.ok) load(); });
+        return;
+      }
+      if (t.hasAttribute('data-nedit') && note) {
+        var editKind = note.kind;
+        item.innerHTML = '<textarea class="nedit" maxlength="1000" rows="3" aria-label="Edit note">' + esc(note.text) + '</textarea>' +
+          '<div class="nrow"><div class="ntags" data-editkinds>' + tagButtons(editKind) + '</div><div class="btns">' +
+          '<button type="button" class="btn btn-gold btn-sm" data-nsave>SAVE</button><button type="button" class="btn btn-ghost btn-sm" data-ncancel>CANCEL</button></div></div>';
+        item.addEventListener('click', function (ev) {
+          var b = ev.target.closest('button'); if (!b) return; ev.stopPropagation();
+          if (b.hasAttribute('data-kind')) { editKind = b.getAttribute('data-kind'); $$('[data-editkinds] .ntag', item).forEach(function (x) { x.classList.toggle('on', x === b); }); return; }
+          if (b.hasAttribute('data-ncancel')) { load(); return; }
+          if (b.hasAttribute('data-nsave')) {
+            busy(b, true);
+            P.post('/api/staff/notes', { action: 'edit', note_id: id, text: $('.nedit', item).value, kind: editKind }).then(function (d) {
+              busy(b, false); P.toast(d.message, d.ok ? 'ok' : 'bad'); if (d.ok) load();
+            });
+          }
+        });
+      }
+    });
+    load();
+  }
 
   function fightEditor(id) {
     fetch('/api/staff/fight?id=' + id, { credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(function (f) {
@@ -5258,8 +5394,26 @@ def setup_web_tables(g):
         )
     """)
     db.execute("CREATE INDEX IF NOT EXISTS site_views_day ON site_views(day)")
+    # Staff fighter notes: private, Moderator+ only, website only
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS staff_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            author_id INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'general',
+            text TEXT NOT NULL,
+            pinned INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            edited_at INTEGER
+        )
+    """)
+    db.execute("CREATE INDEX IF NOT EXISTS staff_notes_user ON staff_notes(guild_id, user_id)")
     db.commit()
     db.close()
+
+
+NOTE_KINDS = {"general": "General", "behaviour": "Behaviour", "matchmaking": "Matchmaking", "watch": "Keep an eye on", "positive": "Positive"}
 
 
 def _hash(text):
@@ -7204,6 +7358,40 @@ def render_staff(ctx, viewer, query):
         except Exception:
             pass
 
+    # Mod+: every staff fighter note, newest first, with search and type filter
+    if viewer.levels["mod"]:
+        try:
+            kind = query.get("nk", "")
+            search = (query.get("nq", "") or "").strip()[:60]
+            sql = "SELECT * FROM staff_notes WHERE guild_id = ?"
+            params = [gid]
+            if kind in NOTE_KINDS:
+                sql += " AND kind = ?"
+                params.append(kind)
+            rows = ctx.q(sql + " ORDER BY created_at DESC LIMIT 300", tuple(params))
+            if search:
+                low = search.lower()
+                rows = [r for r in rows if low in r["text"].lower() or low in fighter_name(ctx, r["user_id"]).lower()]
+            rows = rows[:80]
+            filters = "".join(f'<a class="ntag nt-{k}{" on" if kind == k else ""}" href="/dashboard?nk={k}#notes">{esc(v)}</a>' for k, v in NOTE_KINDS.items())
+            filters = f'<a class="ntag nt-all{" on" if not kind else ""}" href="/dashboard#notes">All</a>' + filters
+            table = "".join(
+                f'<tr><td class="nwho">{name_link(ctx, r["user_id"], fighter_name(ctx, r["user_id"]))}</td>'
+                f'<td>{"📌 " if r["pinned"] else ""}{esc(r["text"])}</td>'
+                f'<td><span class="ntag on nt-{esc(r["kind"])}">{esc(NOTE_KINDS.get(r["kind"], r["kind"]))}</span></td>'
+                f'<td class="muted">{esc(player_name(ctx, r["author_id"]))}</td><td class="muted">{when_html(r["created_at"])}</td></tr>'
+                for r in rows)
+            inner = (f'<form class="nfilter" method="get" action="/dashboard#notes"><input class="ninput" name="nq" value="{esc(search)}" '
+                     f'placeholder="Search notes or fighters…" aria-label="Search notes">'
+                     f'{f"<input type=hidden name=nk value={esc(kind)}>" if kind else ""}<button class="btn btn-ghost btn-sm">SEARCH</button></form>'
+                     f'<div class="ntags">{filters}</div>'
+                     + (f'<div class="ntable"><table><thead><tr><th>FIGHTER</th><th>NOTE</th><th>TYPE</th><th>BY</th><th>WHEN</th></tr></thead>'
+                        f'<tbody>{table}</tbody></table></div>' if table else '<p class="muted">No notes yet. Add them from a fighter\'s page.</p>')
+                     + '<p class="note">Only Moderators and above can see these. Add, pin, edit and delete them on each fighter\'s page.</p>')
+            blocks.append(('<span id="notes"></span>FIGHTER NOTES · MOD+ ONLY', inner))
+        except Exception:
+            traceback.print_exc()
+
     links = '<a class="btn btn-ghost btn-sm" href="/results">RESULTS (EDIT)</a><a class="btn btn-ghost btn-sm" href="/rankings">RANKINGS (EDIT)</a>'
     if viewer.levels["senior"]:
         links += '<a class="btn btn-ghost btn-sm" href="/stats">SITE STATS</a>'
@@ -7658,9 +7846,41 @@ def render_cards(ctx):
     packs = "".join(
         f'<div class="pbox"><h3 class="pbox-h">{esc(ctx.SHOP_ITEMS[k][1])} {esc(ctx.SHOP_ITEMS[k][0].upper())} · {ctx.item_price(ctx.gid, k):,}</h3>'
         f'<p class="muted">{esc(ctx.SHOP_ITEMS[k][5])}</p></div>' for k in ("pack_common", "pack_rare", "pack_champ"))
+
+    # Pack Board: this week's top pullers (same as /packboard)
+    board_html = ""
+    if "pack_board" in ctx.g:
+        try:
+            start, end, label = ctx.pack_week(0)
+            board = ctx.pack_board(ctx.gid, start, end)
+            top = ctx.pack_board_rows(board, "points")[:3]
+            prizes = list(ctx.PACKBOARD_PRIZES) + [0, 0, 0]
+            pods = ""
+            for place in (1, 0, 2):
+                if place < len(top):
+                    uid, e, value = top[place]
+                    pods += (f'<div class="pod{" pod1" if place == 0 else ""}"><span class="d pod-place">{("1ST", "2ND", "3RD")[place]}</span>'
+                             f'<span class="pod-name">{name_link(ctx, uid, fighter_name(ctx, uid))}</span>'
+                             f'<span class="muted">{esc(value)} · {e["packs"]} pack{"s" if e["packs"] != 1 else ""}</span>'
+                             f'{f"<span class=pod-prize>+{prizes[place]:,}</span>" if prizes[place] else ""}</div>')
+            best = ctx.pack_board_rows(board, "best")[:1]
+            pull = ""
+            if best:
+                uid, e, _ = best[0]
+                pull = (f'<p class="pullweek"><span class="eyebrow-grey">PULL OF THE WEEK</span> {name_link(ctx, uid, fighter_name(ctx, uid))} pulled '
+                        f'<b>{esc(ctx._pull_text(e))}</b> · {e["best"][2]} pts</p>')
+            points = " · ".join(f"{ctx.CARD_TIER_NAMES[t]} {p}" for t, p in ctx.PACK_POINTS.items())
+            board_html = (f'<section class="block bt"><div class="head-t rv"><span class="eyebrow">{esc(label.upper())}</span>'
+                          f'<h2 class="d h-m">PACK BOARD</h2></div>'
+                          + (f'<div class="podium">{pods}</div>{pull}' if pods else '<p class="muted">No packs opened yet this week. Open one to get on the board.</p>')
+                          + f'<p class="note">Points for every card pulled from a pack this week: {esc(points)}. The top 3 win coins on Monday. '
+                            'Use /packboard in Discord for every board.</p></section>')
+        except Exception:
+            traceback.print_exc()
     body = page_hero("COLLECT THE LEAGUE", "CARDS", "CARD", f'<div class="evchips l-up">{chip("FIGHTERS", len(order))}{counts}</div>'
                      '<div class="btns l-up"><a class="btn btn-gold" href="/shop">GET PACKS</a><a class="btn btn-ghost" href="/me/cards">MY CARDS</a></div>') + f"""
 <div class="wrap">
+  {board_html}
   <section class="block">{filters}<div class="cardgrid">{tiles or '<p class="empty">Cards appear for fighters with a weight class role or a UFC fighter name.</p>'}</div></section>
   <section class="block bt"><div class="head-t rv"><span class="eyebrow">IN THE SHOP</span><h2 class="d h-m">PACKS</h2></div>
     <div class="pgrid">{packs}</div>
@@ -8240,14 +8460,68 @@ def add_page_routes(app, bot, g, serve, html_response):
                           ("/api/spin", daily_spin), ("/api/cards/trade", cards_trade),
                           ("/api/cards/trade/respond", cards_trade_respond)):
         app.router.add_post(path, handler)
+    # ---- staff fighter notes (Moderator+ only; never sent to anyone else) ----
+    def note_json(viewer, row):
+        own = row["author_id"] == viewer.user_id
+        ctx_ = Ctx(g, guild())
+        return {"id": row["id"], "kind": row["kind"], "kind_name": NOTE_KINDS.get(row["kind"], row["kind"]), "text": row["text"],
+                "pinned": bool(row["pinned"]), "author": player_name(ctx_, row["author_id"]), "at": row["created_at"],
+                "edited": bool(row["edited_at"]), "can_edit": own or viewer.levels["senior"]}
+
+    async def staff_notes_list(request):
+        viewer = viewer_for(bot, g, request)
+        if not viewer.ok or not viewer.levels["mod"]:
+            return jres({"ok": False}, 403)
+        uid = _int(request.query.get("user_id"), 0)
+        rows = g["discipline_query"]("SELECT * FROM staff_notes WHERE guild_id = ? AND user_id = ? ORDER BY pinned DESC, created_at DESC",
+                                     (guild().id, uid))
+        return jres({"ok": True, "notes": [note_json(viewer, r) for r in rows], "kinds": NOTE_KINDS})
+
+    @action_route(bot, g, need="mod", bucket="notes", limit=40, window=60)
+    async def staff_notes_change(viewer, body, request):
+        gd = guild()
+        action = body.get("action")
+        if action == "add":
+            uid = _int(body.get("user_id"), 0)
+            text = str(body.get("text") or "").strip()[:1000]
+            kind = body.get("kind") if body.get("kind") in NOTE_KINDS else "general"
+            if not uid or not text:
+                raise ActionError("Write a note first.")
+            g["discipline_query"]("INSERT INTO staff_notes (guild_id, user_id, author_id, kind, text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                  (gd.id, uid, viewer.user_id, kind, text, int(time.time())), write=True)
+            return {"ok": True, "message": "Note added."}
+        rows = g["discipline_query"]("SELECT * FROM staff_notes WHERE id = ? AND guild_id = ?", (_int(body.get("note_id"), 0), gd.id))
+        if not rows:
+            raise ActionError("That note doesn't exist any more.")
+        row = rows[0]
+        can_edit = row["author_id"] == viewer.user_id or viewer.levels["senior"]
+        if action == "pin":
+            g["discipline_query"]("UPDATE staff_notes SET pinned = ? WHERE id = ?", (0 if row["pinned"] else 1, row["id"]), write=True)
+            return {"ok": True, "message": "Unpinned." if row["pinned"] else "Pinned."}
+        if not can_edit:
+            raise ActionError("You can only change your own notes. Head Moderators and above can change anyone's.")
+        if action == "edit":
+            text = str(body.get("text") or "").strip()[:1000]
+            kind = body.get("kind") if body.get("kind") in NOTE_KINDS else row["kind"]
+            if not text:
+                raise ActionError("A note can't be empty. Delete it instead.")
+            g["discipline_query"]("UPDATE staff_notes SET text = ?, kind = ?, edited_at = ? WHERE id = ?",
+                                  (text, kind, int(time.time()), row["id"]), write=True)
+            return {"ok": True, "message": "Note saved."}
+        if action == "delete":
+            g["discipline_query"]("DELETE FROM staff_notes WHERE id = ?", (row["id"],), write=True)
+            return {"ok": True, "message": "Note deleted."}
+        raise ActionError("Unknown action.")
+
     for path, handler in (("/me", me_page), ("/dashboard", staff_page), ("/staff", staff_public), ("/teams", teams_page),
                           ("/team/{team_id}", team_page), ("/stats", stats_page), ("/shop", shop), ("/social", social),
                           ("/records", records), ("/awards", awards), ("/week", week), ("/app", app_page), ("/offline", offline),
                           ("/manifest.webmanifest", manifest), ("/sw.js", service_worker), ("/icon.svg", icon_svg),
-                          ("/icon-192.png", icon), ("/icon-512.png", icon), ("/api/home", home_panel), ("/api/staff/fight", staff_fight_info)):
+                          ("/icon-192.png", icon), ("/icon-512.png", icon), ("/api/home", home_panel), ("/api/staff/fight", staff_fight_info),
+                          ("/api/staff/notes", staff_notes_list)):
         app.router.add_get(path, handler)
     for path, handler in (("/api/tasks/claim", claim_tasks), ("/api/staff/fight", staff_fight), ("/api/staff/rank", staff_rank),
-                          ("/api/staff/shop", staff_shop)):
+                          ("/api/staff/shop", staff_shop), ("/api/staff/notes", staff_notes_change)):
         app.router.add_post(path, handler)
 
 
