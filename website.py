@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "31"
+SITE_VERSION = "32"
 _THEME_BANNERS = {}
 COMMENTARY_ROLE = os.getenv("COMMENTARY_ROLE", "[COMMENTARY]").strip()    # who can open /commentary (plus Helper+)             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
@@ -4587,6 +4587,7 @@ ACCOUNT_JS = r"""
         var links = '<a href="/me"><span class="nd-t">My PFO</span><span class="nd-s">Your fights, bets, fantasy and more</span></a>'
           + '<a href="/me/cards"><span class="nd-t">My cards</span><span class="nd-s">Your collection and trades</span></a>';
         if (me.levels.staff) links += '<a href="/dashboard"><span class="nd-t">Staff dashboard</span><span class="nd-s">Helper and above</span></a>';
+        if (me.levels.commentary) links += '<a href="/commentary"><span class="nd-t">🎙️ Commentary desk</span><span class="nd-s">The card with a tale of the tape for every fight</span></a>';
         if (me.levels.senior) links += '<a href="/stats"><span class="nd-t">Site stats</span><span class="nd-s">Head Moderator+</span></a>';
         links += '<div class="nu-sep"></div><button type="button" data-out="0"><span class="nd-t">Log out</span></button><button type="button" data-out="1"><span class="nd-t">Log out everywhere</span><span class="nd-s">Every phone and computer</span></button>';
         var head = '<div class="nu-head"><b>' + P.esc(me.name) + '</b><span>' + Number(me.coins || 0).toLocaleString('en-GB') + ' coins</span></div>';
@@ -4885,7 +4886,7 @@ V2_JS = r"""
     else if (path.indexOf('/fighter/') === 0 && location.pathname !== path) label = 'Back to fighter';
     else {
       var names = { '/live': 'Live card', '/results': 'Results', '/fighters': 'Fighters', '/sportsbook': 'Sportsbook', '/fantasy': 'Fantasy',
-        '/titles': 'Titles', '/leaderboards': 'Leaderboards', '/compare': 'Head to head', '/me': 'My PFO', '/staff': 'Staff', '/dashboard': 'Staff dashboard', '/teams': 'Teams', '/social': 'Social',
+        '/titles': 'Titles', '/leaderboards': 'Leaderboards', '/compare': 'Head to head', '/me': 'My PFO', '/staff': 'Staff', '/dashboard': 'Staff dashboard', '/commentary': 'Commentary', '/teams': 'Teams', '/social': 'Social',
         '/records': 'Records', '/awards': 'Awards', '/week': 'The week', '/hall-of-fame': 'Hall of Fame', '/': 'Home' };
       label = names[path] || null;
     }
