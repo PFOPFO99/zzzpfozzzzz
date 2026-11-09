@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "32"
+SITE_VERSION = "33"
 _THEME_BANNERS = {}
 COMMENTARY_ROLE = os.getenv("COMMENTARY_ROLE", "[COMMENTARY]").strip()    # who can open /commentary (plus Helper+)             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
@@ -1996,6 +1996,77 @@ def live_side(ctx, user_id, fight, cache):
             f'<span class="lv-n"><span class="d">{name_link(ctx, user_id, name)}</span><span class="muted tab">{esc(record)}</span></span></div>')
 
 
+def live_tape(ctx, a, b, cache):
+    """A simple tale of the tape for one fight on the Live page."""
+    gid = ctx.gid
+    sa, sb = stats_for(ctx, a, cache), stats_for(ctx, b, cache)
+    na, nb = clean_name(ctx, fighter_name(ctx, a)), clean_name(ctx, fighter_name(ctx, b))
+    ranks_a = ctx.get_user_rankings(gid, a) if a else []
+    ranks_b = ctx.get_user_rankings(gid, b) if b else []
+    weight = None
+    try:
+        weight = ctx.fighter_division(gid, a, ranks_a) or ctx.fighter_division(gid, b, ranks_b)
+    except Exception:
+        pass
+
+    def rank(ranks):
+        div = [r for r in ranks if r["weight"] == weight] if weight else []
+        return ("C" if div[0]["rank"] == 0 else f"#{div[0]['rank']}") if div else "–"
+
+    def wins(s, key):
+        return (s or {}).get("wins_by", {}).get(key, 0)
+
+    def form(uid, s):
+        if not s or not s.get("fights"):
+            return '<span class="muted">Debut</span>'
+        out = ""
+        for f in s["fights"][-5:]:
+            if f["method"] == "NC":
+                r, c = "NC", "pill-nc"
+            elif f["method"] == "DRAW":
+                r, c = "D", "pill-d"
+            elif ctx.fight_is_win_for(f, uid):
+                r, c = "W", "pill-w"
+            else:
+                r, c = "L", "pill-l"
+            out += f'<span class="pill {c}">{r}</span>'
+        return f'<span class="sbform">{out}</span>'
+
+    def arch(uid):
+        try:
+            key = ctx.get_archetype(gid, uid) if "get_archetype" in ctx.g else None
+            return ctx.ARCHETYPES[key][1] if key else "–"
+        except Exception:
+            return "–"
+
+    def row(label, va, vb, better=None):
+        ca = cb = ""
+        try:
+            fa, fb = float(str(va).rstrip("%")), float(str(vb).rstrip("%"))
+            if better and fa != fb:
+                ca, cb = (" better", "") if fa > fb else ("", " better")
+        except (TypeError, ValueError):
+            pass
+        return f'<div class="lt-r"><span class="l{ca}">{va}</span><span class="c">{esc(label)}</span><span class="r{cb}">{vb}</span></div>'
+
+    def rate(s):
+        return f"{s['finish_rate']}%" if s and s.get("finish_rate") is not None else "–"
+
+    short = ctx.WEIGHTS.get(weight, "") if weight else ""
+    return ('<details class="lvtape" data-lvtape><summary>TALE OF THE TAPE</summary><div class="lt">'
+            f'<div class="lt-r lt-h"><span class="l">{esc(na.upper())}</span><span class="c"></span><span class="r">{esc(nb.upper())}</span></div>'
+            + row("RECORD", esc(ctx.stats_record(sa) if sa else "0-0-0"), esc(ctx.stats_record(sb) if sb else "0-0-0"))
+            + row(f"RANK{f' ({short})' if short else ''}", rank(ranks_a), rank(ranks_b))
+            + row("STREAK", esc((sa or {}).get("streak") or "–"), esc((sb or {}).get("streak") or "–"))
+            + row("LAST 5", form(a, sa), form(b, sb))
+            + row("KO / TKO WINS", wins(sa, "KO/TKO"), wins(sb, "KO/TKO"), True)
+            + row("SUB WINS", wins(sa, "SUB"), wins(sb, "SUB"), True)
+            + row("DECISION WINS", wins(sa, "DEC"), wins(sb, "DEC"), True)
+            + row("FINISH RATE", rate(sa), rate(sb), True)
+            + row("STYLE", esc(arch(a)), esc(arch(b)))
+            + f'<p class="lt-f"><a href="/compare?a={a}&amp;b={b}">Full head to head →</a></p></div></details>')
+
+
 def render_live(ctx):
     notice = live_notice(ctx)
 
@@ -2055,7 +2126,7 @@ def render_live(ctx):
     {live_side(ctx, a, fight, cache)}
     <div class="lv-mid">{middle}</div>
     {live_side(ctx, b, fight, cache).replace('lv-side', 'lv-side lv-right', 1)}
-  </div>"""
+  </div>{live_tape(ctx, a, b, cache) if not cancelled else ''}"""
 
     extra = (f'<div class="evchips l-up">{chip("STATUS", esc(status), "red" if status == "LIVE NOW" else "gold")}'
              f'{chip("RESULTS IN", f"{len(by_pair)}/{len(on_card)}")}'
@@ -3727,6 +3798,21 @@ img{max-width:100%}
 .small{font-size:12px}
 .ctitlebar{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;border-top:1px dashed var(--line2,#24242A);padding-top:12px}
 .clink{margin:0;font-size:13px}.clink a{color:var(--gold2,#E2C27A)}
+.lvtape{margin:-11px 12px 14px;border:1px solid var(--line,#1C1C21);border-top:0;border-radius:0 0 12px 12px;background:var(--panel,#0C0C0F);position:relative}
+.lvtape summary{cursor:pointer;list-style:none;padding:10px 14px 8px;font-size:11px;font-weight:700;letter-spacing:.14em;color:var(--gold2,#E2C27A);text-align:center}
+.lvtape summary::-webkit-details-marker{display:none}
+.lvtape summary::after{content:" ▾"}
+.lvtape[open] summary::after{content:" ▴"}
+.lvtape summary:focus-visible{outline:2px solid var(--gold2,#E2C27A);outline-offset:-2px}
+.lt{padding:0 12px 12px;display:flex;flex-direction:column}
+.lt-r{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);align-items:center;gap:8px;padding:7px 4px;border-bottom:1px solid var(--line,#1C1C21);font-size:14px;font-variant-numeric:tabular-nums}
+.lt-r .l{text-align:right;display:flex;justify-content:flex-end}.lt-r .r{text-align:left;display:flex;justify-content:flex-start}
+.lt-r .c{text-align:center;font-size:10px;letter-spacing:.12em;color:var(--dim,#868690);font-weight:700}
+.lt-r .better{color:var(--gold2,#E2C27A);font-weight:700}
+.lt-h{font:800 15px "Barlow Condensed",Impact,sans-serif;letter-spacing:.04em;border-bottom-color:var(--line2,#24242A)}
+.lt-r .sbform{margin:0}
+.lt-f{margin:10px 0 0;text-align:center;font-size:13px}.lt-f a{color:var(--gold2,#E2C27A)}
+@media (max-width:520px){.lt-r{font-size:13px;gap:4px}.lt-r .sbform .pill{min-width:16px;padding:0 2px}}
 .snotes{margin-top:22px}
 .snotes-in{border:1px solid rgba(240,122,126,.35);background:linear-gradient(180deg,rgba(240,122,126,.06),rgba(240,122,126,0) 140px);border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px}
 .snotes-h{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
@@ -5774,6 +5860,22 @@ CARDS_CSS = r"""
 }
 """
 
+LIVE_TAPE_JS = r"""
+(function () {
+  var tapes = Array.prototype.slice.call(document.querySelectorAll('[data-lvtape]'));
+  if (!tapes.length) return;
+  var key = 'pfo-live-tapes:' + location.pathname, open = [];
+  try { open = JSON.parse(sessionStorage.getItem(key) || '[]'); } catch (e) { open = []; }
+  tapes.forEach(function (t, i) {
+    if (open.indexOf(i) !== -1) t.open = true;
+    t.addEventListener('toggle', function () {
+      var now = tapes.map(function (x, j) { return x.open ? j : -1; }).filter(function (j) { return j !== -1; });
+      try { sessionStorage.setItem(key, JSON.stringify(now)); } catch (e) {}
+    });
+  });
+})();
+"""
+
 COMMENTARY_JS = r"""
 (function () {
   var card = document.querySelector('.ccard');
@@ -5829,6 +5931,7 @@ SITE_JS += ACCOUNT_JS
 SITE_JS += V2_JS
 SITE_JS += CARDS_JS
 SITE_JS += COMMENTARY_JS
+SITE_JS += LIVE_TAPE_JS
 SITE_CSS += V2_CSS
 SITE_CSS += CARDS_CSS
 
