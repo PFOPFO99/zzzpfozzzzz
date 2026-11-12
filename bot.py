@@ -4719,7 +4719,7 @@ PROFILE_DESIGNS = {
     "freedom": ((233, 200, 120), (233, 200, 120), (11, 37, 80), (8, 29, 63), (19, 10, 30), (255, 255, 255), (184, 32, 46),
                 (8, 29, 63), (255, 255, 255), (184, 32, 46), ("stars", "stripes", "fireworks", "rail"), "FREEDOM 13"),
 }
-PROFILE_W, PROFILE_H = 900, 1200
+PROFILE_W, PROFILE_H = 1400, 920
 _EMOJI_RE = re.compile("[\U00010000-\U0010FFFF☀-➿️‍⬀-⯿]")
 
 
@@ -4744,7 +4744,7 @@ def set_profile_text_only(guild_id: int, user_id: int, on: bool):
                      (guild_id, user_id, 1 if on else 0), write=True)
 
 
-def _plain(text):
+def _design_text(text):
     return re.sub(r"\s{2,}", " ", _EMOJI_RE.sub("", str(text or "")).replace("**", "").replace("*", "")).strip()
 
 
@@ -4777,7 +4777,7 @@ def profile_design_data(guild, member, tab: str):
         if key:
             data["tags"].append(ARCHETYPES[key][2])
         if cosmetics.get("nickname"):
-            data["tags"].append(f"“{_plain(cosmetics['nickname'])}”")
+            data["tags"].append(f"“{_design_text(cosmetics['nickname'])}”")
         try:
             data["booster"] = is_booster(gid, uid)
         except Exception:
@@ -4792,7 +4792,7 @@ def profile_design_data(guild, member, tab: str):
     titles += [(f"{w} Champion", False) for w in champion_of]
     if uid:
         try:
-            titles += [(_plain(belt_title(w, b)), False) for w, b in get_member_belts(gid, uid)]
+            titles += [(_design_text(belt_title(w, b)), False) for w, b in get_member_belts(gid, uid)]
         except Exception:
             pass
         try:
@@ -4816,11 +4816,11 @@ def profile_design_data(guild, member, tab: str):
                          (f"{stats['finish_rate']}%" if stats["finish_rate"] is not None else "-", "FINISHES"),
                          (str(wins_by.get(top_methods[0], 0)), label[top_methods[0]]),
                          (str(wins_by.get(top_methods[1], 0)), label[top_methods[1]])]
-        data["lines"] = [("Wins", _plain(method_short_text(wins_by))), ("Losses", _plain(method_short_text(losses_by)))]
+        data["lines"] = [("Wins", _design_text(method_short_text(wins_by))), ("Losses", _design_text(method_short_text(losses_by)))]
         try:
             like = fights_like_line(gid, member, stats, ranks)
             if like:
-                data["lines"].append(("Fights like", _plain(like).replace("Fights like ", "")))
+                data["lines"].append(("Fights like", _design_text(like).replace("Fights like ", "")))
         except Exception:
             pass
         extras = []
@@ -4842,7 +4842,7 @@ def profile_design_data(guild, member, tab: str):
             except Exception:
                 pass
             if cosmetics.get("quote"):
-                extras.append(("quote", f"“{_plain(cosmetics['quote'])}”"))
+                extras.append(("quote", f"“{_design_text(cosmetics['quote'])}”"))
         data["extras"] = extras
         last = []
         for fight in list(reversed(stats["fights"]))[:3]:
@@ -4904,7 +4904,7 @@ def profile_design_data(guild, member, tab: str):
             opp_member = guild.get_member(opp_id) if opp_id else None
             opp = name_without_record(opp_member.display_name if opp_member else (opp_name or "Unknown"))
             where = fight["event"] or (fight["fight_date"] or "")
-            history.append((res, f"vs {_plain(opp)}" + (f" · {_plain(where)}" if where else ""), _plain(fight_method_text(fight))
+            history.append((res, f"vs {_design_text(opp)}" + (f" · {_design_text(where)}" if where else ""), _design_text(fight_method_text(fight))
                             + (" · title" if fight["title_fight"] else "")))
         data["history"] = history
         info = []
@@ -4920,13 +4920,13 @@ def profile_design_data(guild, member, tab: str):
             try:
                 award_rows = awards_for_member(gid, uid)
                 if award_rows:
-                    info.append(("Awards", _plain(award_counts_text(award_rows))))
+                    info.append(("Awards", _design_text(award_counts_text(award_rows))))
             except Exception:
                 pass
             try:
                 team = team_of(gid, uid)
                 if team:
-                    info.append(("Team", _plain(team_label(team))))
+                    info.append(("Team", _design_text(team_label(team))))
             except Exception:
                 pass
         if stats["title_wins"]:
@@ -4970,16 +4970,21 @@ def _star(draw, cx, cy, r, fill):
 
 
 def draw_profile_image(data, avatar_bytes=None, logo_bytes=None, card_png=None):
-    """The designed profile, 900x1200 PNG bytes."""
+    """The designed profile as PNG bytes. Wide (about the banner's shape) so Discord
+    shows it at full width instead of shrinking it, with big text."""
     import io as _io
     import math
     from PIL import Image, ImageDraw, ImageFilter
     design = PROFILE_DESIGNS.get(data.get("theme")) or PROFILE_DESIGNS[None]
     acc, acc2, top, mid, bot_c, ring1, ring2, tile, name_col, shadow, patterns, tag = design
     W, H = PROFILE_W, PROFILE_H
+    white, soft, muted = (255, 255, 255), (226, 228, 234), (176, 180, 190)
+    win_c, loss_c, draw_c = (61, 214, 140), (240, 122, 126), (161, 161, 170)
+    tile_edge = tuple(min(255, v + 34) for v in tile)
+
+    # ---------- background ----------
     img = Image.new("RGB", (W, H), bot_c)
     d = ImageDraw.Draw(img)
-    # background gradient
     for y in range(H):
         t = y / H
         if t < 0.5:
@@ -4988,279 +4993,288 @@ def draw_profile_image(data, avatar_bytes=None, logo_bytes=None, card_png=None):
             c = tuple(int(mid[i] + (bot_c[i] - mid[i]) * ((t - 0.5) / 0.5)) for i in range(3))
         d.line([(0, y), (W, y)], fill=c)
     over = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    od = ImageDraw.Draw(over)
-    # soft glow at the top
-    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse([W * 0.1, -H * 0.25, W * 0.9, H * 0.28], fill=acc + (70,))
-    over = Image.alpha_composite(over, glow.filter(ImageFilter.GaussianBlur(90)))
+
+    def blur_blob(box, colour, radius):
+        nonlocal over
+        layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(layer).ellipse(box, fill=colour)
+        over = Image.alpha_composite(over, layer.filter(ImageFilter.GaussianBlur(radius)))
+
+    blur_blob([-W * 0.1, -H * 0.5, W * 0.55, H * 0.45], acc + (70,), 110)
+    if "glow" in patterns:
+        blur_blob([W * 0.6, H * 0.45, W * 1.15, H * 1.25], acc + (45,), 120)
+    if "boost" in patterns:
+        blur_blob([-W * 0.1, H * 0.1, W * 0.4, H * 0.8], (244, 127, 255, 55), 120)
+        blur_blob([W * 0.6, H * 0.3, W * 1.1, H * 1.1], (88, 101, 242, 60), 120)
     od = ImageDraw.Draw(over)
     if "lines" in patterns:
-        for x in range(-H, W, 34):
+        for x in range(-H, W, 40):
             od.line([(x, 0), (x + H * 0.7, H)], fill=acc + (14,), width=2)
-    if "glow" in patterns:
-        g2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        ImageDraw.Draw(g2).ellipse([W * 0.55, H * 0.6, W * 1.2, H * 1.1], fill=acc + (45,))
-        over = Image.alpha_composite(over, g2.filter(ImageFilter.GaussianBlur(110)))
-        od = ImageDraw.Draw(over)
-    if "boost" in patterns:
-        g2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(g2)
-        gd.ellipse([-W * 0.2, H * 0.02, W * 0.5, H * 0.4], fill=(244, 127, 255, 60))
-        gd.ellipse([W * 0.55, H * 0.55, W * 1.2, H * 0.95], fill=(88, 101, 242, 60))
-        over = Image.alpha_composite(over, g2.filter(ImageFilter.GaussianBlur(100)))
-        od = ImageDraw.Draw(over)
     if "stars" in patterns:
-        for yy in range(20, int(H * 0.45), 30):
-            for xx in range(15 + (15 if (yy // 30) % 2 else 0), W, 30):
-                a = int(110 * (1 - yy / (H * 0.45)))
-                od.ellipse([xx - 1.6, yy - 1.6, xx + 1.6, yy + 1.6], fill=(255, 255, 255, max(0, a)))
+        for yy in range(26, int(H * 0.55), 34):
+            for xx in range(17 + (17 if (yy // 34) % 2 else 0), W, 34):
+                a = int(110 * (1 - yy / (H * 0.55)))
+                od.ellipse([xx - 2, yy - 2, xx + 2, yy + 2], fill=(255, 255, 255, max(0, a)))
     if "stripes" in patterns:
-        band = Image.new("RGBA", (W * 2, H), (0, 0, 0, 0))
+        band = Image.new("RGBA", (W * 2, H * 2), (0, 0, 0, 0))
         bd = ImageDraw.Draw(band)
-        for i, y in enumerate(range(0, H, 34)):
-            bd.rectangle([0, y, W * 2, y + 34], fill=(184, 32, 46, 120) if i % 2 == 0 else (245, 240, 228, 26))
-        band = band.rotate(-12, resample=Image.BICUBIC).crop((W // 2, 0, W // 2 + W, H))
-        fade = Image.linear_gradient("L").resize((W, H)).point(lambda v: max(0, int((v - 120) * 2)))
+        for i, y in enumerate(range(0, H * 2, 40)):
+            bd.rectangle([0, y, W * 2, y + 40], fill=(184, 32, 46, 120) if i % 2 == 0 else (245, 240, 228, 26))
+        band = band.rotate(-10, resample=Image.BICUBIC).crop((W // 2, H // 2, W // 2 + W, H // 2 + H))
+        fade = Image.linear_gradient("L").resize((W, H)).point(lambda v: max(0, int((v - 110) * 1.6)))
         band.putalpha(Image.composite(band.getchannel("A"), Image.new("L", (W, H), 0), fade))
         over = Image.alpha_composite(over, band)
         od = ImageDraw.Draw(over)
     if "fireworks" in patterns:
-        for cx, cy, r in ((150, 150, 120), (W - 140, 210, 90)):
+        for cx, cy, r in ((W - 420, 120, 110), (W - 140, 260, 80)):
             for i in range(28):
                 ang = i * math.pi * 2 / 28
-                od.line([(cx + math.cos(ang) * r * 0.25, cy + math.sin(ang) * r * 0.25), (cx + math.cos(ang) * r, cy + math.sin(ang) * r)],
-                        fill=(233, 200, 120, 70), width=2)
-            od.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=(255, 255, 255, 160))
+                od.line([(cx + math.cos(ang) * r * 0.25, cy + math.sin(ang) * r * 0.25),
+                         (cx + math.cos(ang) * r, cy + math.sin(ang) * r)], fill=(233, 200, 120, 60), width=2)
+            od.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=(255, 255, 255, 150))
     if "rail" in patterns:
-        for i, x in enumerate(range(0, W, 40)):
-            od.rectangle([x, 0, x + 40, 9], fill=((184, 32, 46), (245, 240, 228), (18, 48, 103))[i % 3] + (255,))
+        for i, x in enumerate(range(0, W, 46)):
+            od.rectangle([x, 0, x + 46, 10], fill=((184, 32, 46), (245, 240, 228), (18, 48, 103))[i % 3] + (255,))
     img = Image.alpha_composite(img.convert("RGBA"), over)
     d = ImageDraw.Draw(img)
-    pad = 54
+    pad = 56
+    tab = data["tab"]
 
-    # top row: logo + theme tag
-    logo_r = 46
-    if logo_bytes:
+    # ---------- small pieces ----------
+    def circle_paste(raw, box_size, xy):
+        if not raw:
+            return False
         try:
-            logo = Image.open(_io.BytesIO(logo_bytes)).convert("RGBA").resize((logo_r * 2, logo_r * 2))
-            mask = Image.new("L", logo.size, 0)
-            ImageDraw.Draw(mask).ellipse([0, 0, logo.size[0], logo.size[1]], fill=255)
-            img.paste(logo, (pad, 40), mask)
+            pic = Image.open(_io.BytesIO(raw)).convert("RGBA").resize((box_size, box_size), Image.LANCZOS)
+            mask = Image.new("L", (box_size, box_size), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, box_size, box_size], fill=255)
+            img.paste(pic, xy, mask)
+            return True
         except Exception:
-            logo_bytes = None
-    if not logo_bytes:
-        d.ellipse([pad, 40, pad + logo_r * 2, 40 + logo_r * 2], fill=(8, 8, 10), outline=(201, 162, 74), width=4)
-        d.text((pad + logo_r, 40 + logo_r), "PFO", font=rank_font("display", 34), fill=(230, 230, 234), anchor="mm")
-    d.ellipse([pad, 40, pad + logo_r * 2, 40 + logo_r * 2], outline=(201, 162, 74), width=3)
-    tag_font = rank_font("bold", 20)
-    tag_text = "  ".join(tag) if False else tag
-    tw = d.textlength(tag_text, font=tag_font)
-    tx = W - pad - tw
-    d.text((tx, 86), tag_text, font=tag_font, fill=acc2, anchor="lm")
-    _star(d, tx - 20, 86, 9, acc2)
-    _star(d, W - pad + 14, 86, 9, acc2)
+            return False
 
-    # header: avatar, name, record, tags
-    small = data["tab"] != "overview"
-    av = 190 if not small else 150
-    ax, ay = pad + 6, 170
-    ring = [(ring2, 14), (ring1, 7)]
-    for colour, grow in ring:
-        d.ellipse([ax - grow, ay - grow, ax + av + grow, ay + av + grow], fill=colour)
-    if avatar_bytes:
-        try:
-            face = Image.open(_io.BytesIO(avatar_bytes)).convert("RGBA").resize((av, av))
-            mask = Image.new("L", (av, av), 0)
-            ImageDraw.Draw(mask).ellipse([0, 0, av, av], fill=255)
-            img.paste(face, (ax, ay), mask)
-        except Exception:
-            avatar_bytes = None
-    if not avatar_bytes:
-        d.ellipse([ax, ay, ax + av, ay + av], fill=(40, 40, 46))
-        d.text((ax + av / 2, ay + av / 2), (data["name"][:2] or "?").upper(), font=rank_font("display", 70), fill=(220, 220, 225), anchor="mm")
-    nx = ax + av + 44
-    nmax = W - pad - nx
-    name = data["name"].upper()
-    # Name in big italic letters (sheared), with a coloured drop line
-    nfont = _fit(d, name, "display", 96 if not small else 76, nmax - 20, 40)
-    box = d.textbbox((0, 0), name, font=nfont)
-    nw, nh = box[2] - box[0] + 40, box[3] - box[1] + 30
-    layer = Image.new("RGBA", (nw, nh), (0, 0, 0, 0))
-    ld = ImageDraw.Draw(layer)
-    ld.text((10 - box[0], 6 - box[1] + 5), name, font=nfont, fill=shadow + (255,))
-    ld.text((10 - box[0], 6 - box[1]), name, font=nfont, fill=name_col + (255,))
-    layer = layer.transform(layer.size, Image.AFFINE, (1, 0.18, -0.18 * nh / 2, 0, 1, 0), resample=Image.BICUBIC)
-    ny = ay + (8 if not small else 2)
-    img.alpha_composite(layer, (int(nx - 10), int(ny)))
-    d = ImageDraw.Draw(img)
-    ry = ny + nh + 6
-    rec = f"{data['record']}  ·  {data['ranks']}"
-    d.text((nx, ry), rec, font=_fit(d, rec, "display", 40, nmax, 22), fill=acc2)
-    ry += 54
-    if not small:
-        x = nx
-        pills = list(data["tags"]) + (["BOOSTER"] if data.get("booster") else [])
-        pfont = rank_font("bold", 17)
-        for pill in pills[:3]:
-            text = _plain(pill).upper()
-            w = d.textlength(text, font=pfont) + 28
-            if x + w > W - pad:
+    def italic_name(text, x, y, size, max_w):
+        font = _fit(d, text, "display", size, max_w - 30, 40)
+        box = d.textbbox((0, 0), text, font=font)
+        w, h = box[2] - box[0] + 60, box[3] - box[1] + 30
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        ld.text((14 - box[0], 8 - box[1] + 6), text, font=font, fill=shadow + (255,))
+        ld.text((14 - box[0], 8 - box[1]), text, font=font, fill=name_col + (255,))
+        layer = layer.transform(layer.size, Image.AFFINE, (1, 0.18, -0.18 * h / 2, 0, 1, 0), resample=Image.BICUBIC)
+        img.alpha_composite(layer, (int(x - 14), int(y)))
+        return y + h
+
+    def pills(x, y, items, size=28, max_x=None):
+        font = rank_font("bold", size)
+        h = size + 22
+        for text, boost in items:
+            text = _design_text(text).upper()
+            w = d.textlength(text, font=font) + 36
+            if x + w > (max_x or W - pad):
                 break
-            boost = pill == "BOOSTER"
-            d.rounded_rectangle([x, ry, x + w, ry + 34], radius=17, fill=tile + (210,) if len(tile) == 3 else tile,
-                                outline=(244, 127, 255) if boost else acc, width=2)
-            d.text((x + w / 2, ry + 17), text, font=pfont, fill=(255, 194, 255) if boost else (240, 240, 244), anchor="mm")
-            x += w + 10
+            d.rounded_rectangle([x, y, x + w, y + h], radius=h // 2, fill=tile,
+                                outline=(244, 127, 255) if boost else acc, width=3)
+            d.text((x + w / 2, y + h / 2), text, font=font, fill=(255, 194, 255) if boost else white, anchor="mm")
+            x += w + 12
+        return y + h
 
-    y = max(ay + av + 44, ry + 50)
+    def heading(x, y, text):
+        d.text((x, y), text, font=rank_font("bold", 26), fill=acc2)
+        return y + 42
 
-    def section(label, yy):
-        d.text((pad, yy), label, font=rank_font("bold", 18), fill=acc2)
-        return yy + 34
-
-    def titles(yy, rows):
+    def title_rows(x, y, rows, width, height=64):
         for text, special in rows:
-            text = _plain(text).upper()
-            band = Image.new("RGBA", (W - 2 * pad, 50), (0, 0, 0, 0))
+            text = _design_text(text).upper()
+            band = Image.new("RGBA", (width, height), (0, 0, 0, 0))
             bd = ImageDraw.Draw(band)
             start = (184, 32, 46) if special else acc
-            for x in range(band.width):
-                a = int(130 * (1 - x / band.width))
-                bd.line([(x, 0), (x, 50)], fill=start + (a,))
-            img.alpha_composite(band, (pad, yy))
-            d.rectangle([pad, yy, pad + 5, yy + 50], fill=(255, 255, 255) if special else acc)
-            _star(d, pad + 30, yy + 25, 11, (255, 255, 255) if special else acc2)
-            d.text((pad + 52, yy + 25), text, font=_fit(d, text, "display", 34, W - 2 * pad - 70, 18), fill=(255, 255, 255), anchor="lm")
-            yy += 58
-        return yy
+            for bx in range(width):
+                bd.line([(bx, 0), (bx, height)], fill=start + (int(150 * (1 - bx / width)),))
+            img.alpha_composite(band, (x, y))
+            d.rectangle([x, y, x + 7, y + height], fill=white if special else acc)
+            _star(d, x + 38, y + height / 2, 14, white if special else acc2)
+            d.text((x + 66, y + height / 2), text, font=_fit(d, text, "display", 46, width - 80, 22), fill=white, anchor="lm")
+            y += height + 10
+        return y
 
-    def tiles(yy, items, cols):
-        gap = 12
-        tw = (W - 2 * pad - gap * (cols - 1)) / cols
-        th = 112
+    def tiles(x, y, items, cols, width, th=150, value_size=84, label_size=26):
+        gap = 14
+        tw = (width - gap * (cols - 1)) / cols
         for i, (value, label) in enumerate(items):
             r, c = divmod(i, cols)
-            x0, y0 = pad + c * (tw + gap), yy + r * (th + gap)
-            d.rounded_rectangle([x0, y0, x0 + tw, y0 + th], radius=14, fill=tile, outline=(255, 255, 255, 40) if False else tuple(min(255, v + 30) for v in tile), width=1)
-            d.rectangle([x0 + 14, y0, x0 + tw - 14, y0 + 4], fill=acc)
-            d.text((x0 + tw / 2, y0 + 48), str(value), font=_fit(d, str(value), "display", 52, tw - 20, 22), fill=(255, 255, 255), anchor="mm")
-            d.text((x0 + tw / 2, y0 + 88), label, font=_fit(d, label, "bold", 15, tw - 16, 10), fill=(197, 200, 208), anchor="mm")
-        rows = (len(items) + cols - 1) // cols
-        return yy + rows * (th + gap)
+            x0, y0 = x + c * (tw + gap), y + r * (th + gap)
+            d.rounded_rectangle([x0, y0, x0 + tw, y0 + th], radius=16, fill=tile, outline=tile_edge, width=2)
+            d.rectangle([x0 + 18, y0, x0 + tw - 18, y0 + 6], fill=acc)
+            value = str(value)
+            d.text((x0 + tw / 2, y0 + th * 0.44), value, font=_fit(d, value, "display", value_size, tw - 24, 24), fill=white, anchor="mm")
+            d.text((x0 + tw / 2, y0 + th * 0.82), label, font=_fit(d, label, "bold", label_size, tw - 20, 14), fill=muted, anchor="mm")
+        return y + ((len(items) + cols - 1) // cols) * (th + gap) - gap
 
-    def line_pair(yy, label, value):
-        f1, f2 = rank_font("semibold", 26), rank_font("bold", 26)
-        d.text((pad, yy), label, font=f1, fill=(205, 208, 216))
+    def label_value(x, y, label, value, width, size=40):
+        f1 = rank_font("semibold", size)
+        d.text((x, y), label, font=f1, fill=soft)
         lw = d.textlength(label + "  ", font=f1)
-        d.text((pad + lw, yy), value, font=_fit(d, value, "bold", 26, W - 2 * pad - lw, 14), fill=acc2)
-        return yy + 40
+        d.text((x + lw, y), value, font=_fit(d, value, "bold", size, width - lw, 20), fill=acc2)
+        return y + size + 18
 
-    def bars(yy, rows):
+    def chips(x, y, items, size=34, max_x=None):
+        font = rank_font("bold", size)
+        h = size + 26
+        for kind, text in items:
+            w = d.textlength(text, font=font) + 40
+            if x + w > (max_x or W - pad):
+                break
+            col = {"W": win_c, "L": loss_c}.get(kind, draw_c)
+            d.rounded_rectangle([x, y, x + w, y + h], radius=12, fill=tuple(int(v * 0.25) for v in col), outline=col, width=3)
+            d.text((x + w / 2, y + h / 2), text, font=font, fill=white, anchor="mm")
+            x += w + 14
+        return y + h
+
+    def bars(x, y, rows, width):
         total = max(1, sum(v for _, v in rows))
         for label, value in rows:
-            d.text((pad, yy + 11), label, font=rank_font("bold", 18), fill=(230, 230, 236), anchor="lm")
-            bx0, bx1 = pad + 190, W - pad - 60
-            d.rounded_rectangle([bx0, yy + 2, bx1, yy + 20], radius=9, fill=(255, 255, 255, 30) if False else tuple(min(255, v + 25) for v in tile))
+            d.text((x, y + 20), label, font=rank_font("bold", 28), fill=soft, anchor="lm")
+            bx0, bx1 = x + 230, x + width - 70
+            d.rounded_rectangle([bx0, y + 8, bx1, y + 32], radius=12, fill=tile_edge)
             if value:
-                d.rounded_rectangle([bx0, yy + 2, bx0 + (bx1 - bx0) * value / total, yy + 20], radius=9, fill=acc)
-            d.text((W - pad, yy + 11), str(value), font=rank_font("display", 30), fill=acc2, anchor="rm")
-            yy += 36
-        return yy
+                d.rounded_rectangle([bx0, y + 8, max(bx0 + 24, bx0 + (bx1 - bx0) * value / total), y + 32], radius=12, fill=acc)
+            d.text((x + width, y + 20), str(value), font=rank_font("display", 48), fill=acc2, anchor="rm")
+            y += 54
+        return y
 
-    tab = data["tab"]
-    if tab == "overview":
-        if data["titles"]:
-            y = titles(y, data["titles"][:4]) + 10
-        y = tiles(y, data["tiles"], 4) + 14
-        for label, value in data["lines"]:
-            y = line_pair(y, label, value)
-        if data.get("last"):
-            y += 8
-            x = pad
-            cf = rank_font("bold", 22)
-            for kind, text in data["last"]:
-                w = d.textlength(text, font=cf) + 30
-                col = {"W": (61, 214, 140), "L": (240, 122, 126)}.get(kind, (161, 161, 170))
-                d.rounded_rectangle([x, y, x + w, y + 42], radius=10, fill=tuple(int(v * 0.25) for v in col), outline=col, width=2)
-                d.text((x + w / 2, y + 21), text, font=cf, fill=(255, 255, 255), anchor="mm")
-                x += w + 10
-            y += 58
-        for kind, text in data.get("extras", [])[:3]:
-            col = {"bad": (240, 122, 126), "warn": (245, 180, 85), "gold": acc2, "quote": (210, 212, 220)}[kind]
-            font = rank_font("medium" if kind == "quote" else "bold", 22)
-            d.text((pad, y), text, font=_fit(d, text, "medium" if kind == "quote" else "bold", 22, W - 2 * pad, 12), fill=col)
-            y += 34
-    elif tab == "stats":
-        y = section("STRIKING & GRAPPLING", y)
-        if data["tiles"]:
-            y = tiles(y, data["tiles"], 3) + 4
-        d.text((pad, y), data["stat_note"], font=rank_font("medium", 18), fill=(170, 174, 184))
-        y += 44
-        y = section("HOW THEY WIN", y)
-        y = bars(y, data["win_bars"]) + 10
-        y = section("HOW THEY LOSE", y)
-        y = bars(y, data["loss_bars"]) + 10
-        for text in data.get("stat_lines", []):
-            d.text((pad, y), text, font=_fit(d, text, "bold", 24, W - 2 * pad, 12), fill=acc2)
-            y += 38
-    elif tab == "career":
-        y = section("FIGHT HISTORY · NEWEST FIRST", y)
-        if not data["history"]:
-            d.text((pad, y), "No PFO fights logged yet.", font=rank_font("medium", 24), fill=(190, 190, 200))
-            y += 44
-        for res, who, how in data["history"]:
-            d.rounded_rectangle([pad, y, W - pad, y + 52], radius=10, fill=tile)
-            col = {"W": (61, 214, 140), "L": (240, 122, 126)}.get(res, (161, 161, 170))
-            d.rounded_rectangle([pad + 10, y + 9, pad + 52, y + 43], radius=7, fill=tuple(int(v * 0.3) for v in col))
-            d.text((pad + 31, y + 26), res, font=rank_font("display", 28), fill=col, anchor="mm")
-            hw = d.textlength(how, font=rank_font("semibold", 20))
-            d.text((pad + 66, y + 26), who, font=_fit(d, who, "semibold", 22, W - 2 * pad - 100 - hw, 12), fill=(240, 240, 244), anchor="lm")
-            d.text((W - pad - 14, y + 26), how, font=rank_font("semibold", 20), fill=(197, 200, 208), anchor="rm")
-            y += 60
-        if data["titles"]:
-            y = section("BELTS & TITLES", y + 8)
-            y = titles(y, data["titles"][:3])
-        for label, value in data.get("info", []):
-            if y > H - 70:
-                break
-            y = line_pair(y, label, value)
-    elif tab == "card":
+    # ---------- top-right: theme tag + logo ----------
+    tag_font = rank_font("bold", 26)
+    logo_size = 64
+    tag_w = d.textlength(tag, font=tag_font)
+    if not circle_paste(logo_bytes, logo_size, (W - pad - logo_size, 30)):
+        d.ellipse([W - pad - logo_size, 30, W - pad, 30 + logo_size], fill=(8, 8, 10))
+        d.text((W - pad - logo_size / 2, 30 + logo_size / 2), "PFO", font=rank_font("display", 26), fill=soft, anchor="mm")
+    d.ellipse([W - pad - logo_size, 30, W - pad, 30 + logo_size], outline=(201, 162, 74), width=3)
+    tag_right = W - pad - logo_size - 22
+    d.text((tag_right, 30 + logo_size / 2), tag, font=tag_font, fill=acc2, anchor="rm")
+    _star(d, tag_right - tag_w - 22, 30 + logo_size / 2, 11, acc2)
+
+    left_x, left_w = pad, 640
+    right_x = pad + left_w + 48
+    right_w = W - pad - right_x
+    body_bottom = H - 96
+    pill_items = [(t, False) for t in data["tags"]] + ([("BOOSTER", True)] if data.get("booster") else [])
+
+    if tab == "card":
+        # card on the left, name and numbers on the right
+        cx = pad
+        card_h = body_bottom - 40
+        drew_card = False
         if card_png:
             try:
                 card = Image.open(_io.BytesIO(card_png)).convert("RGBA")
-                cw = int(W * 0.52)
-                card = card.resize((cw, int(card.height * cw / card.width)))
-                halo = Image.new("RGBA", (card.width + 80, card.height + 80), (0, 0, 0, 0))
-                ImageDraw.Draw(halo).rounded_rectangle([30, 30, halo.width - 30, halo.height - 30], radius=30, fill=acc + (110,))
-                halo = halo.filter(ImageFilter.GaussianBlur(26))
-                cy = max(y - 40, 300)
-                img.alpha_composite(halo, (pad - 40, cy - 40))
-                img.alpha_composite(card, (pad, cy))
+                cw = int(card.width * card_h / card.height)
+                card = card.resize((cw, card_h), Image.LANCZOS)
+                halo = Image.new("RGBA", (cw + 100, card_h + 100), (0, 0, 0, 0))
+                ImageDraw.Draw(halo).rounded_rectangle([40, 40, cw + 60, card_h + 60], radius=34, fill=acc + (120,))
+                img.alpha_composite(halo.filter(ImageFilter.GaussianBlur(28)), (cx - 50, 40 - 50))
+                img.alpha_composite(card, (cx, 40))
                 d = ImageDraw.Draw(img)
-                y = max(cy + card.height + 20, cy + 3 * 134)
-                x0 = pad + cw + 34
-                ty = cy + 10
-                for value, label in data.get("card_tiles", []):
-                    d.rounded_rectangle([x0, ty, W - pad, ty + 120], radius=14, fill=tile)
-                    d.rectangle([x0 + 14, ty, W - pad - 14, ty + 4], fill=acc)
-                    d.text(((x0 + W - pad) / 2, ty + 52), value, font=_fit(d, value, "display", 50, W - pad - x0 - 20, 20), fill=(255, 255, 255), anchor="mm")
-                    d.text(((x0 + W - pad) / 2, ty + 95), label, font=rank_font("bold", 15), fill=(197, 200, 208), anchor="mm")
-                    ty += 134
+                cx += cw + 56
+                drew_card = True
             except Exception as error:
                 print(f"Profile card draw failed: {error}")
+        y = italic_name(data["name"].upper(), cx, 120, 120, W - pad - cx)
+        rec = f"{data['record']}  ·  {data['ranks']}"
+        d.text((cx, y + 4), rec, font=_fit(d, rec, "display", 56, W - pad - cx, 28), fill=acc2)
+        y += 84
+        y = pills(cx, y, pill_items, max_x=W - pad) + 36
+        if drew_card:
+            tiles(cx, y, data.get("card_tiles", []), 3, W - pad - cx, th=170, value_size=80)
         else:
-            d.text((pad, y), "No card: cards are for fighters with a weight class role or a UFC fighter name.",
-                   font=_fit(d, "No card: cards are for fighters with a weight class role or a UFC fighter name.", "medium", 24, W - 2 * pad, 12), fill=(200, 200, 210))
+            text = "No card yet: cards are for fighters with a weight class role or a UFC fighter name."
+            d.text((cx, y), text, font=_fit(d, text, "medium", 34, W - pad - cx, 16), fill=soft)
+    else:
+        # ---------- header ----------
+        av = 250
+        ax, ay = pad + 14, 52
+        for colour, grow in ((ring2, 16), (ring1, 8)):
+            d.ellipse([ax - grow, ay - grow, ax + av + grow, ay + av + grow], fill=colour)
+        if not circle_paste(avatar_bytes, av, (ax, ay)):
+            d.ellipse([ax, ay, ax + av, ay + av], fill=(40, 40, 46))
+            d.text((ax + av / 2, ay + av / 2), (data["name"][:2] or "?").upper(), font=rank_font("display", 96), fill=soft, anchor="mm")
+        nx = ax + av + 56
+        y = italic_name(data["name"].upper(), nx, 96, 128, W - pad - nx)
+        rec = f"{data['record']}  ·  {data['ranks']}"
+        d.text((nx, y + 2), rec, font=_fit(d, rec, "display", 58, W - pad - nx, 28), fill=acc2)
+        y += 84
+        pill_bottom = pills(nx, y, pill_items, max_x=W - pad) if pill_items else y - 20
+        body_top = max(ay + av + 44, pill_bottom + 30)
 
-    # trim empty space at the bottom, then the footer strip
-    H = max(780, min(H, int(y) + 40 + 64))
-    img = img.crop((0, 0, W, H))
-    d = ImageDraw.Draw(img)
-    d.rectangle([0, H - 64, W, H], fill=(8, 8, 10))
-    d.rectangle([0, H - 66, W, H - 63], fill=acc)
-    d.text((pad, H - 32), {"overview": "FIGHTER PROFILE", "stats": "FIGHTER STATS", "career": "CAREER", "card": "FIGHTER CARD"}[tab],
-           font=rank_font("display", 34), fill=(255, 255, 255), anchor="lm")
-    d.text((W - pad, H - 32), _plain(data["footer"]).upper(), font=rank_font("bold", 15), fill=acc2, anchor="rm")
+        if tab == "overview":
+            y = body_top
+            if data["titles"]:
+                y = title_rows(left_x, y, data["titles"][:2], left_w) + 6
+            for label, value in data["lines"]:
+                if y + 58 > body_bottom:
+                    break
+                y = label_value(left_x, y, label, value, left_w)
+            for kind, text in data.get("extras", []):
+                if y + 50 > body_bottom:
+                    break
+                col = {"bad": loss_c, "warn": (245, 180, 85), "gold": acc2, "quote": muted}[kind]
+                kind_font = "medium" if kind == "quote" else "bold"
+                d.text((left_x, y), text, font=_fit(d, text, kind_font, 34, left_w, 16), fill=col)
+                y += 50
+            ty = tiles(right_x, body_top, data["tiles"], 2, right_w, th=142, value_size=80)
+            if data.get("last"):
+                d.text((right_x, ty + 22), "LAST FIGHTS", font=rank_font("bold", 26), fill=acc2)
+                chips(right_x, ty + 64, data["last"], max_x=W - pad)
+
+        elif tab == "stats":
+            y = heading(left_x, body_top, "STRIKING & GRAPPLING")
+            if data["tiles"]:
+                y = tiles(left_x, y, data["tiles"], 3, left_w, th=136, value_size=64, label_size=21) + 18
+            note = data["stat_note"]
+            d.text((left_x, y), note, font=_fit(d, note, "medium", 28, left_w, 14), fill=muted)
+            y += 52
+            for text in data.get("stat_lines", []):
+                if y + 46 > body_bottom:
+                    break
+                d.text((left_x, y), text, font=_fit(d, text, "bold", 34, left_w, 16), fill=acc2)
+                y += 48
+            y = heading(right_x, body_top, "HOW THEY WIN")
+            y = bars(right_x, y, data["win_bars"], right_w) + 14
+            y = heading(right_x, y, "HOW THEY LOSE")
+            bars(right_x, y, data["loss_bars"], right_w)
+
+        elif tab == "career":
+            y = heading(left_x, body_top, "FIGHT HISTORY · NEWEST FIRST")
+            if not data["history"]:
+                d.text((left_x, y), "No PFO fights logged yet.", font=rank_font("medium", 34), fill=soft)
+            for res, who, how in data["history"]:
+                if y + 80 > body_bottom:
+                    break
+                d.rounded_rectangle([left_x, y, left_x + left_w, y + 74], radius=12, fill=tile)
+                col = {"W": win_c, "L": loss_c}.get(res, draw_c)
+                d.rounded_rectangle([left_x + 12, y + 12, left_x + 62, y + 62], radius=9, fill=tuple(int(v * 0.3) for v in col))
+                d.text((left_x + 37, y + 38), res, font=rank_font("display", 40), fill=col, anchor="mm")
+                parts = who.split(" · ", 1)
+                d.text((left_x + 80, y + 8), parts[0], font=_fit(d, parts[0], "bold", 32, left_w - 100, 16), fill=white)
+                sub = how + (f" · {parts[1]}" if len(parts) > 1 else "")
+                d.text((left_x + 80, y + 46), sub, font=_fit(d, sub, "semibold", 22, left_w - 100, 12), fill=muted)
+                y += 84
+            y = body_top
+            if data["titles"]:
+                y = heading(right_x, y, "BELTS & TITLES")
+                y = title_rows(right_x, y, data["titles"][:3], right_w, height=58) + 8
+            for label, value in data.get("info", []):
+                if y + 54 > body_bottom:
+                    break
+                y = label_value(right_x, y, label, value, right_w, size=34)
+
+    # ---------- footer ----------
+    d.rectangle([0, H - 80, W, H], fill=(8, 8, 10))
+    d.rectangle([0, H - 83, W, H - 79], fill=acc)
+    d.text((pad, H - 40), {"overview": "FIGHTER PROFILE", "stats": "FIGHTER STATS", "career": "CAREER", "card": "FIGHTER CARD"}[tab],
+           font=rank_font("display", 46), fill=white, anchor="lm")
+    d.text((W - pad, H - 40), _design_text(data["footer"]).upper(), font=rank_font("bold", 24), fill=acc2, anchor="rm")
     out = img.convert("RGB")
     if data.get("theme") == "blackout":
         out = out.convert("L").convert("RGB")
