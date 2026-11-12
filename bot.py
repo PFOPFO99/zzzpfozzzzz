@@ -439,6 +439,9 @@ def setup_database():
     setup_card_edit_table()
     setup_archetype_table()
     setup_booster_table()
+    setup_owned_theme_table()
+    setup_profile_pref_table()
+    setup_profile_title_table()
     setup_ask_table()
     setup_away_table()
     setup_name_start_table()
@@ -718,6 +721,9 @@ def setup_signup_time_columns():
     if "starts_at" not in columns:
         cursor.execute("ALTER TABLE signup_sessions ADD COLUMN starts_at TEXT")
 
+    if "venue" not in columns:
+        cursor.execute("ALTER TABLE signup_sessions ADD COLUMN venue TEXT")
+
     db.commit()
     db.close()
 
@@ -772,6 +778,55 @@ def set_signup_event(session_id: int, event=None, starts=None, change_event=True
     db.close()
 
 
+# ------------------------------------------------------------
+# Venues: optional "where it's held" on sign-ups. The card DMs, card
+# post, check-in board and website use the venue of the latest sign-up
+# of the same kind. /signuptimes venue:... changes it (and the open card).
+# ------------------------------------------------------------
+
+def set_signup_venue(session_id: int, venue):
+    discipline_query("UPDATE signup_sessions SET venue = ? WHERE id = ?", (venue, session_id), write=True)
+
+
+def latest_venue(guild_id: int, kind: str):
+    """Venue of the newest sign-up of this kind that has one (or None)."""
+    try:
+        rows = discipline_query("SELECT venue FROM signup_sessions WHERE guild_id = ? AND signup_type = ? "
+                                "ORDER BY id DESC LIMIT 1", (guild_id, kind))
+    except sqlite3.OperationalError:
+        return None
+    return rows[0]["venue"] if rows and rows[0]["venue"] else None
+
+
+def notice_venue(notice):
+    try:
+        return notice["venue"]
+    except (IndexError, KeyError):
+        return None
+
+
+def known_venues(guild_id: int):
+    try:
+        rows = discipline_query("SELECT venue, MAX(id) AS last FROM signup_sessions WHERE guild_id = ? AND venue IS NOT NULL "
+                                "AND venue != '' GROUP BY venue ORDER BY last DESC LIMIT 25", (guild_id,))
+    except sqlite3.OperationalError:
+        return []
+    return [r["venue"] for r in rows]
+
+
+async def venue_autocomplete(interaction: discord.Interaction, current: str):
+    current = (current or "").lower()
+    return [app_commands.Choice(name=v[:100], value=v[:100]) for v in known_venues(interaction.guild.id) if current in v.lower()][:25]
+
+
+def read_venue(venue):
+    """Cleaned venue text, or None to clear."""
+    if venue is None:
+        return None
+    venue = venue.strip()
+    return None if not venue or venue.lower() in ("none", "clear", "-") else venue[:100]
+
+
 def signup_time_lines(
     session_id: int,
     closed: bool = False
@@ -788,6 +843,10 @@ def signup_time_lines(
     lines = []
     closes_at = session_value(session, "closes_at")
     card_out = session_value(session, "card_out")
+
+    venue = session_value(session, "venue")
+    if venue:
+        lines.append(f"📍 **Venue:** {venue}")
 
     start_line = signup_start_line(session_value(session, "starts_at"))
     if start_line:
@@ -916,7 +975,8 @@ async def start_signup(
     closes: str = None,
     card_out: str = None,
     event: str = None,
-    starts: str = None
+    starts: str = None,
+    venue: str = None
 ):
 
     if not is_admin(interaction):
@@ -963,6 +1023,9 @@ async def start_signup(
 
     if (event and event.strip()) or starts:
         set_signup_event(session_id, (event or "").strip()[:80] or None, read_signup_start(starts))
+
+    if read_venue(venue):
+        set_signup_venue(session_id, read_venue(venue))
 
     await message.edit(
         content=None,
@@ -1648,15 +1711,18 @@ def is_admin(
 )
 @app_commands.describe(
     closes="Optional: when sign-ups close by themselves, UK time, e.g. 24/10/2026 18:00",
-    card_out="Optional: when the card will be out, e.g. 25/10/2026 12:00 (or any text)"
+    card_out="Optional: when the card will be out, e.g. 25/10/2026 12:00 (or any text)",
+    venue="Optional: where it's held, e.g. The South Lawn, Washington D.C."
 )
+@app_commands.autocomplete(venue=venue_autocomplete)
 async def fnsignup(
     interaction: discord.Interaction,
     closes: str = None,
-    card_out: str = None
+    card_out: str = None,
+    venue: str = None
 ):
 
-    await start_signup(interaction, "fight_night", closes, card_out)
+    await start_signup(interaction, "fight_night", closes, card_out, venue=venue)
 
 
 # ============================================================
@@ -1671,17 +1737,20 @@ async def fnsignup(
     event="Optional: event name for the title, e.g. PFO Live Card 7",
     starts="Optional: when the card starts, UK time, e.g. 07/11/2026 20:00 (or any text)",
     closes="Optional: when sign-ups close by themselves, UK time, e.g. 24/10/2026 18:00",
-    card_out="Optional: when the card will be out, e.g. 25/10/2026 12:00 (or any text)"
+    card_out="Optional: when the card will be out, e.g. 25/10/2026 12:00 (or any text)",
+    venue="Optional: where it's held, e.g. The South Lawn, Washington D.C."
 )
+@app_commands.autocomplete(venue=venue_autocomplete)
 async def livesignup(
     interaction: discord.Interaction,
     event: str = None,
     starts: str = None,
     closes: str = None,
-    card_out: str = None
+    card_out: str = None,
+    venue: str = None
 ):
 
-    await start_signup(interaction, "live_card", closes, card_out, event, starts)
+    await start_signup(interaction, "live_card", closes, card_out, event, starts, venue)
 
 
 # ============================================================
@@ -1762,7 +1831,8 @@ async def signupclose(
     closes="When sign-ups close, UK time, e.g. 24/10/2026 18:00 ('none' to remove)",
     card_out="When the card will be out, e.g. 25/10/2026 12:00 or any text ('none' to remove)",
     event="Event name for the title, e.g. PFO Live Card 7 ('none' to remove)",
-    starts="When the card starts, UK time, e.g. 07/11/2026 20:00 ('none' to remove)"
+    starts="When the card starts, UK time, e.g. 07/11/2026 20:00 ('none' to remove)",
+    venue="Where it's held ('none' to remove). Also works after sign-ups close, for the card."
 )
 @app_commands.choices(
     signup_type=[
@@ -1770,13 +1840,15 @@ async def signupclose(
         app_commands.Choice(name="Live Card", value="live_card"),
     ]
 )
+@app_commands.autocomplete(venue=venue_autocomplete)
 async def signuptimes(
     interaction: discord.Interaction,
     signup_type: app_commands.Choice[str],
     closes: str = None,
     card_out: str = None,
     event: str = None,
-    starts: str = None
+    starts: str = None,
+    venue: str = None
 ):
 
     if not is_admin(interaction):
@@ -1788,6 +1860,19 @@ async def signuptimes(
 
     session = get_active_session(interaction.guild.id, signup_type.value)
 
+    # Venue only, after sign-ups have closed: change it on the latest sign-up and the open card.
+    if not session and venue is not None and closes is None and card_out is None and event is None and starts is None:
+        rows = discipline_query("SELECT id FROM signup_sessions WHERE guild_id = ? AND signup_type = ? ORDER BY id DESC LIMIT 1",
+                                (interaction.guild.id, signup_type.value))
+        if rows:
+            set_signup_venue(rows[0]["id"], read_venue(venue))
+        discipline_query("UPDATE card_notices SET venue = ? WHERE guild_id = ? AND kind = ? AND active = 1",
+                         (read_venue(venue), interaction.guild.id, signup_type.value), write=True)
+        await interaction.response.send_message(
+            f"✅ Venue {'set to **' + read_venue(venue) + '**' if read_venue(venue) else 'removed'} for the latest "
+            f"{SIGNUP_LABELS[signup_type.value]} and its card.", ephemeral=True)
+        return
+
     if not session:
         await interaction.response.send_message(
             f"❌ There is no open {SIGNUP_INFO[signup_type.value]['title']}.",
@@ -1795,12 +1880,15 @@ async def signuptimes(
         )
         return
 
-    if closes is None and card_out is None and event is None and starts is None:
+    if closes is None and card_out is None and event is None and starts is None and venue is None:
         await interaction.response.send_message(
-            "❌ Fill in at least one of **closes**, **card_out**, **event** or **starts**.",
+            "❌ Fill in at least one of **closes**, **card_out**, **event**, **starts** or **venue**.",
             ephemeral=True
         )
         return
+
+    if venue is not None:
+        set_signup_venue(session["id"], read_venue(venue))
 
     closes_at, card_value, error = read_signup_times(closes, card_out)
 
@@ -4388,6 +4476,8 @@ async def create_profile_embed(
             try:
                 if is_booster(guild.id, member.id):
                     top.append("💎 **Server Booster**")
+                for title_name, title_emoji in get_profile_titles(guild.id, member.id):
+                    top.append(f"{title_emoji} **{title_name}**")
             except Exception as error:
                 print(f"Profile booster badge failed: {error}")
 
@@ -4598,14 +4688,643 @@ async def create_profile_embed(
     return embed
 
 
+# ============================================================
+# DESIGNED PROFILES
+#
+# /profile is drawn as one designed image per tab (Overview, Stats,
+# Career, Card) in the person's Profile Theme (or PFO black and gold),
+# with the animated banner under it as a second strip (not on Card).
+# Anyone can switch to the plain text version with the 📝 button under
+# a profile; that choice is remembered for them.
+# ============================================================
+
+# theme: (accent, accent 2, top, middle, bottom, ring 1, ring 2, tile, name colour, name shadow, patterns, tag)
+PROFILE_DESIGNS = {
+    None: ((201, 162, 74), (233, 200, 120), (22, 18, 10), (12, 10, 7), (5, 5, 5), (201, 162, 74), (58, 44, 15),
+           (22, 18, 10), (255, 255, 255), (122, 90, 18), ("lines", "glow"), "PFO"),
+    "crimson": ((229, 83, 75), (255, 154, 146), (42, 11, 13), (22, 6, 7), (7, 3, 3), (229, 83, 75), (74, 16, 20),
+                (40, 10, 12), (255, 228, 229), (122, 26, 32), ("lines", "glow"), "CRIMSON"),
+    "ice": ((108, 198, 234), (184, 230, 248), (10, 31, 44), (6, 18, 26), (3, 7, 10), (184, 230, 248), (22, 70, 92),
+            (8, 28, 40), (230, 246, 255), (22, 70, 92), ("lines", "glow"), "ICE"),
+    "emerald": ((63, 191, 127), (142, 230, 184), (8, 36, 26), (5, 20, 14), (3, 8, 6), (63, 191, 127), (15, 74, 46),
+                (8, 34, 24), (227, 255, 240), (15, 74, 46), ("lines", "glow"), "EMERALD"),
+    "neon": ((224, 79, 216), (247, 163, 242), (37, 10, 46), (19, 6, 26), (7, 3, 10), (247, 163, 242), (58, 15, 99),
+             (36, 10, 44), (255, 230, 253), (122, 29, 116), ("lines", "glow"), "NEON"),
+    "royal": ((139, 124, 240), (226, 194, 122), (21, 16, 58), (11, 8, 32), (5, 4, 13), (226, 194, 122), (42, 31, 107),
+              (22, 16, 56), (238, 234, 255), (42, 31, 107), ("lines", "glow"), "ROYAL"),
+    "blackout": ((212, 212, 212), (255, 255, 255), (22, 22, 22), (10, 10, 10), (0, 0, 0), (255, 255, 255), (43, 43, 43),
+                 (22, 22, 22), (255, 255, 255), (58, 58, 58), ("lines",), "BLACKOUT"),
+    "booster": ((244, 127, 255), (255, 194, 255), (29, 15, 51), (16, 8, 32), (6, 4, 13), (244, 127, 255), (59, 42, 138),
+                (30, 16, 52), (255, 233, 255), (91, 42, 138), ("boost", "lines"), "BOOSTER"),
+    "freedom": ((233, 200, 120), (233, 200, 120), (11, 37, 80), (8, 29, 63), (19, 10, 30), (255, 255, 255), (184, 32, 46),
+                (8, 29, 63), (255, 255, 255), (184, 32, 46), ("stars", "stripes", "fireworks", "rail"), "FREEDOM 13"),
+}
+PROFILE_W, PROFILE_H = 900, 1200
+_EMOJI_RE = re.compile("[\U00010000-\U0010FFFF☀-➿️‍⬀-⯿]")
+
+
+def setup_profile_pref_table():
+    db = get_db()
+    db.execute("CREATE TABLE IF NOT EXISTS profile_prefs (guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, "
+               "text_only INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id, user_id))")
+    db.commit()
+    db.close()
+
+
+def profile_text_only(guild_id: int, user_id: int):
+    try:
+        rows = discipline_query("SELECT text_only FROM profile_prefs WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    except sqlite3.OperationalError:
+        return False
+    return bool(rows and rows[0]["text_only"])
+
+
+def set_profile_text_only(guild_id: int, user_id: int, on: bool):
+    discipline_query("INSERT OR REPLACE INTO profile_prefs (guild_id, user_id, text_only) VALUES (?, ?, ?)",
+                     (guild_id, user_id, 1 if on else 0), write=True)
+
+
+def _plain(text):
+    return re.sub(r"\s{2,}", " ", _EMOJI_RE.sub("", str(text or "")).replace("**", "").replace("*", "")).strip()
+
+
+def profile_design_data(guild, member, tab: str):
+    """Everything the designed image shows, as plain text."""
+    gid = guild.id
+    uid = getattr(member, "id", None)
+    stats = get_fighter_stats(gid, uid, member.display_name)
+    ranks = get_user_rankings(gid, uid) if uid else []
+    weight_order = [w for w in WEIGHTS.keys() if w != P4P_WEIGHT] + [P4P_WEIGHT]
+    rank_bits, champion_of = [], []
+    for weight in weight_order:
+        for row in ranks:
+            if row["weight"] == weight:
+                if row["rank"] == 0:
+                    rank_bits.append(f"C {short_weight(weight)}")
+                    if weight != P4P_WEIGHT:
+                        champion_of.append(weight)
+                else:
+                    rank_bits.append(f"#{row['rank']} {short_weight(weight)}")
+    cosmetics = get_cosmetics(gid, uid) if uid else {}
+    theme = cosmetics.get("style")
+    data = {
+        "tab": tab, "theme": theme, "name": name_without_record(member.display_name),
+        "record": stats_record(stats), "ranks": " · ".join(rank_bits) if rank_bits else "Unranked",
+        "tags": [], "booster": False, "footer": f"{len(stats['fights'])} PFO fight{'s' if len(stats['fights']) != 1 else ''} logged",
+    }
+    if uid:
+        key = get_archetype(gid, uid)
+        if key:
+            data["tags"].append(ARCHETYPES[key][2])
+        if cosmetics.get("nickname"):
+            data["tags"].append(f"“{_plain(cosmetics['nickname'])}”")
+        try:
+            data["booster"] = is_booster(gid, uid)
+        except Exception:
+            pass
+
+    # Titles and belts (top of Overview and Career)
+    titles = []
+    if uid:
+        titles += [(name, True) for name, _ in get_profile_titles(gid, uid)]
+    if len(champion_of) >= 2:
+        titles.append(({2: "Double", 3: "Triple"}.get(len(champion_of), f"{len(champion_of)}x") + " Champ", False))
+    titles += [(f"{w} Champion", False) for w in champion_of]
+    if uid:
+        try:
+            titles += [(_plain(belt_title(w, b)), False) for w, b in get_member_belts(gid, uid)]
+        except Exception:
+            pass
+        try:
+            hof_number, _ = hof_entry(gid, uid, member.display_name)
+            if hof_number:
+                titles.append((f"Hall of Fame #{hof_number}", False))
+        except Exception:
+            pass
+    if is_prospect(stats) and not champion_of:
+        titles.append(("Prospect", False))
+    data["titles"] = titles[:5]
+
+    streak = stats["streak"] or "-"
+    wins_by, losses_by = stats["wins_by"], stats["losses_by"]
+    if tab == "overview":
+        top_methods = sorted((m for m in ("KO/TKO", "SUB", "DEC") if wins_by.get(m)), key=lambda m: -wins_by[m])[:2]
+        while len(top_methods) < 2:
+            top_methods.append([m for m in ("KO/TKO", "SUB", "DEC") if m not in top_methods][0])
+        label = {"KO/TKO": "KO WINS", "SUB": "SUB WINS", "DEC": "DEC WINS"}
+        data["tiles"] = [(streak, "STREAK"),
+                         (f"{stats['finish_rate']}%" if stats["finish_rate"] is not None else "-", "FINISHES"),
+                         (str(wins_by.get(top_methods[0], 0)), label[top_methods[0]]),
+                         (str(wins_by.get(top_methods[1], 0)), label[top_methods[1]])]
+        data["lines"] = [("Wins", _plain(method_short_text(wins_by))), ("Losses", _plain(method_short_text(losses_by)))]
+        try:
+            like = fights_like_line(gid, member, stats, ranks)
+            if like:
+                data["lines"].append(("Fights like", _plain(like).replace("Fights like ", "")))
+        except Exception:
+            pass
+        extras = []
+        if uid:
+            try:
+                suspension = get_active_suspension(gid, uid)
+                if suspension:
+                    extras.append(("bad", "SUSPENDED until " + datetime.fromtimestamp(suspension["ends_at"], timezone.utc).strftime("%d %b %Y")))
+                else:
+                    warns = len(active_warnings(gid, uid))
+                    if warns:
+                        extras.append(("warn", f"{warns}/{MAX_WARNINGS} warnings"))
+            except Exception:
+                pass
+            try:
+                bounty = open_bounty_total(gid, uid)
+                if bounty:
+                    extras.append(("gold", f"Bounty on their head: {coins_text(bounty)} coins"))
+            except Exception:
+                pass
+            if cosmetics.get("quote"):
+                extras.append(("quote", f"“{_plain(cosmetics['quote'])}”"))
+        data["extras"] = extras
+        last = []
+        for fight in list(reversed(stats["fights"]))[:3]:
+            if fight["method"] in ("NC", "DRAW"):
+                last.append(("D", fight["method"]))
+                continue
+            won = fight_is_win_for(fight, uid, member.display_name)
+            method = {"KO/TKO": "KO"}.get(fight["method"], fight["method"])
+            rnd = f" R{fight['round']}" if fight["round"] and fight["method"] != "DEC" else ""
+            last.append(("W" if won else "L", f"{'W' if won else 'L'} {method}{rnd}"))
+        data["last"] = last
+
+    elif tab == "stats":
+        total = fight_stat_totals(gid).get(uid) if uid else None
+        if total and total.get("fights"):
+            n = total["fights"]
+
+            def pct(a, b):
+                return f"{round(100 * a / b)}%" if b else "-"
+            ctrl = round((total.get("control") or 0) / n)
+            data["tiles"] = [(f"{total['sig_landed'] / n:.1f}", "SIG. STRIKES / FIGHT"), (pct(total["sig_landed"], total["sig_thrown"]), "STRIKE ACCURACY"),
+                             (f"{total['knockdowns'] / n:.1f}", "KNOCKDOWNS / FIGHT"), (f"{total['td_landed'] / n:.1f}", "TAKEDOWNS / FIGHT"),
+                             (pct(total["td_landed"], total["td_attempted"]), "TAKEDOWN ACCURACY"), (f"{ctrl // 60}:{ctrl % 60:02d}", "CONTROL / FIGHT")]
+            data["stat_note"] = f"From {n} fight{'s' if n != 1 else ''} logged with /addstrikes"
+        else:
+            data["tiles"] = []
+            data["stat_note"] = "No strike stats yet. Staff add them with /addstrikes."
+        data["win_bars"] = [(m, wins_by.get(k, 0)) for k, m in (("KO/TKO", "KO / TKO"), ("SUB", "SUBMISSION"), ("DEC", "DECISION"))]
+        data["loss_bars"] = [(m, losses_by.get(k, 0)) for k, m in (("KO/TKO", "KO / TKO"), ("SUB", "SUBMISSION"), ("DEC", "DECISION"))]
+        bits = []
+        try:
+            odds_record = favourite_records(gid).get(uid) if uid else None
+            if odds_record and (sum(odds_record["fav"]) or sum(odds_record["dog"])):
+                bits.append(f"Favourite {odds_record['fav'][0]}-{odds_record['fav'][1]} · Underdog {odds_record['dog'][0]}-{odds_record['dog'][1]}")
+        except Exception:
+            pass
+        try:
+            places = leaderboard_places(guild, uid) if uid else []
+            firsts = [LEADERBOARD_SHORT[c] for spot, c in places if spot == 1]
+            if firsts:
+                bits.append("1st in " + ", ".join(firsts[:3]))
+        except Exception:
+            pass
+        data["stat_lines"] = bits
+
+    elif tab == "career":
+        history = []
+        for fight in list(reversed(stats["fights"]))[:6]:
+            if fight["method"] in ("NC", "DRAW"):
+                res = "D"
+            else:
+                res = "W" if fight_is_win_for(fight, uid, member.display_name) else "L"
+            won = res == "W"
+            opp_id = fight["loser_id"] if won else fight["winner_id"]
+            opp_name = fight["loser_name"] if won else fight["winner_name"]
+            if res == "D":
+                opp_id = fight["loser_id"] if fight["winner_id"] == uid else fight["winner_id"]
+                opp_name = fight["loser_name"] if fight["winner_id"] == uid else fight["winner_name"]
+            opp_member = guild.get_member(opp_id) if opp_id else None
+            opp = name_without_record(opp_member.display_name if opp_member else (opp_name or "Unknown"))
+            where = fight["event"] or (fight["fight_date"] or "")
+            history.append((res, f"vs {_plain(opp)}" + (f" · {_plain(where)}" if where else ""), _plain(fight_method_text(fight))
+                            + (" · title" if fight["title_fight"] else "")))
+        data["history"] = history
+        info = []
+        if stats["fights"]:
+            first = stats["fights"][0]
+            when = (first["fight_date"] or str(first["created_at"]))[:7]
+            try:
+                when = datetime.strptime(when, "%Y-%m").strftime("%b %Y")
+            except ValueError:
+                pass
+            info.append(("First PFO fight", when))
+        if uid:
+            try:
+                award_rows = awards_for_member(gid, uid)
+                if award_rows:
+                    info.append(("Awards", _plain(award_counts_text(award_rows))))
+            except Exception:
+                pass
+            try:
+                team = team_of(gid, uid)
+                if team:
+                    info.append(("Team", _plain(team_label(team))))
+            except Exception:
+                pass
+        if stats["title_wins"]:
+            info.append(("Title fight wins", str(stats["title_wins"])))
+        data["info"] = info[:4]
+
+    elif tab == "card":
+        try:
+            ratings = card_rating_table(gid)
+            card = fighter_card_data(guild, uid, member, ratings=ratings) if uid else None
+        except Exception:
+            card = None
+        data["card"] = card
+        pulled = 0
+        try:
+            pulled = discipline_query("SELECT COUNT(*) AS n FROM card_pulls WHERE guild_id = ? AND fighter_id = ?", (gid, uid))[0]["n"] if uid else 0
+        except Exception:
+            pass
+        data["card_tiles"] = ([(str(card["ovr"]), "OVERALL"), (CARD_TIER_NAMES.get(card["tier"], card["tier"]).upper(), "TIER")] if card else []) + [
+            (str(pulled), "COPIES PULLED")]
+    return data
+
+
+def _fit(draw, text, kind, size, max_width, min_size=12):
+    while size > min_size:
+        font = rank_font(kind, size)
+        if draw.textlength(text, font=font) <= max_width:
+            return font
+        size -= 2
+    return rank_font(kind, min_size)
+
+
+def _star(draw, cx, cy, r, fill):
+    import math
+    pts = []
+    for i in range(10):
+        ang = -math.pi / 2 + i * math.pi / 5
+        rad = r if i % 2 == 0 else r * 0.45
+        pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+    draw.polygon(pts, fill=fill)
+
+
+def draw_profile_image(data, avatar_bytes=None, logo_bytes=None, card_png=None):
+    """The designed profile, 900x1200 PNG bytes."""
+    import io as _io
+    import math
+    from PIL import Image, ImageDraw, ImageFilter
+    design = PROFILE_DESIGNS.get(data.get("theme")) or PROFILE_DESIGNS[None]
+    acc, acc2, top, mid, bot_c, ring1, ring2, tile, name_col, shadow, patterns, tag = design
+    W, H = PROFILE_W, PROFILE_H
+    img = Image.new("RGB", (W, H), bot_c)
+    d = ImageDraw.Draw(img)
+    # background gradient
+    for y in range(H):
+        t = y / H
+        if t < 0.5:
+            c = tuple(int(top[i] + (mid[i] - top[i]) * (t / 0.5)) for i in range(3))
+        else:
+            c = tuple(int(mid[i] + (bot_c[i] - mid[i]) * ((t - 0.5) / 0.5)) for i in range(3))
+        d.line([(0, y), (W, y)], fill=c)
+    over = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    od = ImageDraw.Draw(over)
+    # soft glow at the top
+    glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).ellipse([W * 0.1, -H * 0.25, W * 0.9, H * 0.28], fill=acc + (70,))
+    over = Image.alpha_composite(over, glow.filter(ImageFilter.GaussianBlur(90)))
+    od = ImageDraw.Draw(over)
+    if "lines" in patterns:
+        for x in range(-H, W, 34):
+            od.line([(x, 0), (x + H * 0.7, H)], fill=acc + (14,), width=2)
+    if "glow" in patterns:
+        g2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(g2).ellipse([W * 0.55, H * 0.6, W * 1.2, H * 1.1], fill=acc + (45,))
+        over = Image.alpha_composite(over, g2.filter(ImageFilter.GaussianBlur(110)))
+        od = ImageDraw.Draw(over)
+    if "boost" in patterns:
+        g2 = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(g2)
+        gd.ellipse([-W * 0.2, H * 0.02, W * 0.5, H * 0.4], fill=(244, 127, 255, 60))
+        gd.ellipse([W * 0.55, H * 0.55, W * 1.2, H * 0.95], fill=(88, 101, 242, 60))
+        over = Image.alpha_composite(over, g2.filter(ImageFilter.GaussianBlur(100)))
+        od = ImageDraw.Draw(over)
+    if "stars" in patterns:
+        for yy in range(20, int(H * 0.45), 30):
+            for xx in range(15 + (15 if (yy // 30) % 2 else 0), W, 30):
+                a = int(110 * (1 - yy / (H * 0.45)))
+                od.ellipse([xx - 1.6, yy - 1.6, xx + 1.6, yy + 1.6], fill=(255, 255, 255, max(0, a)))
+    if "stripes" in patterns:
+        band = Image.new("RGBA", (W * 2, H), (0, 0, 0, 0))
+        bd = ImageDraw.Draw(band)
+        for i, y in enumerate(range(0, H, 34)):
+            bd.rectangle([0, y, W * 2, y + 34], fill=(184, 32, 46, 120) if i % 2 == 0 else (245, 240, 228, 26))
+        band = band.rotate(-12, resample=Image.BICUBIC).crop((W // 2, 0, W // 2 + W, H))
+        fade = Image.linear_gradient("L").resize((W, H)).point(lambda v: max(0, int((v - 120) * 2)))
+        band.putalpha(Image.composite(band.getchannel("A"), Image.new("L", (W, H), 0), fade))
+        over = Image.alpha_composite(over, band)
+        od = ImageDraw.Draw(over)
+    if "fireworks" in patterns:
+        for cx, cy, r in ((150, 150, 120), (W - 140, 210, 90)):
+            for i in range(28):
+                ang = i * math.pi * 2 / 28
+                od.line([(cx + math.cos(ang) * r * 0.25, cy + math.sin(ang) * r * 0.25), (cx + math.cos(ang) * r, cy + math.sin(ang) * r)],
+                        fill=(233, 200, 120, 70), width=2)
+            od.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=(255, 255, 255, 160))
+    if "rail" in patterns:
+        for i, x in enumerate(range(0, W, 40)):
+            od.rectangle([x, 0, x + 40, 9], fill=((184, 32, 46), (245, 240, 228), (18, 48, 103))[i % 3] + (255,))
+    img = Image.alpha_composite(img.convert("RGBA"), over)
+    d = ImageDraw.Draw(img)
+    pad = 54
+
+    # top row: logo + theme tag
+    logo_r = 46
+    if logo_bytes:
+        try:
+            logo = Image.open(_io.BytesIO(logo_bytes)).convert("RGBA").resize((logo_r * 2, logo_r * 2))
+            mask = Image.new("L", logo.size, 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, logo.size[0], logo.size[1]], fill=255)
+            img.paste(logo, (pad, 40), mask)
+        except Exception:
+            logo_bytes = None
+    if not logo_bytes:
+        d.ellipse([pad, 40, pad + logo_r * 2, 40 + logo_r * 2], fill=(8, 8, 10), outline=(201, 162, 74), width=4)
+        d.text((pad + logo_r, 40 + logo_r), "PFO", font=rank_font("display", 34), fill=(230, 230, 234), anchor="mm")
+    d.ellipse([pad, 40, pad + logo_r * 2, 40 + logo_r * 2], outline=(201, 162, 74), width=3)
+    tag_font = rank_font("bold", 20)
+    tag_text = "  ".join(tag) if False else tag
+    tw = d.textlength(tag_text, font=tag_font)
+    tx = W - pad - tw
+    d.text((tx, 86), tag_text, font=tag_font, fill=acc2, anchor="lm")
+    _star(d, tx - 20, 86, 9, acc2)
+    _star(d, W - pad + 14, 86, 9, acc2)
+
+    # header: avatar, name, record, tags
+    small = data["tab"] != "overview"
+    av = 190 if not small else 150
+    ax, ay = pad + 6, 170
+    ring = [(ring2, 14), (ring1, 7)]
+    for colour, grow in ring:
+        d.ellipse([ax - grow, ay - grow, ax + av + grow, ay + av + grow], fill=colour)
+    if avatar_bytes:
+        try:
+            face = Image.open(_io.BytesIO(avatar_bytes)).convert("RGBA").resize((av, av))
+            mask = Image.new("L", (av, av), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, av, av], fill=255)
+            img.paste(face, (ax, ay), mask)
+        except Exception:
+            avatar_bytes = None
+    if not avatar_bytes:
+        d.ellipse([ax, ay, ax + av, ay + av], fill=(40, 40, 46))
+        d.text((ax + av / 2, ay + av / 2), (data["name"][:2] or "?").upper(), font=rank_font("display", 70), fill=(220, 220, 225), anchor="mm")
+    nx = ax + av + 44
+    nmax = W - pad - nx
+    name = data["name"].upper()
+    # Name in big italic letters (sheared), with a coloured drop line
+    nfont = _fit(d, name, "display", 96 if not small else 76, nmax - 20, 40)
+    box = d.textbbox((0, 0), name, font=nfont)
+    nw, nh = box[2] - box[0] + 40, box[3] - box[1] + 30
+    layer = Image.new("RGBA", (nw, nh), (0, 0, 0, 0))
+    ld = ImageDraw.Draw(layer)
+    ld.text((10 - box[0], 6 - box[1] + 5), name, font=nfont, fill=shadow + (255,))
+    ld.text((10 - box[0], 6 - box[1]), name, font=nfont, fill=name_col + (255,))
+    layer = layer.transform(layer.size, Image.AFFINE, (1, 0.18, -0.18 * nh / 2, 0, 1, 0), resample=Image.BICUBIC)
+    ny = ay + (8 if not small else 2)
+    img.alpha_composite(layer, (int(nx - 10), int(ny)))
+    d = ImageDraw.Draw(img)
+    ry = ny + nh + 6
+    rec = f"{data['record']}  ·  {data['ranks']}"
+    d.text((nx, ry), rec, font=_fit(d, rec, "display", 40, nmax, 22), fill=acc2)
+    ry += 54
+    if not small:
+        x = nx
+        pills = list(data["tags"]) + (["BOOSTER"] if data.get("booster") else [])
+        pfont = rank_font("bold", 17)
+        for pill in pills[:3]:
+            text = _plain(pill).upper()
+            w = d.textlength(text, font=pfont) + 28
+            if x + w > W - pad:
+                break
+            boost = pill == "BOOSTER"
+            d.rounded_rectangle([x, ry, x + w, ry + 34], radius=17, fill=tile + (210,) if len(tile) == 3 else tile,
+                                outline=(244, 127, 255) if boost else acc, width=2)
+            d.text((x + w / 2, ry + 17), text, font=pfont, fill=(255, 194, 255) if boost else (240, 240, 244), anchor="mm")
+            x += w + 10
+
+    y = max(ay + av + 44, ry + 50)
+
+    def section(label, yy):
+        d.text((pad, yy), label, font=rank_font("bold", 18), fill=acc2)
+        return yy + 34
+
+    def titles(yy, rows):
+        for text, special in rows:
+            text = _plain(text).upper()
+            band = Image.new("RGBA", (W - 2 * pad, 50), (0, 0, 0, 0))
+            bd = ImageDraw.Draw(band)
+            start = (184, 32, 46) if special else acc
+            for x in range(band.width):
+                a = int(130 * (1 - x / band.width))
+                bd.line([(x, 0), (x, 50)], fill=start + (a,))
+            img.alpha_composite(band, (pad, yy))
+            d.rectangle([pad, yy, pad + 5, yy + 50], fill=(255, 255, 255) if special else acc)
+            _star(d, pad + 30, yy + 25, 11, (255, 255, 255) if special else acc2)
+            d.text((pad + 52, yy + 25), text, font=_fit(d, text, "display", 34, W - 2 * pad - 70, 18), fill=(255, 255, 255), anchor="lm")
+            yy += 58
+        return yy
+
+    def tiles(yy, items, cols):
+        gap = 12
+        tw = (W - 2 * pad - gap * (cols - 1)) / cols
+        th = 112
+        for i, (value, label) in enumerate(items):
+            r, c = divmod(i, cols)
+            x0, y0 = pad + c * (tw + gap), yy + r * (th + gap)
+            d.rounded_rectangle([x0, y0, x0 + tw, y0 + th], radius=14, fill=tile, outline=(255, 255, 255, 40) if False else tuple(min(255, v + 30) for v in tile), width=1)
+            d.rectangle([x0 + 14, y0, x0 + tw - 14, y0 + 4], fill=acc)
+            d.text((x0 + tw / 2, y0 + 48), str(value), font=_fit(d, str(value), "display", 52, tw - 20, 22), fill=(255, 255, 255), anchor="mm")
+            d.text((x0 + tw / 2, y0 + 88), label, font=_fit(d, label, "bold", 15, tw - 16, 10), fill=(197, 200, 208), anchor="mm")
+        rows = (len(items) + cols - 1) // cols
+        return yy + rows * (th + gap)
+
+    def line_pair(yy, label, value):
+        f1, f2 = rank_font("semibold", 26), rank_font("bold", 26)
+        d.text((pad, yy), label, font=f1, fill=(205, 208, 216))
+        lw = d.textlength(label + "  ", font=f1)
+        d.text((pad + lw, yy), value, font=_fit(d, value, "bold", 26, W - 2 * pad - lw, 14), fill=acc2)
+        return yy + 40
+
+    def bars(yy, rows):
+        total = max(1, sum(v for _, v in rows))
+        for label, value in rows:
+            d.text((pad, yy + 11), label, font=rank_font("bold", 18), fill=(230, 230, 236), anchor="lm")
+            bx0, bx1 = pad + 190, W - pad - 60
+            d.rounded_rectangle([bx0, yy + 2, bx1, yy + 20], radius=9, fill=(255, 255, 255, 30) if False else tuple(min(255, v + 25) for v in tile))
+            if value:
+                d.rounded_rectangle([bx0, yy + 2, bx0 + (bx1 - bx0) * value / total, yy + 20], radius=9, fill=acc)
+            d.text((W - pad, yy + 11), str(value), font=rank_font("display", 30), fill=acc2, anchor="rm")
+            yy += 36
+        return yy
+
+    tab = data["tab"]
+    if tab == "overview":
+        if data["titles"]:
+            y = titles(y, data["titles"][:4]) + 10
+        y = tiles(y, data["tiles"], 4) + 14
+        for label, value in data["lines"]:
+            y = line_pair(y, label, value)
+        if data.get("last"):
+            y += 8
+            x = pad
+            cf = rank_font("bold", 22)
+            for kind, text in data["last"]:
+                w = d.textlength(text, font=cf) + 30
+                col = {"W": (61, 214, 140), "L": (240, 122, 126)}.get(kind, (161, 161, 170))
+                d.rounded_rectangle([x, y, x + w, y + 42], radius=10, fill=tuple(int(v * 0.25) for v in col), outline=col, width=2)
+                d.text((x + w / 2, y + 21), text, font=cf, fill=(255, 255, 255), anchor="mm")
+                x += w + 10
+            y += 58
+        for kind, text in data.get("extras", [])[:3]:
+            col = {"bad": (240, 122, 126), "warn": (245, 180, 85), "gold": acc2, "quote": (210, 212, 220)}[kind]
+            font = rank_font("medium" if kind == "quote" else "bold", 22)
+            d.text((pad, y), text, font=_fit(d, text, "medium" if kind == "quote" else "bold", 22, W - 2 * pad, 12), fill=col)
+            y += 34
+    elif tab == "stats":
+        y = section("STRIKING & GRAPPLING", y)
+        if data["tiles"]:
+            y = tiles(y, data["tiles"], 3) + 4
+        d.text((pad, y), data["stat_note"], font=rank_font("medium", 18), fill=(170, 174, 184))
+        y += 44
+        y = section("HOW THEY WIN", y)
+        y = bars(y, data["win_bars"]) + 10
+        y = section("HOW THEY LOSE", y)
+        y = bars(y, data["loss_bars"]) + 10
+        for text in data.get("stat_lines", []):
+            d.text((pad, y), text, font=_fit(d, text, "bold", 24, W - 2 * pad, 12), fill=acc2)
+            y += 38
+    elif tab == "career":
+        y = section("FIGHT HISTORY · NEWEST FIRST", y)
+        if not data["history"]:
+            d.text((pad, y), "No PFO fights logged yet.", font=rank_font("medium", 24), fill=(190, 190, 200))
+            y += 44
+        for res, who, how in data["history"]:
+            d.rounded_rectangle([pad, y, W - pad, y + 52], radius=10, fill=tile)
+            col = {"W": (61, 214, 140), "L": (240, 122, 126)}.get(res, (161, 161, 170))
+            d.rounded_rectangle([pad + 10, y + 9, pad + 52, y + 43], radius=7, fill=tuple(int(v * 0.3) for v in col))
+            d.text((pad + 31, y + 26), res, font=rank_font("display", 28), fill=col, anchor="mm")
+            hw = d.textlength(how, font=rank_font("semibold", 20))
+            d.text((pad + 66, y + 26), who, font=_fit(d, who, "semibold", 22, W - 2 * pad - 100 - hw, 12), fill=(240, 240, 244), anchor="lm")
+            d.text((W - pad - 14, y + 26), how, font=rank_font("semibold", 20), fill=(197, 200, 208), anchor="rm")
+            y += 60
+        if data["titles"]:
+            y = section("BELTS & TITLES", y + 8)
+            y = titles(y, data["titles"][:3])
+        for label, value in data.get("info", []):
+            if y > H - 70:
+                break
+            y = line_pair(y, label, value)
+    elif tab == "card":
+        if card_png:
+            try:
+                card = Image.open(_io.BytesIO(card_png)).convert("RGBA")
+                cw = int(W * 0.52)
+                card = card.resize((cw, int(card.height * cw / card.width)))
+                halo = Image.new("RGBA", (card.width + 80, card.height + 80), (0, 0, 0, 0))
+                ImageDraw.Draw(halo).rounded_rectangle([30, 30, halo.width - 30, halo.height - 30], radius=30, fill=acc + (110,))
+                halo = halo.filter(ImageFilter.GaussianBlur(26))
+                cy = max(y - 40, 300)
+                img.alpha_composite(halo, (pad - 40, cy - 40))
+                img.alpha_composite(card, (pad, cy))
+                d = ImageDraw.Draw(img)
+                y = max(cy + card.height + 20, cy + 3 * 134)
+                x0 = pad + cw + 34
+                ty = cy + 10
+                for value, label in data.get("card_tiles", []):
+                    d.rounded_rectangle([x0, ty, W - pad, ty + 120], radius=14, fill=tile)
+                    d.rectangle([x0 + 14, ty, W - pad - 14, ty + 4], fill=acc)
+                    d.text(((x0 + W - pad) / 2, ty + 52), value, font=_fit(d, value, "display", 50, W - pad - x0 - 20, 20), fill=(255, 255, 255), anchor="mm")
+                    d.text(((x0 + W - pad) / 2, ty + 95), label, font=rank_font("bold", 15), fill=(197, 200, 208), anchor="mm")
+                    ty += 134
+            except Exception as error:
+                print(f"Profile card draw failed: {error}")
+        else:
+            d.text((pad, y), "No card: cards are for fighters with a weight class role or a UFC fighter name.",
+                   font=_fit(d, "No card: cards are for fighters with a weight class role or a UFC fighter name.", "medium", 24, W - 2 * pad, 12), fill=(200, 200, 210))
+
+    # trim empty space at the bottom, then the footer strip
+    H = max(780, min(H, int(y) + 40 + 64))
+    img = img.crop((0, 0, W, H))
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, H - 64, W, H], fill=(8, 8, 10))
+    d.rectangle([0, H - 66, W, H - 63], fill=acc)
+    d.text((pad, H - 32), {"overview": "FIGHTER PROFILE", "stats": "FIGHTER STATS", "career": "CAREER", "card": "FIGHTER CARD"}[tab],
+           font=rank_font("display", 34), fill=(255, 255, 255), anchor="lm")
+    d.text((W - pad, H - 32), _plain(data["footer"]).upper(), font=rank_font("bold", 15), fill=acc2, anchor="rm")
+    out = img.convert("RGB")
+    if data.get("theme") == "blackout":
+        out = out.convert("L").convert("RGB")
+    buf = _io.BytesIO()
+    out.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+async def profile_design_message(guild, member, tab: str):
+    """(embeds, files) for the designed profile."""
+    data = profile_design_data(guild, member, tab)
+    avatar = await _avatar_bytes(member) if getattr(member, "display_avatar", None) else None
+    try:
+        if getattr(member, "display_avatar", None):
+            big = member.display_avatar.replace(size=256, static_format="png")
+            avatar = await big.read()
+    except Exception:
+        pass
+    logo = await _logo()
+    card_png = None
+    if tab == "card" and getattr(member, "id", None):
+        try:
+            card_png = await card_png_for_fighter(guild, member)
+        except Exception as error:
+            print(f"Profile card failed: {error}")
+    png = await asyncio.to_thread(draw_profile_image, data, avatar, logo, card_png)
+    theme = data["theme"]
+    colour = PROFILE_THEME_COLOURS.get(theme, PFO_GOLD) if theme else PFO_GOLD
+    stats_footer = data["footer"]
+    main = discord.Embed(color=colour)
+    main.set_image(url="attachment://profile.png")
+    embeds = [main]
+    if tab != "card":
+        banner = discord.Embed(color=colour)
+        url = asset_url(PROFILE_BANNER_FILE) if ASSET_BASE_URL else None
+        try:
+            if theme in PROFILE_THEME_TINTS and ASSET_BASE_URL and BOT_SITE_URL and website_running():
+                import sys as _sys
+                ready = getattr(_sys.modules.get("website"), "_THEME_BANNERS", {}).get(theme)
+                if ready:
+                    url = f"{BOT_SITE_URL}/theme-banner/{theme}.gif?v={ASSET_VERSION}-{int(ready[0])}"
+        except Exception:
+            pass
+        if url:
+            banner.set_image(url=url)
+            banner.set_footer(text=stats_footer, icon_url=asset_url(LOGO_FILE))
+            embeds.append(banner)
+        else:
+            main.set_footer(text=stats_footer, icon_url=asset_url(LOGO_FILE))
+    else:
+        main.set_footer(text=stats_footer, icon_url=asset_url(LOGO_FILE))
+    import io as _io
+    return embeds, [discord.File(_io.BytesIO(png), filename="profile.png")]
+
+
 class ProfileView(discord.ui.View):
     """Overview / Stats / Career / Card buttons under /profile.
     The person who ran it flips the tabs; anyone else gets their own private copy."""
 
-    def __init__(self, owner_id: int, member, tab: str = "overview"):
+    def __init__(self, owner_id: int, member, tab: str = "overview", guild_id: int = None):
         super().__init__(timeout=3600)
         self.owner_id = owner_id
         self.member = member
+        self.guild_id = guild_id
         self.tab = tab
         self.message = None
         self.build()
@@ -4619,6 +5338,16 @@ class ProfileView(discord.ui.View):
             )
             button.callback = self.make_callback(key)
             self.add_item(button)
+        try:
+            text_only = profile_text_only(self.guild_id, self.owner_id) if self.guild_id else False
+        except Exception:
+            text_only = False
+        style = discord.ui.Button(label="🎨 Designed" if text_only else "📝 Text version", style=discord.ButtonStyle.grey, row=1)
+
+        async def style_callback(interaction):
+            await self.toggle_style(interaction)
+        style.callback = style_callback
+        self.add_item(style)
 
     def make_callback(self, key):
         async def callback(interaction):
@@ -4626,6 +5355,12 @@ class ProfileView(discord.ui.View):
         return callback
 
     async def render(self, guild, tab):
+        """(embeds, files). Designed image unless this viewer picked the text version."""
+        if not profile_text_only(guild.id, self.owner_id):
+            try:
+                return await profile_design_message(guild, self.member, tab)
+            except Exception as error:
+                print(f"Profile design failed, using text: {error}")
         embed = await create_profile_embed(guild, self.member, tab)
         files = []
         if tab == "card":
@@ -4635,18 +5370,37 @@ class ProfileView(discord.ui.View):
             else:
                 embed.set_image(url=None)
                 embed.description = (embed.description or "") + "\n\nNo card: cards are for fighters with a weight class role or a UFC fighter name."
-        return embed, files
+        return [embed], files
 
     async def switch(self, interaction, key):
         if interaction.user.id != self.owner_id:
-            copy = ProfileView(interaction.user.id, self.member, key)
-            embed, files = await copy.render(interaction.guild, key)
-            await interaction.response.send_message(embed=embed, files=files, view=copy, ephemeral=True)
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            copy = ProfileView(interaction.user.id, self.member, key, interaction.guild.id)
+            embeds, files = await copy.render(interaction.guild, key)
+            await interaction.followup.send(embeds=embeds, files=files, view=copy, ephemeral=True)
             return
+        await interaction.response.defer()
         self.tab = key
         self.build()
-        embed, files = await self.render(interaction.guild, key)
-        await interaction.response.edit_message(embed=embed, attachments=files, view=self)
+        embeds, files = await self.render(interaction.guild, key)
+        await interaction.edit_original_response(embeds=embeds, attachments=files, view=self)
+
+    async def toggle_style(self, interaction):
+        """📝 / 🎨: the clicker's own choice of text or designed profiles, remembered."""
+        text_now = not profile_text_only(interaction.guild.id, interaction.user.id)
+        set_profile_text_only(interaction.guild.id, interaction.user.id, text_now)
+        if interaction.user.id != self.owner_id:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            copy = ProfileView(interaction.user.id, self.member, self.tab, interaction.guild.id)
+            embeds, files = await copy.render(interaction.guild, self.tab)
+            await interaction.followup.send(
+                ("📝 Profiles will show as text for you from now on." if text_now else "🎨 Profiles will show the designed version for you from now on."),
+                embeds=embeds, files=files, view=copy, ephemeral=True)
+            return
+        await interaction.response.defer()
+        self.build()
+        embeds, files = await self.render(interaction.guild, self.tab)
+        await interaction.edit_original_response(embeds=embeds, attachments=files, view=self)
 
     async def on_timeout(self):
         try:
@@ -5359,10 +6113,9 @@ async def profile(
                 return
 
         try:
-            view = ProfileView(interaction.user.id, member)
-            view.message = await interaction.followup.send(
-                embed=await create_profile_embed(interaction.guild, member), view=view
-            )
+            view = ProfileView(interaction.user.id, member, guild_id=interaction.guild.id)
+            embeds, files = await view.render(interaction.guild, "overview")
+            view.message = await interaction.followup.send(embeds=embeds, files=files, view=view)
         except Exception as error:
             print(f"Profile error: {error}")
             await interaction.followup.send(
@@ -5404,14 +6157,9 @@ async def profile(
 
     try:
 
-        view = ProfileView(interaction.user.id, member)
-        view.message = await interaction.followup.send(
-            embed=await create_profile_embed(
-                interaction.guild,
-                member
-            ),
-            view=view
-        )
+        view = ProfileView(interaction.user.id, member, guild_id=interaction.guild.id)
+        embeds, files = await view.render(interaction.guild, "overview")
+        view.message = await interaction.followup.send(embeds=embeds, files=files, view=view)
 
         if problem and is_staff(interaction):
             await interaction.followup.send(
@@ -10955,6 +11703,11 @@ def create_notice(
 
     notice_id = cursor.lastrowid
 
+    try:
+        cursor.execute("UPDATE card_notices SET venue = ? WHERE id = ?", (latest_venue(guild_id, kind), notice_id))
+    except Exception as error:
+        print(f"Card venue failed: {error}")
+
     cursor.executemany("""
         INSERT INTO card_fighters
         (notice_id, user_id, position, name, opponent_id)
@@ -11301,6 +12054,8 @@ def setup_card_section_columns():
     for column in ("main_card", "prelims", "early_prelims"):
         if column not in columns:
             db.execute(f"ALTER TABLE card_notices ADD COLUMN {column} INTEGER")
+    if "venue" not in columns:
+        db.execute("ALTER TABLE card_notices ADD COLUMN venue TEXT")     # where the card is held (from the sign-up)
 
     db.commit()
     db.close()
@@ -11486,7 +12241,8 @@ def create_selection_dm_embed(
     event_date: str = None,
     deadline: str = None,
     opponent_text: str = None,
-    spot: dict = None
+    spot: dict = None,
+    venue: str = None
 ):
 
     if kind == "fight_night":
@@ -11517,6 +12273,9 @@ def create_selection_dm_embed(
         banner_file=banner,
         author_text=author
     )
+
+    if venue:
+        embed.add_field(name="📍 Venue", value=venue, inline=False)
 
     if opponent_text:
         embed.add_field(
@@ -11610,7 +12369,7 @@ class CheckInView(
         embed = (
             interaction.message.embeds[0].copy()
             if interaction.message and interaction.message.embeds
-            else create_selection_dm_embed("live_card", event=notice["event"], event_date=notice["event_date"])
+            else create_selection_dm_embed("live_card", event=notice["event"], event_date=notice["event_date"], venue=notice_venue(notice))
         )
 
         banner = asset_url(CHECKED_IN_BANNER)
@@ -11684,6 +12443,9 @@ def create_checkin_board_embed(
 
     if notice["event_date"]:
         header.append(f"📅 {format_saved_time(notice['event_date'])}")
+
+    if notice_venue(notice):
+        header.append(f"📍 {notice_venue(notice)}")
 
     header.append(f"**{checked} / {len(fighters)} checked in**")
 
@@ -11868,7 +12630,8 @@ class SendDMsView(
                 event=self.event,
                 event_date=self.event_date,
                 deadline=self.deadline,
-                spot=spots.get(user_id)
+                spot=spots.get(user_id),
+                venue=latest_venue(self.guild.id, self.kind)
             )
 
             view = CheckInView(notice_id) if self.kind == "live_card" else None
@@ -15363,8 +16126,10 @@ METHOD_NAMES = {"KO/TKO": "KO/TKO", "SUB": "Submission", "DEC": "Decision",
 #   NEW_FIGHTER_FIGHTS  fighters with fewer fights than this get tamer odds (not enough stats yet)
 MAX_BET_ODDS = float(os.getenv("MAX_BET_ODDS", "50") or 50)
 NEW_FIGHTER_FIGHTS = int(os.getenv("NEW_FIGHTER_FIGHTS", "3") or 3)
-MAX_METHOD_ODDS = 15.0          # any KO / SUB / DEC pick
-NEW_FIGHTER_METHOD_ODDS = 6.0   # KO / SUB / DEC pick on a fighter with little history
+MAX_METHOD_ODDS = float(os.getenv("MAX_METHOD_ODDS", "6.0"))              # any KO / SUB / DEC pick
+NEW_FIGHTER_METHOD_ODDS = float(os.getenv("NEW_FIGHTER_METHOD_ODDS", "4.0"))   # KO / SUB / DEC pick on a fighter with little history
+METHOD_ODDS_SCALE = float(os.getenv("METHOD_ODDS_SCALE", "0.4"))           # how much of the "true" extra price is paid
+METHOD_MAX_TIMES = float(os.getenv("METHOD_MAX_TIMES", "1.6"))             # never more than this many times the win odds
 
 # Round betting: "<fighter> to finish in Round N" (KO/TKO or submission in that round).
 # A decision, or a finish in another round, loses the bet. Odds come from how often
@@ -15373,9 +16138,10 @@ NEW_FIGHTER_METHOD_ODDS = 6.0   # KO / SUB / DEC pick on a fighter with little h
 ROUND_PICKS = {"R1": 1, "R2": 2, "R3": 3}
 ROUND_SHARE = {1: 0.45, 2: 0.32, 3: 0.23}   # default split of finishes by round
 ROUND_PRIOR_FIGHTS = 10         # "average" finishes mixed in so a few fights don't swing it
-MAX_ROUND_ODDS = float(os.getenv("MAX_ROUND_ODDS", "6.0"))          # any round pick
-NEW_FIGHTER_ROUND_ODDS = float(os.getenv("NEW_FIGHTER_ROUND_ODDS", "4.5"))   # round pick on a fighter with little history
-ROUND_ODDS_SCALE = float(os.getenv("ROUND_ODDS_SCALE", "0.45"))     # how much of the "true" extra price is paid (lower = tamer)
+MAX_ROUND_ODDS = float(os.getenv("MAX_ROUND_ODDS", "4.0"))          # any round pick
+NEW_FIGHTER_ROUND_ODDS = float(os.getenv("NEW_FIGHTER_ROUND_ODDS", "3.5"))   # round pick on a fighter with little history
+ROUND_ODDS_SCALE = float(os.getenv("ROUND_ODDS_SCALE", "0.25"))      # how much of the "true" extra price is paid (lower = tamer)
+ROUND_MAX_TIMES = float(os.getenv("ROUND_MAX_TIMES", "1.6"))        # never more than this many times the win odds
 MIN_ROUND_SHARE = 0.06          # never prices a round pick longer than this chance allows
 
 _markets_to_refresh = set()
@@ -16041,6 +16807,15 @@ def round_shares(guild_id: int):
     return {rnd: counts[rnd] / total for rnd in counts}
 
 
+def tamed_odds(win: float, share: float, scale: float, max_times: float, cap: float, floor_times: float):
+    """Odds for a narrower pick (method or round) built on the win odds, kept sensible:
+    only part of the extra price is paid, never more than max_times the win odds or the cap,
+    and always at least floor_times the win odds (so it never pays less than just backing the win)."""
+    times = min(max_times, 1 + (1 / max(share, 0.01) - 1) * scale)
+    value = min(win * times, cap)
+    return round(max(win * floor_times, value), 2)
+
+
 def round_pick_odds(bout, pick: str, method: str):
     """Odds for '<fighter> to finish in Round N'."""
 
@@ -16059,10 +16834,7 @@ def round_pick_odds(bout, pick: str, method: str):
         cap = NEW_FIGHTER_ROUND_ODDS
 
     share = max(share, MIN_ROUND_SHARE)
-    # Only part of the extra price over the win odds is paid, so round picks stay sensible.
-    tamed = odds + (odds / share - odds) * ROUND_ODDS_SCALE
-    # Always pays a bit more than just picking the winner, never more than the cap.
-    return max(round(odds * 1.25, 2), min(cap, round(tamed, 2)))
+    return tamed_odds(odds, share, ROUND_ODDS_SCALE, ROUND_MAX_TIMES, cap, 1.05)
 
 
 def pick_odds(bout, pick: str, method: str = None):
@@ -16083,7 +16855,7 @@ def pick_odds(bout, pick: str, method: str = None):
         if min(fights_on_record(market["guild_id"], winner), fights_on_record(market["guild_id"], loser)) < NEW_FIGHTER_FIGHTS:
             share = max(share, 0.25)                    # no real stats yet: no long shots on a method
             cap = NEW_FIGHTER_METHOD_ODDS
-        odds = max(odds, min(cap, round(odds / share, 2)))
+        odds = tamed_odds(odds, share, METHOD_ODDS_SCALE, METHOD_MAX_TIMES, cap, 1.05)
 
     return odds
 
@@ -20500,6 +21272,8 @@ def tale_of_the_tape_embed(
                 bits.append(cosmetic["badge"])
             if is_booster(guild.id, member.id):
                 bits.append("💎 Booster")
+            for title_name, title_emoji in get_profile_titles(guild.id, member.id):
+                bits.append(f"{title_emoji} {title_name}")
             return f"{name} " + " · ".join(bits) if bits else None
         tags = [t for t in (tag(a, name_a), tag(b, name_b)) if t]
         if tags:
@@ -20715,6 +21489,7 @@ BELT_CHOICES = [
     app_commands.Choice(name="Interim Champion", value="interim"),
     app_commands.Choice(name="BMF (Baddest Motherfucker)", value="bmf"),
     app_commands.Choice(name="WMF (Worst Motherfucker)", value="wmf"),
+    app_commands.Choice(name="Freedom 13 Winner (permanent, on profile, no weight)", value="freedom13"),
 ]
 
 
@@ -20771,14 +21546,46 @@ def belt_title(weight: str, belt: str):
     return f"{icon} Interim {weight} Champion" if belt == "interim" else f"{icon} {weight} {name}"
 
 
+# ---------------- profile titles (permanent) ----------------
+# Event belts that stay on someone's profile for good, given with /belt
+# (no weight class). Shown on /profile, the website, Tale of the Tape and
+# the Hall of Fame. Not on rankings.
+PROFILE_TITLES = {"freedom13": ("Freedom 13 Winner", "🏆", "freedom")}    # key: (name, emoji, theme it comes with)
+
+
+def setup_profile_title_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS profile_titles (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            given_by INTEGER,
+            at INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, user_id, title)
+        )
+    """)
+    db.commit()
+    db.close()
+
+
+def get_profile_titles(guild_id: int, user_id: int):
+    """[(name, emoji)] for someone's permanent titles."""
+    try:
+        rows = discipline_query("SELECT title FROM profile_titles WHERE guild_id = ? AND user_id = ? ORDER BY at", (guild_id, user_id))
+    except sqlite3.OperationalError:
+        return []
+    return [PROFILE_TITLES[r["title"]][:2] for r in rows if r["title"] in PROFILE_TITLES]
+
+
 @bot.tree.command(
     name="belt",
-    description="Give or take an Interim Champion, BMF or WMF belt in a division."
+    description="Give or take a belt: Interim, BMF or WMF in a division, or a permanent title like Freedom 13 Winner."
 )
 @app_commands.describe(
     action="Give or remove",
     belt="Which belt",
-    weight="Which division",
+    weight="Which division (not needed for Freedom 13 Winner)",
     fighter="Who gets it (only needed when giving)"
 )
 @app_commands.choices(
@@ -20790,7 +21597,7 @@ async def belt(
     interaction: discord.Interaction,
     action: app_commands.Choice[str],
     belt: app_commands.Choice[str],
-    weight: app_commands.Choice[str],
+    weight: app_commands.Choice[str] = None,
     fighter: discord.Member = None
 ):
 
@@ -20799,6 +21606,32 @@ async def belt(
         return
 
     guild = interaction.guild
+
+    # Permanent profile titles (no weight class)
+    if belt.value in PROFILE_TITLES:
+        name, emoji, theme = PROFILE_TITLES[belt.value]
+        if not fighter or fighter.bot:
+            await interaction.response.send_message("❌ Pick the fighter.", ephemeral=True)
+            return
+        if action.value == "give":
+            discipline_query("INSERT OR IGNORE INTO profile_titles (guild_id, user_id, title, given_by, at) VALUES (?, ?, ?, ?, ?)",
+                             (guild.id, fighter.id, belt.value, interaction.user.id, int(time.time())), write=True)
+            note = f"{emoji} <@{fighter.id}> is a **{name}**. It stays on their profile for good."
+            if theme:
+                own_theme(guild.id, fighter.id, theme, f"title:{belt.value}")
+                switch_theme(guild.id, fighter.id, theme)
+                note += f"\n🎨 The **{PROFILE_STYLES[theme]}** theme has been added to their themes and switched on."
+        else:
+            discipline_query("DELETE FROM profile_titles WHERE guild_id = ? AND user_id = ? AND title = ?",
+                             (guild.id, fighter.id, belt.value), write=True)
+            note = (f"🗑️ **{name}** removed from <@{fighter.id}>." +
+                    (f" They keep the {PROFILE_STYLES[theme]} theme (take it with `/givetheme ... remove:True`)." if theme else ""))
+        await interaction.response.send_message(note, ephemeral=True)
+        return
+
+    if weight is None:
+        await interaction.response.send_message("❌ Pick the division for this belt.", ephemeral=True)
+        return
     holders = get_division_belts(guild.id, weight.value)
     current = holders.get(belt.value)
     title = belt_title(weight.value, belt.value)
@@ -23148,6 +23981,7 @@ def hof_career(guild_id: int, user_id, name: str):
             defences += sum(reign["defences"] for reign in mine)
             belts.append(division)
 
+    belts += [f"{title_name}" for title_name, _ in get_profile_titles(guild_id, user_id)] if user_id else []
     return {"record": stats_record(stats), "reigns": reigns, "defences": defences, "belts": belts}
 
 
@@ -23731,12 +24565,117 @@ BADGES = ["The Finisher", "Knockout Artist", "Sub Specialist", "Underdog King", 
 
 # Every theme someone can have (gold frame and glow were sold before themes, and still work for them).
 PROFILE_STYLES = {"gold": "Gold frame", "glow": "Gold glow", "crimson": "Crimson", "ice": "Ice", "emerald": "Emerald",
-                  "neon": "Neon", "royal": "Royal", "blackout": "Blackout", "booster": "Booster"}
+                  "neon": "Neon", "royal": "Royal", "blackout": "Blackout", "booster": "Booster", "freedom": "Freedom 13"}
 # The ones on sale now (Profile Theme in the shop).
 PROFILE_THEMES = {key: PROFILE_STYLES[key] for key in ("crimson", "ice", "emerald", "neon", "royal", "blackout")}
 # The /profile embed colour for each theme (no theme: PFO gold).
 PROFILE_THEME_COLOURS = {"crimson": 0xD2453A, "ice": 0x6CC6EA, "emerald": 0x3FBF7F, "neon": 0xE04FD8,
-                         "royal": 0x8B7CF0, "blackout": 0xD4D4D4, "booster": 0xF47FFF}
+                         "royal": 0x8B7CF0, "blackout": 0xD4D4D4, "booster": 0xF47FFF, "freedom": 0xB8202E}
+
+# ---------------- owned themes ----------------
+#
+# Every Profile Theme someone gets stays theirs: bought in the shop, given by
+# staff (/givetheme) or won (Freedom 13 Winner gets Freedom 13). They switch
+# between them any time from 🎒 My items in /shop or My PFO on the website.
+# Themes bought before this was added are found from shop history.
+# (The Booster theme is separate: it's on/off in /boosterperks while boosting.)
+
+GIVEABLE_THEMES = ["crimson", "ice", "emerald", "neon", "royal", "blackout", "freedom"]
+
+
+def setup_owned_theme_table():
+    db = get_db()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS owned_themes (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            theme TEXT NOT NULL,
+            source TEXT,
+            at INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, user_id, theme)
+        )
+    """)
+    db.commit()
+    db.close()
+    try:
+        now = int(time.time())
+        for row in discipline_query("SELECT guild_id, user_id, data FROM shop_items WHERE item = 'profile_style' AND data IS NOT NULL"):
+            try:
+                style = json.loads(row["data"] or "{}").get("style")
+            except (TypeError, ValueError):
+                style = None
+            if style and style in PROFILE_STYLES and style != "booster":
+                discipline_query("INSERT OR IGNORE INTO owned_themes (guild_id, user_id, theme, source, at) VALUES (?, ?, ?, 'shop', ?)",
+                                 (row["guild_id"], row["user_id"], style, now), write=True)
+        for row in discipline_query("SELECT guild_id, user_id, style FROM fighter_cosmetics WHERE style IS NOT NULL AND style != ''"):
+            if row["style"] in PROFILE_STYLES and row["style"] != "booster":
+                discipline_query("INSERT OR IGNORE INTO owned_themes (guild_id, user_id, theme, source, at) VALUES (?, ?, ?, 'shop', ?)",
+                                 (row["guild_id"], row["user_id"], row["style"], now), write=True)
+    except Exception as error:
+        print(f"Owned themes backfill failed: {error}")
+
+
+def owned_themes(guild_id: int, user_id: int):
+    try:
+        rows = discipline_query("SELECT theme FROM owned_themes WHERE guild_id = ? AND user_id = ? ORDER BY at", (guild_id, user_id))
+    except sqlite3.OperationalError:
+        return []
+    order = list(PROFILE_STYLES)
+    return sorted({r["theme"] for r in rows if r["theme"] in PROFILE_STYLES}, key=lambda k: order.index(k))
+
+
+def own_theme(guild_id: int, user_id: int, theme: str, source: str = "shop"):
+    discipline_query("INSERT OR IGNORE INTO owned_themes (guild_id, user_id, theme, source, at) VALUES (?, ?, ?, ?, ?)",
+                     (guild_id, user_id, theme, source, int(time.time())), write=True)
+
+
+def remove_owned_theme(guild_id: int, user_id: int, theme: str):
+    discipline_query("DELETE FROM owned_themes WHERE guild_id = ? AND user_id = ? AND theme = ?", (guild_id, user_id, theme), write=True)
+    raw = discipline_query("SELECT style FROM fighter_cosmetics WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    if raw and raw[0]["style"] == theme:
+        set_cosmetic(guild_id, user_id, style=None)
+
+
+def switch_theme(guild_id: int, user_id: int, theme):
+    """Use one of your themes (None = no theme). Returns a message."""
+    if theme and theme not in owned_themes(guild_id, user_id):
+        return "❌ You don't own that theme."
+    set_cosmetic(guild_id, user_id, style=theme)
+    if booster_row(guild_id, user_id).get("theme_on"):
+        booster_save(guild_id, user_id, theme_on=0)
+    return (f"🎨 Your profile theme is now **{PROFILE_STYLES[theme]}** on Discord and the website." if theme
+            else "🎨 Theme off. Your profile is back to PFO black and gold.")
+
+
+def current_theme_raw(guild_id: int, user_id: int):
+    try:
+        rows = discipline_query("SELECT style FROM fighter_cosmetics WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    except sqlite3.OperationalError:
+        return None
+    return rows[0]["style"] if rows else None
+
+
+@bot.tree.command(name="givetheme", description="Moderator+: give (or take back) a profile theme, or every theme, for free.")
+@app_commands.describe(member="Who gets it", theme="Which theme (or All themes)", remove="Take it away instead")
+@app_commands.choices(theme=[app_commands.Choice(name="All themes", value="all")] +
+                      [app_commands.Choice(name=PROFILE_STYLES[k], value=k) for k in GIVEABLE_THEMES])
+async def givetheme(interaction: discord.Interaction, member: discord.Member, theme: app_commands.Choice[str], remove: bool = False):
+    if not is_moderator_plus(interaction):
+        await interaction.response.send_message("❌ Only Moderators and above can give themes.", ephemeral=True)
+        return
+    keys = GIVEABLE_THEMES if theme.value == "all" else [theme.value]
+    names = ", ".join(PROFILE_STYLES[k] for k in keys)
+    if remove:
+        for key in keys:
+            remove_owned_theme(interaction.guild.id, member.id, key)
+        await interaction.response.send_message(f"🗑️ Took **{names}** away from **{member.display_name}**.", ephemeral=True)
+        return
+    for key in keys:
+        own_theme(interaction.guild.id, member.id, key, f"given:{interaction.user.id}")
+    await interaction.response.send_message(
+        f"✅ Gave **{member.display_name}** {'every theme: ' if theme.value == 'all' else ''}**{names}**. Nothing was charged.\n"
+        f"-# They can switch between them in 🎒 My items (/shop) or My PFO on the website.", ephemeral=True)
+
 
 # ---------------- theme banners ----------------
 # A Profile Theme also gets its own colour of the /profile banner. The website
@@ -23745,7 +24684,7 @@ PROFILE_THEME_COLOURS = {"crimson": 0xD2453A, "ice": 0x6CC6EA, "emerald": 0x3FBF
 # uploaded. If the website isn't running, /profile keeps the normal banner.
 # (Pillow HSV hue 0-255, saturation boost)
 PROFILE_THEME_TINTS = {"crimson": (2, 1.15), "ice": (138, 1.0), "emerald": (104, 1.05), "neon": (213, 1.35),
-                       "royal": (178, 1.15), "blackout": (None, 0), "booster": (218, 1.3)}
+                       "royal": (178, 1.15), "blackout": (None, 0), "booster": (218, 1.3), "freedom": ("freedom", 1.0)}
 
 
 def website_running():
@@ -23783,7 +24722,27 @@ def themed_banner_gif(source: bytes, theme: str) -> bytes:
             fade = Image.linear_gradient("L").rotate(90).resize((w, h))
             fade = fade.point(lambda v: int(v * 0.30))
             glow = Image.composite(Image.new("RGB", (w, h), rgb), Image.new("RGB", (w, h), (0, 0, 0)), fade)
-        if hue is None:
+        if hue == "freedom":
+            if glow is not None and not isinstance(glow, tuple):
+                w, h = img.size
+                # Navy star field on the left, red and white stripes on the right, the banner showing through.
+                over = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+                od = ImageDraw.Draw(over)
+                stripe = max(4, h // 8)
+                for i, y in enumerate(range(0, h, stripe)):
+                    od.rectangle([int(w * 0.36), y, w, y + stripe], fill=(184, 32, 46, 200) if i % 2 == 0 else (245, 240, 228, 120))
+                od.rectangle([0, 0, int(w * 0.38), h], fill=(10, 34, 71, 230))
+                step = max(10, h // 9)
+                for y in range(step // 2, h, step):
+                    for x in range(step // 2 + (step // 2 if (y // step) % 2 else 0), int(w * 0.38), step):
+                        od.ellipse([x - 1.5, y - 1.5, x + 1.5, y + 1.5], fill=(255, 255, 255, 170))
+                glow = (over,)
+            # Only over the dark background, so the banner's own text and logo stay clear.
+            dark = img.convert("L").point(lambda v: 255 if v < 55 else (0 if v > 125 else int(255 * (125 - v) / 70)))
+            layer = glow[0].copy()
+            layer.putalpha(ImageChops.multiply(glow[0].getchannel("A"), dark))
+            img = Image.alpha_composite(img.convert("RGBA"), layer).convert("RGB")
+        elif hue is None:
             grey = img.convert("L").point(lambda v: min(255, int((v - 128) * 1.15 + 128)) if v > 0 else 0)
             img = Image.merge("RGB", (grey, grey, grey))
         else:
@@ -24619,6 +25578,8 @@ async def buy_item(interaction: discord.Interaction, item: str, target=None, cho
         return "❌ Pick a badge."
     if item == "profile_style" and choice not in PROFILE_THEMES:
         return "❌ Pick a theme."
+    if item == "profile_style" and choice in owned_themes(guild.id, user.id):
+        return f"❌ You already own **{PROFILE_STYLES[choice]}**. Switch to it in 🎒 My items."
     if item == "name_colour" and choice not in NAME_COLOURS:
         return "❌ Pick a colour."
 
@@ -24728,6 +25689,7 @@ async def use_item(interaction: discord.Interaction, item_id: int, choice: str =
         if choice not in PROFILE_THEMES:
             return "❌ Pick a theme."
         set_cosmetic(guild.id, row["user_id"], style=choice)
+        own_theme(guild.id, row["user_id"], choice, "shop")
         if booster_row(guild.id, row["user_id"]).get("theme_on"):
             booster_save(guild.id, row["user_id"], theme_on=0)     # their new theme shows instead of the Booster one
         set_item(item_id, status="used", data={"style": choice})
@@ -25040,8 +26002,16 @@ class ShopPanel(
             extras.append(f"🏅 Badge: **{cosmetics['badge']}**")
         if cosmetics.get("quote"):
             extras.append(f"💬 Quote: *“{cosmetics['quote']}”*")
-        if cosmetics.get("style"):
-            extras.append(f"✨ Profile theme: **{PROFILE_STYLES.get(cosmetics['style'], cosmetics['style'])}** (Discord and website)")
+        mine = owned_themes(self.guild.id, self.user_id)
+        using = current_theme_raw(self.guild.id, self.user_id)
+        if cosmetics.get("style") == "booster":
+            using = "booster"
+        if mine or using:
+            extras.append(f"🎨 **My themes ({len(mine)})** · switch with the menu below")
+            for key in mine:
+                extras.append(f"{'✅' if key == using else '·'} {PROFILE_STYLES[key]}{' (using)' if key == using else ''}")
+            if using == "booster":
+                extras.append("✅ Booster (using, from /boosterperks)")
 
         bounty = open_bounty_total(self.guild.id, self.user_id)
         if bounty:
@@ -25087,6 +26057,16 @@ class ShopPanel(
                                          options=[discord.SelectOption(label=labels[c], value=c) for c in choices], row=1)
                 pick.callback = self.use_with_choice
                 self.add_item(pick)
+
+        mine = owned_themes(self.guild.id, self.user_id)
+        if mine:
+            using = current_theme_raw(self.guild.id, self.user_id)
+            options = [discord.SelectOption(label=PROFILE_STYLES[key], value=key, emoji="🎨", default=key == using,
+                                            description="Using now" if key == using else None) for key in mine[:24]]
+            options.append(discord.SelectOption(label="No theme (PFO black and gold)", value="none", default=not using))
+            themes = discord.ui.Select(placeholder="🎨 Change theme…", options=options, row=2)
+            themes.callback = self.pick_theme
+            self.add_item(themes)
 
         back = discord.ui.Button(label="Back to shop", style=discord.ButtonStyle.grey, row=4)
         back.callback = self.back_to_shop
@@ -25217,6 +26197,12 @@ class ShopPanel(
         item_id = int(self.item[4:])
         message = await use_item(interaction, item_id, interaction.data["values"][0])
         self.item = None
+        self.build()
+        await interaction.response.edit_message(embed=self.mine_embed(message), view=self)
+
+    async def pick_theme(self, interaction):
+        value = interaction.data["values"][0]
+        message = switch_theme(self.guild.id, self.user_id, None if value == "none" else value)
         self.build()
         await interaction.response.edit_message(embed=self.mine_embed(message), view=self)
 
@@ -28973,6 +29959,9 @@ async def setup_hook():
     setup_card_edit_table()
     setup_archetype_table()
     setup_booster_table()
+    setup_owned_theme_table()
+    setup_profile_pref_table()
+    setup_profile_title_table()
     setup_ask_table()
     setup_away_table()
     setup_name_start_table()
@@ -34966,7 +35955,7 @@ async def replacefight(interaction: discord.Interaction, fight: str, replacing: 
     if opponent_id:
         opp_name = name_without_record(opponent.display_name) if opponent else "Your opponent"
         opponent_text = f"**{opp_name}** (<@{opponent_id}>)"
-    embed = create_selection_dm_embed(notice["kind"], event=notice["event"], event_date=notice["event_date"],
+    embed = create_selection_dm_embed(notice["kind"], event=notice["event"], event_date=notice["event_date"], venue=notice_venue(notice),
                                       deadline=notice["deadline"], opponent_text=opponent_text, spot=spot)
     embed.title = "🔁 You're in as a replacement!"
     embed.description = (f"You're replacing **{name_without_record(replacing.display_name)}** on this card.\n\n"

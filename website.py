@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "33"
+SITE_VERSION = "34"
 _THEME_BANNERS = {}
 COMMENTARY_ROLE = os.getenv("COMMENTARY_ROLE", "[COMMENTARY]").strip()    # who can open /commentary (plus Helper+)             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
@@ -1449,6 +1449,9 @@ def render_fighter(ctx, user_id):
     try:
         if "is_booster" in ctx.g and ctx.is_booster(ctx.gid, user_id):
             badge_html += '<span class="fboost" title="Server Booster">💎 BOOSTER</span>'
+        if "get_profile_titles" in ctx.g:
+            for title_name, title_emoji in ctx.get_profile_titles(ctx.gid, user_id):
+                badge_html += f'<span class="ftitle">{esc(title_emoji)} {esc(title_name.upper())}</span>'
     except Exception:
         pass
     style_cls = f' fstyle-{esc(cosmetics["style"])}' if cosmetics.get("style") else ""
@@ -1801,6 +1804,20 @@ def chip(label, value, cls=""):
     return f'<div class="evchip {cls}"><span class="evchip-l">{esc(label)}</span><span class="d evchip-v">{value}</span></div>'
 
 
+def venue_chip(venue):
+    """📍 chip for a card's venue (from the sign-up), or nothing."""
+    return chip("📍 VENUE", esc(venue), "gold") if venue else ""
+
+
+def event_venue(ctx, name):
+    try:
+        rows = ctx.q("SELECT venue FROM card_notices WHERE guild_id = ? AND event = ? AND venue IS NOT NULL ORDER BY id DESC LIMIT 1",
+                     (ctx.gid, name))
+        return rows[0]["venue"] if rows else None
+    except Exception:
+        return None
+
+
 def render_event(ctx, slug):
     name = find_event(ctx, slug)
     if not name:
@@ -1898,6 +1915,7 @@ def render_event(ctx, slug):
              + '</nav>')
 
     strip = "".join([
+        venue_chip(event_venue(ctx, display)),
         chip("FIGHTS", len(fights)),
         chip("FINISHES", finishes, "gold"),
         chip("ROUND 1 FINISHES", r1),
@@ -2129,6 +2147,7 @@ def render_live(ctx):
   </div>{live_tape(ctx, a, b, cache) if not cancelled else ''}"""
 
     extra = (f'<div class="evchips l-up">{chip("STATUS", esc(status), "red" if status == "LIVE NOW" else "gold")}'
+             f'{venue_chip(row_get(notice, "venue"))}'
              f'{chip("RESULTS IN", f"{len(by_pair)}/{len(on_card)}")}'
              + (chip("CANCELLED", str(len(layout) - len(on_card)), "red") if len(on_card) < len(layout) else "")
              + (chip("STARTS" if not started else "STARTED", when_html(when)) if when else "") + '</div>')
@@ -2495,6 +2514,7 @@ def render_commentary(ctx, viewer, query):
         for n in notices)
     status = "FINISHED" if not pending else ("LIVE NOW" if started else "UP NEXT")
     extra = (f'<div class="evchips l-up">{chip("STATUS", esc(status), "red" if status == "LIVE NOW" else "gold")}'
+             f'{venue_chip(row_get(notice, "venue"))}'
              f'{chip("FIGHTS", str(count))}{chip("RESULTS IN", f"{len(by_pair)}/{count - len(called_off)}")}</div>')
     body = page_hero("COMMENTARY DESK", name.upper(), "MIC", extra) + f"""
 <div class="wrap">
@@ -3698,6 +3718,17 @@ img{max-width:100%}
 .fstyle-booster{background:radial-gradient(70% 90% at 15% 30%,rgba(244,127,255,.22),rgba(88,101,242,.1) 45%,rgba(8,8,10,0) 65%)}
 .fstyle-booster .fhero-name{color:#FFE9FF;text-shadow:0 0 22px rgba(244,127,255,.4)}
 .ftheme-booster{--gold:#F47FFF;--gold2:#FFC2FF}
+.ftitle{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;color:#fff;background:linear-gradient(90deg,#B8202E,#0A2247);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:3px 11px;margin-left:6px;vertical-align:middle}
+/* Freedom 13: stars and stripes across the whole fighter box */
+.fstyle-freedom{background:linear-gradient(180deg,rgba(10,34,71,.93),rgba(10,34,71,.78) 70%,rgba(8,8,10,.95)),repeating-linear-gradient(180deg,#B8202E 0 26px,#F5F0E4 26px 52px);border-bottom:3px solid #B8202E;position:relative}
+.fstyle-freedom::before{content:"";position:absolute;inset:0 55% 0 0;background-image:radial-gradient(circle,#fff 0 1.3px,transparent 1.7px);background-size:24px 24px;opacity:.28;pointer-events:none}
+.fstyle-freedom::after{content:"★ FREEDOM 13 ★";position:absolute;right:max(16px,4vw);top:18px;font:800 12px Inter,system-ui,sans-serif;letter-spacing:.24em;color:#E9C878;pointer-events:none}
+.fstyle-freedom .fhero-name{color:#fff;text-shadow:0 3px 0 #B8202E,0 10px 24px rgba(0,0,0,.5)}
+.fstyle-freedom .av-hero{box-shadow:0 0 0 3px #fff,0 0 0 7px #B8202E,0 0 0 10px #13336B}
+.ftheme-freedom{--gold:#E0414F;--gold2:#F5F0E4}
+.ftheme-freedom .ftile,.ftheme-freedom .tile{box-shadow:inset 0 3px 0 #E0414F}
+.ftheme-freedom .ftile:nth-child(2n),.ftheme-freedom .tile:nth-child(2n){box-shadow:inset 0 3px 0 #F5F0E4}
+.ftheme-freedom .ftile:nth-child(3n),.ftheme-freedom .tile:nth-child(3n){box-shadow:inset 0 3px 0 #4C7BD9}
 .fboost{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;color:#FFC2FF;background:rgba(244,127,255,.14);border:1px solid rgba(244,127,255,.5);border-radius:999px;padding:3px 10px;margin-left:6px;vertical-align:middle}
 /* Profile Theme across the whole fighter page: accents, tabs, numbers and links use the theme colour */
 .ftheme-crimson{--gold:#E5534B;--gold2:#FF9A92}
@@ -3813,6 +3844,13 @@ img{max-width:100%}
 .lt-r .sbform{margin:0}
 .lt-f{margin:10px 0 0;text-align:center;font-size:13px}.lt-f a{color:var(--gold2,#E2C27A)}
 @media (max-width:520px){.lt-r{font-size:13px;gap:4px}.lt-r .sbform .pill{min-width:16px;padding:0 2px}}
+.mythemes{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
+.mytheme{background:var(--panel,#0C0C0F);border:1px solid var(--line2,#24242A);border-radius:12px;padding:10px;display:flex;flex-direction:column;gap:8px;align-items:stretch}
+.mytheme.on{border-color:var(--gold);box-shadow:0 0 0 1px var(--gold)}
+.mytheme.locked{opacity:.5}
+.mt-sw{height:44px;border-radius:8px;display:block}
+.mytheme b{font-size:18px;line-height:1}
+.mytheme .btn{justify-content:center;text-align:center}
 .snotes{margin-top:22px}
 .snotes-in{border:1px solid rgba(240,122,126,.35);background:linear-gradient(180deg,rgba(240,122,126,.06),rgba(240,122,126,0) 140px);border-radius:14px;padding:18px;display:flex;flex-direction:column;gap:14px}
 .snotes-h{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
@@ -5694,6 +5732,8 @@ CARDS_JS = r"""
     }
     b = e.target.closest('[data-trade]');
     if (b) { post('/api/cards/trade/respond', { trade_id: b.getAttribute('data-trade'), action: b.getAttribute('data-a') }, b, true); return; }
+    b = e.target.closest('[data-usetheme]');
+    if (b) { post('/api/themes/use', { theme: b.getAttribute('data-usetheme') }, b, true); return; }
     b = e.target.closest('[data-upgrade]');
     if (b) {
       if (b.getAttribute('data-sure') !== '1') { b.setAttribute('data-sure', '1'); b.textContent = 'TAP AGAIN · ' + (+b.getAttribute('data-price')).toLocaleString() + ' COINS'; return; }
@@ -7277,6 +7317,37 @@ def render_me(ctx, viewer, query):
     except Exception:
         traceback.print_exc()
 
+    # ---------- my themes ----------
+    if "owned_themes" in ctx.g:
+        try:
+            mine = ctx.owned_themes(gid, uid)
+            using = ctx.current_theme_raw(gid, uid)
+            colours = dict(ctx.PROFILE_THEME_COLOURS)
+            tiles = ""
+            order = [k for k in ctx.PROFILE_STYLES if k not in ("gold", "glow", "booster")]
+            for key in order + [None]:
+                owned = key is None or key in mine
+                name = ctx.PROFILE_STYLES[key] if key else "No theme"
+                if key == "freedom":
+                    swatch = "linear-gradient(90deg,#0A2247 40%,#B8202E 40% 55%,#F5F0E4 55% 70%,#B8202E 70% 85%,#F5F0E4 85%)"
+                elif key:
+                    swatch = "#%06X" % colours.get(key, 0xC9A24A)
+                else:
+                    swatch = "#C9A24A"
+                on = (key or None) == (using or None)
+                if not owned:
+                    button = ('<a class="btn btn-ghost btn-sm" href="/shop">IN THE SHOP</a>' if key in ctx.PROFILE_THEMES
+                              else '<span class="muted small">Staff or winners only</span>')
+                else:
+                    button = (f'<button class="btn btn-sm {"btn-gold" if on else "btn-ghost"}" type="button" data-usetheme="{esc(key or "none")}"'
+                              f'{" disabled" if on else ""}>{"USING" if on else "USE"}</button>')
+                tiles += (f'<div class="mytheme{" on" if on else ""}{"" if owned else " locked"}"><span class="mt-sw" style="background:{swatch}"></span>'
+                          f'<b class="d">{esc(name.upper())}</b>{button}</div>')
+            blocks.append(("MY THEMES", "themes", f'<div class="mythemes">{tiles}</div>'
+                           '<p class="note">Your theme changes your /profile in Discord and your fighter page here. Switch any time, free.</p>'))
+        except Exception:
+            traceback.print_exc()
+
     # ---------- awards ----------
     try:
         awards = ctx.awards_for_member(gid, uid)
@@ -8845,6 +8916,17 @@ def add_page_routes(app, bot, g, serve, html_response):
         g["discipline_query"]("UPDATE card_packs SET decided = ? WHERE id = ?", ("sell" if body.get("decision") == "sell" else "keep", pack_id), write=True)
         return {"ok": True, "message": message, "balance": g["get_wallet"](gd.id, viewer.user_id)["balance"]}
 
+    @action_route(bot, g, bucket="themes", limit=20, window=60)
+    async def use_theme(viewer, body, request):
+        gd = guild()
+        if "switch_theme" not in g:
+            raise ActionError("Themes aren't switched on yet.")
+        key = str(body.get("theme") or "")
+        message = g["switch_theme"](gd.id, viewer.user_id, None if key == "none" else key)
+        if message.startswith("❌"):
+            raise ActionError(message.replace("❌ ", ""))
+        return {"ok": True, "message": message.replace("🎨 ", "").replace("**", "")}
+
     @action_route(bot, g, bucket="cards", limit=20, window=60)
     async def cards_upgrade(viewer, body, request):
         gd = guild()
@@ -9114,7 +9196,7 @@ def add_page_routes(app, bot, g, serve, html_response):
                           ("/theme-banner/{theme}.gif", theme_banner),
                           ("/api/cards/of", cards_of)):
         app.router.add_get(path, handler)
-    for path, handler in (("/api/cards/pack", cards_pack), ("/api/cards/sell", cards_sell_spares), ("/api/cards/upgrade", cards_upgrade),
+    for path, handler in (("/api/cards/pack", cards_pack), ("/api/cards/sell", cards_sell_spares), ("/api/cards/upgrade", cards_upgrade), ("/api/themes/use", use_theme),
                           ("/api/spin", daily_spin), ("/api/cards/trade", cards_trade),
                           ("/api/cards/trade/respond", cards_trade_respond)):
         app.router.add_post(path, handler)
