@@ -4717,7 +4717,7 @@ PROFILE_DESIGNS = {
     "booster": ((244, 127, 255), (255, 194, 255), (29, 15, 51), (16, 8, 32), (6, 4, 13), (244, 127, 255), (59, 42, 138),
                 (30, 16, 52), (255, 233, 255), (91, 42, 138), ("boost", "lines"), "BOOSTER"),
     "freedom": ((233, 200, 120), (233, 200, 120), (11, 37, 80), (8, 29, 63), (19, 10, 30), (255, 255, 255), (184, 32, 46),
-                (8, 29, 63), (255, 255, 255), (184, 32, 46), ("stars", "stripes", "fireworks", "rail"), "FREEDOM 13"),
+                (8, 29, 63), (255, 255, 255), (184, 32, 46), ("stars", "stripes", "fireworks", "rail"), "FREEDOM 12"),
 }
 PROFILE_W, PROFILE_H = 1400, 920
 _EMOJI_RE = re.compile("[\U00010000-\U0010FFFF☀-➿️‍⬀-⯿]")
@@ -21503,7 +21503,7 @@ BELT_CHOICES = [
     app_commands.Choice(name="Interim Champion", value="interim"),
     app_commands.Choice(name="BMF (Baddest Motherfucker)", value="bmf"),
     app_commands.Choice(name="WMF (Worst Motherfucker)", value="wmf"),
-    app_commands.Choice(name="Freedom 13 Winner (permanent, on profile, no weight)", value="freedom13"),
+    app_commands.Choice(name="Freedom 12 Winner (permanent, on profile, no weight)", value="freedom13"),
 ]
 
 
@@ -21564,7 +21564,7 @@ def belt_title(weight: str, belt: str):
 # Event belts that stay on someone's profile for good, given with /belt
 # (no weight class). Shown on /profile, the website, Tale of the Tape and
 # the Hall of Fame. Not on rankings.
-PROFILE_TITLES = {"freedom13": ("Freedom 13 Winner", "🏆", "freedom")}    # key: (name, emoji, theme it comes with)
+PROFILE_TITLES = {"freedom13": ("Freedom 12 Winner", "🏆", "freedom")}    # key: (name, emoji, theme it comes with)
 
 
 def setup_profile_title_table():
@@ -21594,12 +21594,12 @@ def get_profile_titles(guild_id: int, user_id: int):
 
 @bot.tree.command(
     name="belt",
-    description="Give or take a belt: Interim, BMF or WMF in a division, or a permanent title like Freedom 13 Winner."
+    description="Give or take a belt: Interim, BMF or WMF in a division, or a permanent title like Freedom 12 Winner."
 )
 @app_commands.describe(
     action="Give or remove",
     belt="Which belt",
-    weight="Which division (not needed for Freedom 13 Winner)",
+    weight="Which division (not needed for Freedom 12 Winner)",
     fighter="Who gets it (only needed when giving)"
 )
 @app_commands.choices(
@@ -24579,7 +24579,7 @@ BADGES = ["The Finisher", "Knockout Artist", "Sub Specialist", "Underdog King", 
 
 # Every theme someone can have (gold frame and glow were sold before themes, and still work for them).
 PROFILE_STYLES = {"gold": "Gold frame", "glow": "Gold glow", "crimson": "Crimson", "ice": "Ice", "emerald": "Emerald",
-                  "neon": "Neon", "royal": "Royal", "blackout": "Blackout", "booster": "Booster", "freedom": "Freedom 13"}
+                  "neon": "Neon", "royal": "Royal", "blackout": "Blackout", "booster": "Booster", "freedom": "Freedom 12"}
 # The ones on sale now (Profile Theme in the shop).
 PROFILE_THEMES = {key: PROFILE_STYLES[key] for key in ("crimson", "ice", "emerald", "neon", "royal", "blackout")}
 # The /profile embed colour for each theme (no theme: PFO gold).
@@ -24589,7 +24589,7 @@ PROFILE_THEME_COLOURS = {"crimson": 0xD2453A, "ice": 0x6CC6EA, "emerald": 0x3FBF
 # ---------------- owned themes ----------------
 #
 # Every Profile Theme someone gets stays theirs: bought in the shop, given by
-# staff (/givetheme) or won (Freedom 13 Winner gets Freedom 13). They switch
+# staff (/givetheme) or won (Freedom 12 Winner gets Freedom 12). They switch
 # between them any time from 🎒 My items in /shop or My PFO on the website.
 # Themes bought before this was added are found from shop history.
 # (The Booster theme is separate: it's on/off in /boosterperks while boosting.)

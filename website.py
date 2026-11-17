@@ -63,7 +63,7 @@ DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET", "").strip()
 LOGIN_ON = bool(SITE_URL and DISCORD_CLIENT_ID and DISCORD_CLIENT_SECRET)
 TWITCH_URL = os.getenv("TWITCH_URL", "").strip()
 WEBSITE_ON = os.getenv("WEBSITE", "on").strip().lower() not in ("off", "no", "false", "0")
-SITE_VERSION = "34"
+SITE_VERSION = "36"
 _THEME_BANNERS = {}
 COMMENTARY_ROLE = os.getenv("COMMENTARY_ROLE", "[COMMENTARY]").strip()    # who can open /commentary (plus Helper+)             # theme -> (made at, gif bytes); the bot only uses a themed banner once it's here            # bump if the styles change and browsers keep the old ones
 CACHE_SECONDS = 60            # each page is rebuilt at most once a minute
@@ -2525,9 +2525,508 @@ def render_commentary(ctx, viewer, query):
       {'<a class="btn btn-gold btn-sm" href="#up-next">JUMP TO THE FIGHT UP NEXT</a>' if up_next is not None else ''}</div>
   </section>
   <section class="block ccard" aria-label="The card, prelims first">{rows}</section>
+  {overlay_controls(ctx, notice, layout, by_pair, called_off)}
   <p class="note">Only Helpers and above and the [COMMENTARY] role can see this page. Results show as they're logged; refresh for the latest.</p>
 </div>"""
     return page(ctx, f"{name} · Commentary", "", body, f"Commentary desk for {name}.")
+
+
+# ============================================================
+# STREAM OVERLAYS  /overlay  (OBS browser source, 1920x1080)
+#
+# One link for OBS. It shows whatever staff pick on the commentary desk:
+# lower third (red or blue corner), tale of the tape, the full card, the
+# result, or nothing. Fights can be picked in any order. With "auto
+# result" on, the result pops up by itself when it's logged.
+# /overlay?only=card keeps the card on screen whatever is picked (for a
+# scene of its own). Everything fills itself from the bot.
+# ============================================================
+
+OVERLAY_SHOWS = ("lt-a", "lt-b", "tt", "card", "result", "off")
+_OVERLAY_CACHE = {}
+
+
+def overlay_state(ctx):
+    try:
+        rows = ctx.q("SELECT * FROM overlay_state WHERE guild_id = ?", (ctx.gid,))
+    except Exception:
+        rows = []
+    if rows:
+        r = rows[0]
+        return {"card_id": r["card_id"], "pair": r["pair"] or "", "show": r["show"] or "lt-a", "swap": bool(r["swap"]),
+                "auto": bool(r["auto"]), "at": r["updated_at"] or 0}
+    return {"card_id": None, "pair": "", "show": "lt-a", "swap": False, "auto": True, "at": 0}
+
+
+def _ov_pair_key(a, b):
+    return "-".join(str(x) for x in sorted((a or 0, b or 0)))
+
+
+def overlay_card(ctx, card_id=None):
+    """(notice, layout) for the card the overlay follows."""
+    notice = None
+    if card_id:
+        found = ctx.q("SELECT * FROM card_notices WHERE guild_id = ? AND id = ?", (ctx.gid, card_id))
+        notice = found[0] if found else None
+    if notice is None:
+        notice = live_notice(ctx)
+    if notice is None:
+        found = ctx.q("SELECT * FROM card_notices WHERE guild_id = ? ORDER BY id DESC LIMIT 1", (ctx.gid,))
+        notice = found[0] if found else None
+    return notice, (list(ctx.notice_layout(notice)) if notice else [])
+
+
+def overlay_payload(ctx):
+    """Everything the overlay draws, as JSON. Cached for a couple of seconds."""
+    state = overlay_state(ctx)
+    key = (ctx.gid, state["at"])
+    hit = _OVERLAY_CACHE.get(ctx.gid)
+    if hit and hit[0] == key and time.time() - hit[1] < 2.5:
+        return hit[2]
+    gid = ctx.gid
+    notice, layout = overlay_card(ctx, state["card_id"])
+    out = {"show": state["show"], "auto": state["auto"], "swap": state["swap"], "event": "", "venue": "", "fight_no": 0,
+           "total": 0, "now": None, "card": []}
+    if not notice or not layout:
+        _OVERLAY_CACHE[gid] = (key, time.time(), out)
+        return out
+    out["event"] = row_get(notice, "event") or ("Live Card" if notice["kind"] == "live_card" else "Fight Night")
+    out["venue"] = row_get(notice, "venue") or ""
+    out["card_id"] = notice["id"]
+    called_off = card_cancelled(ctx, notice)
+    logged, _ = ctx.notice_fights(gid, notice) if getattr(ctx, "notice_fights", None) else ([], len(layout))
+    by_pair = {}
+    for f in logged:
+        by_pair.setdefault(frozenset((f["winner_id"], f["loser_id"])), f)
+    count = len(layout)
+    pending = [i for i, (a, b, _) in enumerate(layout) if frozenset((a, b)) not in by_pair and frozenset((a, b)) not in called_off]
+    keys = [_ov_pair_key(a, b) for a, b, _ in layout]
+    now_i = keys.index(state["pair"]) if state["pair"] in keys else (pending[-1] if pending else 0)
+    try:
+        titles = {r["pair"] for r in ctx.q("SELECT pair FROM commentary_titles WHERE guild_id = ? AND card_id = ?", (gid, notice["id"]))}
+    except Exception:
+        titles = set()
+
+    # Sportsbook odds for the card
+    odds_by_pair = {}
+    try:
+        for m in ctx.q("SELECT * FROM bet_markets WHERE guild_id = ? ORDER BY (status = 'open') DESC, id DESC LIMIT 6", (gid,)):
+            for bout in ctx.market_bouts(m["id"]):
+                pair = frozenset((bout["fighter_a"], bout["fighter_b"]))
+                if pair in odds_by_pair:
+                    continue
+                try:
+                    live = ctx.live_odds(bout)
+                    odds_by_pair[pair] = {bout["fighter_a"]: live["a"], bout["fighter_b"]: live["b"]}
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    cache = {}
+
+    def odds_of(pair, uid):
+        value = odds_by_pair.get(pair, {}).get(uid)
+        return f"{value:.2f}" if value else ""
+
+    # The card, main event first
+    for i, (a, b, spot) in enumerate(layout):
+        label = spot_label(spot)
+        pair = frozenset((a, b))
+        fight = by_pair.get(pair)
+        sa, sb = stats_for(ctx, a, cache), stats_for(ctx, b, cache)
+        res_side = res_text = ""
+        if fight:
+            if fight["method"] in ("DRAW", "NC"):
+                res_text = method_short(ctx, fight)
+            else:
+                res_side = "a" if fight["winner_id"] == a else "b"
+                res_text = method_short(ctx, fight).replace(" · ", " ").replace("KO/TKO", "KO").replace("DECISION", "DEC")
+        out["card"].append({
+            "a": clean_name(ctx, fighter_name(ctx, a)), "b": clean_name(ctx, fighter_name(ctx, b)),
+            "ar": ctx.stats_record(sa) if sa else "0-0-0", "br": ctx.stats_record(sb) if sb else "0-0-0",
+            "oa": odds_of(pair, a), "ob": odds_of(pair, b),
+            "sec": "MAIN CARD" if label in ("MAIN EVENT", "CO-MAIN EVENT", "MAIN CARD") else label,
+            "now": i == now_i, "done": bool(fight), "cancelled": pair in called_off and not fight,
+            "res_side": res_side, "res": res_text, "pair": keys[i],
+        })
+
+    # The fight on now, in detail
+    a, b, spot = layout[now_i]
+    label = spot_label(spot)
+    pair = frozenset((a, b))
+    ranks_a = ctx.get_user_rankings(gid, a) if a else []
+    ranks_b = ctx.get_user_rankings(gid, b) if b else []
+    weight = None
+    try:
+        weight = ctx.fighter_division(gid, a, ranks_a) or ctx.fighter_division(gid, b, ranks_b)
+    except Exception:
+        pass
+    short = ctx.WEIGHTS.get(weight, "") if weight else ""
+    is_title = label in ("MAIN EVENT", "CO-MAIN EVENT", "MAIN CARD") and keys[now_i] in titles
+    try:
+        strikes = ctx.fight_stat_totals(gid)
+    except Exception:
+        strikes = {}
+
+    def fighter(uid, ranks, odds):
+        s = stats_for(ctx, uid, cache) or {}
+        bits = []
+        div = [r for r in ranks if r["weight"] == weight] if weight else []
+        if div:
+            bits.append(("C " if div[0]["rank"] == 0 else f"#{div[0]['rank']} ") + short)
+        p4p = [r for r in ranks if r["weight"] == ctx.P4P_WEIGHT]
+        if p4p:
+            bits.append(f"#{p4p[0]['rank']} P4P")
+        champ = bool(div and div[0]["rank"] == 0)
+        arch = ""
+        if "get_archetype" in ctx.g and uid:
+            k = ctx.get_archetype(gid, uid)
+            arch = ctx.ARCHETYPES[k][1] if k else ""
+        strip = []
+        if "get_profile_titles" in ctx.g and uid:
+            try:
+                strip += [f"★ {name.upper()}" for name, _ in ctx.get_profile_titles(gid, uid)]
+            except Exception:
+                pass
+        if champ:
+            strip.insert(0, f"★ {(weight or '').upper()} CHAMPION")
+        total = s.get("wins", 0) + s.get("losses", 0) + s.get("draws", 0)
+        if total == 0:
+            strip.append("PFO DEBUT")
+        if s.get("finish_rate") is not None and s.get("wins"):
+            strip.append(f"{s['finish_rate']}% FINISH RATE")
+        ko, sub = s.get("wins_by", {}).get("KO/TKO", 0), s.get("wins_by", {}).get("SUB", 0)
+        if ko:
+            strip.append(f"{ko} KO WIN{'S' if ko != 1 else ''}")
+        if sub:
+            strip.append(f"{sub} SUB WIN{'S' if sub != 1 else ''}")
+        t = strikes.get(uid) or {}
+        n = t.get("fights") or 0
+        last = []
+        for f in list(reversed(s.get("fights") or []))[:3]:
+            if f["method"] in ("DRAW", "NC"):
+                last.append("D")
+            else:
+                last.append("W" if ctx.fight_is_win_for(f, uid) else "L")
+        return {
+            "name": clean_name(ctx, fighter_name(ctx, uid)), "record": ctx.stats_record(s) if s else "0-0-0",
+            "ranks": " · ".join(bits) or ("CHAMPION" if champ else "UNRANKED"), "arch": arch, "streak": s.get("streak") or "",
+            "odds": odds, "strip": "   ·   ".join(strip[:4]), "avatar": avatar_url(ctx, uid, 256) or "",
+            "last": " ".join(last),
+            "tape": {
+                "odds": odds or "–",
+                "streak": s.get("streak") or "–",
+                "finish": f"{s['finish_rate']}%" if s.get("finish_rate") is not None else "–",
+                "ko": str(ko),
+                "acc": f"{round(100 * (t.get('sig_landed') or 0) / t['sig_thrown'])}%" if t.get("sig_thrown") else "–",
+                "td": f"{(t.get('td_landed') or 0) / n:.1f}" if n else "–",
+            },
+        }
+
+    fa, fb = fighter(a, ranks_a, odds_of(pair, a)), fighter(b, ranks_b, odds_of(pair, b))
+    fight = by_pair.get(pair)
+    h2h = ctx.q("SELECT id, winner_id, method FROM fights WHERE guild_id = ? AND ((winner_id = ? AND loser_id = ?) OR (winner_id = ? AND loser_id = ?))",
+                (gid, a, b, b, a)) if a and b else []
+    if fight:
+        h2h = [f for f in h2h if f["id"] != fight["id"]]
+    wins_a = sum(1 for f in h2h if f["winner_id"] == a and f["method"] not in ("DRAW", "NC"))
+    wins_b = sum(1 for f in h2h if f["winner_id"] == b and f["method"] not in ("DRAW", "NC"))
+    result = None
+    if fight:
+        if fight["method"] in ("DRAW", "NC"):
+            result = {"id": fight["id"], "side": "", "name": "DRAW" if fight["method"] == "DRAW" else "NO CONTEST",
+                      "how": method_short(ctx, fight), "chips": []}
+        else:
+            side = "a" if fight["winner_id"] == a else "b"
+            ws = stats_for(ctx, fight["winner_id"], cache) or {}
+            how = method_short(ctx, fight).replace("KO/TKO", "KO / TKO").replace(" · R", " · ROUND ")
+            chips = [f"NOW {ctx.stats_record(ws)}" if ws else ""]
+            if ws.get("streak", "").startswith("W"):
+                chips.append(f"{ws['streak']} STREAK")
+            if fight["title_fight"] and weight:
+                chips.append(f"{weight.upper()} CHAMPION")
+            result = {"id": fight["id"], "side": side, "name": (fa if side == "a" else fb)["name"], "how": how, "chips": [c for c in chips if c]}
+    out["fight_no"] = count - now_i
+    out["total"] = count
+    out["now"] = {
+        "pair": keys[now_i], "label": label, "main": label == "MAIN EVENT", "weight": (weight or "").upper(), "title": is_title,
+        "a": fa, "b": fb, "h2h": (f"{wins_a}-{wins_b}" if h2h else ""), "result": result,
+    }
+    _OVERLAY_CACHE[gid] = (key, time.time(), out)
+    return out
+
+
+def overlay_controls(ctx, notice, layout, by_pair, called_off):
+    """The overlay control panel on the commentary desk."""
+    state = overlay_state(ctx)
+    keys = [_ov_pair_key(a, b) for a, b, _ in layout]
+    pending = [i for i, (a, b, _) in enumerate(layout) if frozenset((a, b)) not in by_pair and frozenset((a, b)) not in called_off]
+    same_card = state["card_id"] == notice["id"]
+    now_key = state["pair"] if same_card and state["pair"] in keys else (keys[pending[-1]] if pending else (keys[0] if keys else ""))
+    if not same_card and state["card_id"]:
+        now_key = ""
+    rows = ""
+    for shown, i in enumerate(reversed(range(len(layout))), 1):
+        a, b, _ = layout[i]
+        na, nb = clean_name(ctx, fighter_name(ctx, a)), clean_name(ctx, fighter_name(ctx, b))
+        pair = frozenset((a, b))
+        note = "result logged" if pair in by_pair else ("cancelled" if pair in called_off else "")
+        on = keys[i] == now_key
+        rows += (f'<div class="ovf{" on" if on else ""}{" done" if note else ""}"><span class="ovn d">{shown}</span>'
+                 f'<span class="ovm">{esc(na)} vs {esc(nb)}{f"<small>{note}</small>" if note else ""}</span>'
+                 f'<button class="btn btn-sm {"btn-gold" if on else "btn-ghost"}" type="button" data-ovnow="{esc(keys[i])}" data-card="{notice["id"]}">'
+                 f'{"NOW" if on else "SET AS NOW"}</button></div>')
+    shows = [("lt-a", "Lower third · red"), ("lt-b", "Lower third · blue"), ("tt", "Tale of the Tape"), ("card", "Full card"),
+             ("result", "Result"), ("off", "Hide all")]
+    show_btns = "".join(f'<button class="btn btn-sm {"btn-gold" if state["show"] == k else "btn-ghost"}" type="button" data-ovshow="{k}" '
+                        f'data-card="{notice["id"]}">{esc(t)}</button>' for k, t in shows)
+    other = ('<p class="small muted">The overlay is following a different card. Press SET AS NOW on a fight here to switch it to this one.</p>'
+             if state["card_id"] and not same_card else "")
+    base = (SITE_URL or "").rstrip("/")
+    link = f"{base}/overlay" if base else "/overlay"
+    return f"""
+  <section class="block ovctl" id="overlay">
+    <div class="cm-sec"><h2 class="d">STREAM OVERLAY</h2><span></span></div>
+    <p class="small muted">Add <code class="ovlink">{esc(link)}</code> to OBS as a Browser source (1920×1080). It shows what you pick here,
+      straight away. <code class="ovlink">{esc(link)}?only=card</code> always shows the card.</p>
+    {other}
+    <div class="ovgrid">
+      <div><span class="eyebrow-grey">THE CARD · PICK WHAT'S ON NOW, IN ANY ORDER</span><div class="ovlist">{rows}</div></div>
+      <div><span class="eyebrow-grey">SHOW ON STREAM</span><div class="ovshow">{show_btns}</div>
+        <label class="ovtog"><input type="checkbox" data-ovopt="auto" data-card="{notice["id"]}"{" checked" if state["auto"] else ""}> Auto: show the result when it's logged</label>
+        <label class="ovtog"><input type="checkbox" data-ovopt="swap" data-card="{notice["id"]}"{" checked" if state["swap"] else ""}> Swap red and blue corners</label>
+        <p class="small muted">SET AS NOW only changes what the overlay shows. Results are still logged the normal way.</p>
+      </div>
+    </div>
+  </section>"""
+
+
+OVERLAY_CSS = """
+.ovctl code.ovlink{font:600 12px ui-monospace,Menlo,monospace;background:rgba(127,127,127,.14);padding:2px 6px;border-radius:6px;overflow-wrap:anywhere}
+.ovgrid{display:grid;grid-template-columns:1.4fr 1fr;gap:20px;margin-top:12px}
+@media (max-width:760px){.ovgrid{grid-template-columns:1fr}}
+.ovlist{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+.ovf{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line2,#24242A);border-radius:10px}
+.ovf.on{border-color:var(--gold,#C9A24A);background:rgba(201,162,74,.10)}
+.ovf.done .ovm{opacity:.6}
+.ovn{width:26px;color:var(--muted,#9a9aa5);font-weight:800}
+.ovm{flex:1;min-width:0;font-weight:600;font-size:14px}
+.ovm small{display:block;color:var(--muted,#9a9aa5);font-size:12px;margin-top:2px}
+.ovshow{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:8px 0 12px}
+.ovtog{display:flex;align-items:center;gap:10px;font-size:14px;font-weight:600;margin:8px 0}
+.ovtog input{width:18px;height:18px;accent-color:#C9A24A}
+"""
+
+OVERLAY_CTRL_JS = r"""
+(function () {
+  function send(data, done) {
+    P.post('/api/overlay/set', data).then(function (d) {
+      if (!d || !d.ok) { P.toast((d && d.error) || 'Could not change the overlay.'); return; }
+      P.toast(d.message || 'Overlay updated');
+      if (done) done();
+    });
+  }
+  document.addEventListener('click', function (e) {
+    var t = e.target.closest('[data-ovnow]');
+    if (t) {
+      send({ card_id: t.getAttribute('data-card'), pair: t.getAttribute('data-ovnow') }, function () {
+        document.querySelectorAll('[data-ovnow]').forEach(function (b) {
+          var on = b === t;
+          b.textContent = on ? 'NOW' : 'SET AS NOW';
+          b.classList.toggle('btn-gold', on); b.classList.toggle('btn-ghost', !on);
+          b.closest('.ovf').classList.toggle('on', on);
+        });
+      });
+      return;
+    }
+    t = e.target.closest('[data-ovshow]');
+    if (t) {
+      send({ card_id: t.getAttribute('data-card'), show: t.getAttribute('data-ovshow') }, function () {
+        document.querySelectorAll('[data-ovshow]').forEach(function (b) {
+          var on = b === t;
+          b.classList.toggle('btn-gold', on); b.classList.toggle('btn-ghost', !on);
+        });
+      });
+    }
+  });
+  document.addEventListener('change', function (e) {
+    var t = e.target.closest('[data-ovopt]');
+    if (!t) return;
+    var data = { card_id: t.getAttribute('data-card') };
+    data[t.getAttribute('data-ovopt')] = t.checked;
+    send(data);
+  });
+})();
+"""
+
+OVERLAY_PAGE = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>PFO Overlay</title>
+<meta name="robots" content="noindex">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;1,800&family=Inter:wght@500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--gold:#C9A24A;--gold2:#E9C878;--red:#E5484D;--blue:#3E8BFF;--panel:rgba(10,10,14,.92);--line:rgba(201,162,74,.35);--muted:#a3a6b0}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:transparent;overflow:hidden}
+body{width:1920px;height:1080px;position:relative;font-family:Inter,sans-serif;color:#fff}
+.ov{position:absolute;inset:0;display:none}.ov.on{display:block}
+.logo{width:58px;height:58px;border-radius:50%;background:#050505 center/cover no-repeat;border:3px solid var(--gold);display:grid;place-items:center;font:800 italic 20px "Barlow Condensed";color:#fff}
+.bug{position:absolute;right:48px;top:40px;display:flex;align-items:center;gap:14px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:10px 18px 10px 10px}
+.bug .t{font:800 30px/1 "Barlow Condensed";letter-spacing:.04em;text-transform:uppercase}
+.bug .s{font:700 15px Inter;color:var(--gold2);letter-spacing:.14em;margin-top:4px}
+.live{display:inline-flex;align-items:center;gap:7px;background:#E5484D;color:#fff;font:800 14px Inter;letter-spacing:.12em;padding:4px 9px;border-radius:6px}
+.live i{width:8px;height:8px;border-radius:50%;background:#fff;animation:blink 1.2s infinite}
+@keyframes blink{50%{opacity:.25}}
+.lt{position:absolute;left:90px;bottom:110px;display:flex;align-items:stretch;filter:drop-shadow(0 18px 40px rgba(0,0,0,.6))}
+.lt .corner{width:22px;background:linear-gradient(var(--red),#8f1d22)}
+.lt.blue .corner{background:linear-gradient(var(--blue),#1f4f9c)}
+.lt .av{width:150px;background:#111 center/cover no-repeat;border-right:2px solid var(--line)}
+.lt .main{background:var(--panel);padding:20px 34px 18px 28px;min-width:760px;border-top:1px solid var(--line)}
+.lt .tag{font:800 16px Inter;letter-spacing:.2em;color:var(--gold2)}
+.lt .name{font:800 italic 96px/0.95 "Barlow Condensed";text-transform:uppercase;letter-spacing:.01em;margin:4px 0 6px;white-space:nowrap}
+.lt .meta{display:flex;gap:26px;font:700 26px "Barlow Condensed";letter-spacing:.04em;color:#dfe1e6;text-transform:uppercase}
+.lt .meta b{color:var(--gold2)}
+.lt .side{background:linear-gradient(135deg,#1a1408,#0b0906);border-left:2px solid var(--gold);padding:22px 30px;display:flex;flex-direction:column;justify-content:center;align-items:center;min-width:190px}
+.lt .side .o{font:800 64px/1 "Barlow Condensed";color:var(--gold2)}
+.lt .side .l{font:800 14px Inter;letter-spacing:.2em;color:var(--muted);margin-top:6px}
+.lt .strip{position:absolute;left:22px;right:0;bottom:-34px;height:34px;background:var(--gold);color:#111;display:flex;align-items:center;padding:0 24px;font:800 16px Inter;letter-spacing:.12em;white-space:pre;overflow:hidden}
+.tt{position:absolute;inset:0;background:radial-gradient(ellipse at 50% 40%,rgba(10,10,14,.80),rgba(5,5,8,.95))}
+.tt .head{position:absolute;top:62px;left:0;right:0;text-align:center}
+.tt .kick{font:800 18px Inter;letter-spacing:.32em;color:var(--gold2)}
+.tt .title{font:800 italic 74px/1 "Barlow Condensed";text-transform:uppercase;margin-top:6px}
+.tt .belt{display:inline-block;margin-top:12px;padding:6px 16px;border:2px solid var(--gold);border-radius:999px;font:800 16px Inter;letter-spacing:.2em;color:var(--gold2)}
+.tt .fighters{position:absolute;top:260px;left:110px;right:110px;display:grid;grid-template-columns:1fr 720px 1fr;align-items:start}
+.ft{text-align:center}
+.ft .av{width:250px;height:250px;margin:0 auto 22px;border-radius:50%;background:#333 center/cover no-repeat;box-shadow:0 0 0 8px #0a0a0e,0 0 0 14px var(--red)}
+.ft.b .av{box-shadow:0 0 0 8px #0a0a0e,0 0 0 14px var(--blue)}
+.ft .n{font:800 italic 60px/0.95 "Barlow Condensed";text-transform:uppercase}
+.ft .r{font:700 30px "Barlow Condensed";color:var(--gold2);margin-top:6px;letter-spacing:.04em}
+.ft .rk{font:700 18px Inter;color:#cfd2da;margin-top:8px;letter-spacing:.08em;text-transform:uppercase}
+.rows{margin-top:24px}
+.row{display:grid;grid-template-columns:1fr 260px 1fr;align-items:center;height:64px;border-bottom:1px solid rgba(255,255,255,.08)}
+.row .v{font:800 38px "Barlow Condensed"}.row .v.l{text-align:right;padding-right:26px}.row .v.r{text-align:left;padding-left:26px}
+.row .v.win{color:var(--gold2)}
+.row .k{text-align:center;font:800 16px Inter;letter-spacing:.18em;color:var(--muted)}
+.tt .foot{position:absolute;left:0;right:0;bottom:56px;display:flex;justify-content:center;gap:40px;font:800 22px Inter;letter-spacing:.14em;color:#d8dbe2}
+.tt .foot b{color:var(--gold2)}
+.fc{position:absolute;right:60px;top:150px;width:640px;max-height:860px;background:var(--panel);border:1px solid var(--line);border-radius:18px;overflow:hidden;filter:drop-shadow(0 20px 50px rgba(0,0,0,.6))}
+.fc .top{padding:24px 28px 18px;background:linear-gradient(135deg,#1a1408,#0a0a0e);border-bottom:2px solid var(--gold)}
+.fc .top .e{font:800 italic 52px/1 "Barlow Condensed";text-transform:uppercase}
+.fc .top .d{font:700 16px Inter;letter-spacing:.16em;color:var(--gold2);margin-top:6px;text-transform:uppercase}
+.fc .sec{font:800 15px Inter;letter-spacing:.24em;color:var(--muted);padding:14px 28px 4px}
+.bout{display:grid;grid-template-columns:1fr 64px 1fr;align-items:center;padding:10px 28px;border-bottom:1px solid rgba(255,255,255,.06)}
+.bout .a,.bout .b{font:800 28px/1.05 "Barlow Condensed";text-transform:uppercase}
+.bout .b{text-align:right}
+.bout small{display:block;font:700 15px Inter;color:var(--muted);letter-spacing:.06em;text-transform:none;margin-top:3px}
+.bout .vs{text-align:center;font:800 16px Inter;color:var(--gold2)}
+.bout.now{background:linear-gradient(90deg,rgba(201,162,74,.22),transparent);border-left:5px solid var(--gold)}
+.bout.done{opacity:.55}.bout.cancelled{opacity:.35;text-decoration:line-through}
+.bout .res{display:block;font:800 14px Inter;color:#3DD68C;letter-spacing:.1em;margin-top:3px}
+.rs{position:absolute;left:50%;bottom:110px;transform:translateX(-50%);width:1240px;text-align:center}
+.rs .w{font:800 22px Inter;letter-spacing:.4em;color:var(--gold2)}
+.rs .box{margin-top:14px;background:var(--panel);border:2px solid var(--gold);border-radius:20px;padding:26px 40px 30px;position:relative;overflow:hidden;box-shadow:0 0 80px rgba(201,162,74,.25)}
+.rs .box::before{content:"";position:absolute;inset:0;background:linear-gradient(115deg,transparent 30%,rgba(233,200,120,.18) 50%,transparent 70%);transform:translateX(-100%);animation:shine 2.6s 1s ease-out infinite}
+@keyframes shine{to{transform:translateX(100%)}}
+.rs .n{font:800 italic 120px/0.95 "Barlow Condensed";text-transform:uppercase}
+.rs .how{font:800 46px "Barlow Condensed";color:var(--gold2);letter-spacing:.06em;margin-top:6px}
+.rs .chips{display:flex;justify-content:center;gap:14px;margin-top:18px}
+.rs .chip{font:800 18px Inter;letter-spacing:.1em;padding:9px 16px;border-radius:10px;background:#15151b;border:1px solid rgba(255,255,255,.12)}
+.rs .chip.g{border-color:var(--gold);color:var(--gold2)}
+.anim .lt{animation:ltIn .8s cubic-bezier(.2,.8,.2,1) both}.anim .lt .strip{animation:fadeUp .5s .6s both}
+@keyframes ltIn{from{transform:translateX(-120%);opacity:0}}
+@keyframes fadeUp{from{transform:translateY(20px);opacity:0}}
+.anim .tt{animation:fade .5s both}.anim .tt .ft.a{animation:slideL .7s .2s both}.anim .tt .ft.b{animation:slideR .7s .2s both}
+.anim .tt .row{animation:fadeUp .4s both}
+.anim .tt .row:nth-child(2){animation-delay:.1s}.anim .tt .row:nth-child(3){animation-delay:.2s}.anim .tt .row:nth-child(4){animation-delay:.3s}.anim .tt .row:nth-child(5){animation-delay:.4s}.anim .tt .row:nth-child(6){animation-delay:.5s}
+@keyframes slideL{from{transform:translateX(-80px);opacity:0}}
+@keyframes slideR{from{transform:translateX(80px);opacity:0}}
+@keyframes fade{from{opacity:0}}
+.anim .fc{animation:slideR .7s cubic-bezier(.2,.8,.2,1) both}
+.anim .rs{animation:pop .7s cubic-bezier(.2,1.4,.4,1) both}
+@keyframes pop{from{transform:translateX(-50%) scale(.6);opacity:0}}
+.anim .bug{animation:fade .6s both}
+</style></head>
+<body>
+<div class="ov" data-k="lt"><div class="bug"><div class="logo" style="background-image:url('__LOGO__')"></div><div><div class="t" data-ev></div><div class="s"><span class="live"><i></i>LIVE</span>&nbsp; <span data-fno></span></div></div></div>
+  <div class="lt" id="lt"><div class="corner"></div><div class="av" id="ltAv"></div><div class="main"><div class="tag" id="ltTag"></div><div class="name" id="ltName"></div><div class="meta" id="ltMeta"></div></div>
+  <div class="side" id="ltSide"><div class="o" id="ltOdds"></div><div class="l">ODDS</div></div><div class="strip" id="ltStrip"></div></div></div>
+<div class="ov" data-k="tt"><div class="tt"><div class="head"><div class="kick" id="ttKick"></div><div class="title" id="ttTitle"></div><div class="belt" id="ttBelt"></div></div>
+  <div class="fighters"><div class="ft a"><div class="av" id="ttAav"></div><div class="n" id="ttA"></div><div class="r" id="ttAr"></div><div class="rk" id="ttAk"></div></div>
+  <div class="rows" id="ttRows"></div>
+  <div class="ft b"><div class="av" id="ttBav"></div><div class="n" id="ttB"></div><div class="r" id="ttBr"></div><div class="rk" id="ttBk"></div></div></div>
+  <div class="foot" id="ttFoot"></div></div></div>
+<div class="ov" data-k="card"><div class="bug" style="left:48px;right:auto"><div class="logo" style="background-image:url('__LOGO__')"></div><div><div class="t" data-ev></div><div class="s"><span class="live"><i></i>LIVE</span></div></div></div>
+  <div class="fc"><div class="top"><div class="e" data-ev></div><div class="d" id="fcVenue"></div></div><div id="fcList"></div></div></div>
+<div class="ov" data-k="result"><div class="bug"><div class="logo" style="background-image:url('__LOGO__')"></div><div><div class="t" data-ev></div><div class="s"><span class="live"><i></i>LIVE</span>&nbsp; <span data-fno></span></div></div></div>
+  <div class="rs"><div class="w">★ WINNER ★</div><div class="box"><div class="n" id="rsName"></div><div class="how" id="rsHow"></div><div class="chips" id="rsChips"></div></div></div></div>
+<script>
+(function(){
+var only=new URLSearchParams(location.search).get('only');
+var cur=null,lastSig='',seenResult=null,popUntil=0,first=true;
+function $(id){return document.getElementById(id)}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]})}
+function bg(el,url){el.style.backgroundImage=url?'url("'+url+'")':'none'}
+function anim(){document.body.classList.remove('anim');void document.body.offsetWidth;document.body.classList.add('anim')}
+function showOv(k){document.querySelectorAll('.ov').forEach(function(o){o.classList.toggle('on',o.getAttribute('data-k')===k)})}
+function draw(d){
+  document.querySelectorAll('[data-ev]').forEach(function(e){e.textContent=d.event||''});
+  document.querySelectorAll('[data-fno]').forEach(function(e){e.textContent=d.total?('FIGHT '+d.fight_no+' OF '+d.total):''});
+  $('fcVenue').textContent=d.venue?('📍 '+d.venue):'';
+  var h='',sec='';
+  (d.card||[]).forEach(function(x){
+    if(x.sec!==sec){sec=x.sec;h+='<div class="sec">'+esc(sec)+'</div>'}
+    function side(n,r,o,won){return esc(n)+(won?'<span class="res">✓ '+esc(x.res)+'</span>':'<small>'+esc(r)+(o?' · '+esc(o):'')+'</small>')}
+    h+='<div class="bout'+(x.now?' now':'')+(x.done&&!x.now?' done':'')+(x.cancelled?' cancelled':'')+'"><div class="a">'+side(x.a,x.ar,x.oa,x.res_side==='a')+'</div><div class="vs">'+(x.now?'NOW':(x.done&&!x.res_side?esc(x.res):'VS'))+'</div><div class="b">'+side(x.b,x.br,x.ob,x.res_side==='b')+'</div></div>';
+  });
+  $('fcList').innerHTML=h;
+  var n=d.now; if(!n) return;
+  var A=d.swap?n.b:n.a,B=d.swap?n.a:n.b;
+  var blue=d.show==='lt-b',f=blue?B:A;
+  $('lt').classList.toggle('blue',blue);bg($('ltAv'),f.avatar);$('ltAv').style.display=f.avatar?'block':'none';
+  $('ltTag').textContent=(blue?'BLUE':'RED')+' CORNER'+(n.weight?' · '+n.weight:'')+(n.title?' · TITLE FIGHT':'');
+  $('ltName').textContent=f.name;
+  $('ltMeta').innerHTML='<span><b>'+esc(f.record)+'</b></span><span>'+esc(f.ranks)+'</span>'+(f.arch?'<span>'+esc(f.arch)+'</span>':'')+(f.streak?'<span>'+esc(f.streak)+' streak</span>':'');
+  $('ltOdds').textContent=f.odds;$('ltSide').style.display=f.odds?'flex':'none';
+  $('ltStrip').textContent=f.strip;$('ltStrip').style.display=f.strip?'flex':'none';
+  $('ttKick').textContent='UP NEXT'+(n.main?' · MAIN EVENT':n.label==='CO-MAIN EVENT'?' · CO-MAIN EVENT':'');
+  function last(nm){var p=nm.split(' ');return p[p.length-1]}
+  $('ttTitle').textContent=(d.event?d.event+': ':'')+last(A.name)+' vs '+last(B.name);
+  $('ttBelt').style.display=n.title?'inline-block':'none';$('ttBelt').textContent='★ '+(n.weight||'')+' TITLE ★';
+  bg($('ttAav'),A.avatar);bg($('ttBav'),B.avatar);
+  $('ttA').textContent=A.name;$('ttAr').textContent=A.record;$('ttAk').textContent=A.ranks;
+  $('ttB').textContent=B.name;$('ttBr').textContent=B.record;$('ttBk').textContent=B.ranks;
+  var rows=[['ODDS','odds','down'],['STREAK','streak',''],['FINISH RATE','finish','up'],['KO WINS','ko','up'],['STRIKE ACC.','acc','up'],['TAKEDOWNS','td','up']];
+  $('ttRows').innerHTML=rows.map(function(r){var va=A.tape[r[1]],vb=B.tape[r[1]],fa=parseFloat(va),fb=parseFloat(vb),ca='',cb='';
+    if(r[2]&&!isNaN(fa)&&!isNaN(fb)&&fa!==fb){if((fa>fb)===(r[2]==='up'))ca=' win';else cb=' win'}
+    return '<div class="row"><div class="v l'+ca+'">'+esc(va)+'</div><div class="k">'+r[0]+'</div><div class="v r'+cb+'">'+esc(vb)+'</div></div>'}).join('');
+  var foot=[];if(A.last)foot.push('LAST 3 &nbsp;<b>'+esc(A.last)+'</b>');if(n.h2h)foot.push('HEAD TO HEAD &nbsp;<b>'+esc(d.swap?n.h2h.split('-').reverse().join('-'):n.h2h)+'</b>');if(B.last)foot.push('LAST 3 &nbsp;<b>'+esc(B.last)+'</b>');
+  $('ttFoot').innerHTML=foot.join('<span>·</span>');
+  var r=n.result;
+  if(r){$('rsName').textContent=r.name;$('rsHow').textContent=r.how;$('rsChips').innerHTML=r.chips.map(function(c,i){return '<span class="chip'+(i!==1?' g':'')+'">'+esc(c)+'</span>'}).join('')}
+}
+var lastPair=null;
+function want(d){
+  if(only) return only;
+  var r=d.now&&d.now.result,pair=d.now?d.now.pair:'';
+  if(pair!==lastPair){lastPair=pair;seenResult=r?r.id:0;popUntil=0}
+  else if(r&&r.id!==seenResult){seenResult=r.id;if(d.auto)popUntil=Date.now()+20000}
+  if(Date.now()<popUntil) return 'result';
+  if(d.show==='result') return r?'result':'off';
+  if(d.show==='lt-a'||d.show==='lt-b') return 'lt';
+  return d.show;
+}
+function tick(){
+  fetch('/api/overlay/state',{cache:'no-store'}).then(function(r){return r.json()}).then(function(d){
+    if(!d||!d.ok) return;
+    draw(d);
+    var k=want(d),sig=k+'|'+(d.now?d.now.pair:'')+'|'+d.show+'|'+d.swap;
+    if(sig!==lastSig){lastSig=sig;showOv(k);anim()}
+  }).catch(function(){});
+}
+tick();setInterval(tick,1500);
+})();
+</script></body></html>"""
 
 
 # ============================================================
@@ -3719,10 +4218,10 @@ img{max-width:100%}
 .fstyle-booster .fhero-name{color:#FFE9FF;text-shadow:0 0 22px rgba(244,127,255,.4)}
 .ftheme-booster{--gold:#F47FFF;--gold2:#FFC2FF}
 .ftitle{display:inline-block;font-size:11px;font-weight:800;letter-spacing:.08em;color:#fff;background:linear-gradient(90deg,#B8202E,#0A2247);border:1px solid rgba(255,255,255,.55);border-radius:999px;padding:3px 11px;margin-left:6px;vertical-align:middle}
-/* Freedom 13: stars and stripes across the whole fighter box */
+/* Freedom 12: stars and stripes across the whole fighter box */
 .fstyle-freedom{background:linear-gradient(180deg,rgba(10,34,71,.93),rgba(10,34,71,.78) 70%,rgba(8,8,10,.95)),repeating-linear-gradient(180deg,#B8202E 0 26px,#F5F0E4 26px 52px);border-bottom:3px solid #B8202E;position:relative}
 .fstyle-freedom::before{content:"";position:absolute;inset:0 55% 0 0;background-image:radial-gradient(circle,#fff 0 1.3px,transparent 1.7px);background-size:24px 24px;opacity:.28;pointer-events:none}
-.fstyle-freedom::after{content:"★ FREEDOM 13 ★";position:absolute;right:max(16px,4vw);top:18px;font:800 12px Inter,system-ui,sans-serif;letter-spacing:.24em;color:#E9C878;pointer-events:none}
+.fstyle-freedom::after{content:"★ FREEDOM 12 ★";position:absolute;right:max(16px,4vw);top:18px;font:800 12px Inter,system-ui,sans-serif;letter-spacing:.24em;color:#E9C878;pointer-events:none}
 .fstyle-freedom .fhero-name{color:#fff;text-shadow:0 3px 0 #B8202E,0 10px 24px rgba(0,0,0,.5)}
 .fstyle-freedom .av-hero{box-shadow:0 0 0 3px #fff,0 0 0 7px #B8202E,0 0 0 10px #13336B}
 .ftheme-freedom{--gold:#E0414F;--gold2:#F5F0E4}
@@ -5971,9 +6470,11 @@ SITE_JS += ACCOUNT_JS
 SITE_JS += V2_JS
 SITE_JS += CARDS_JS
 SITE_JS += COMMENTARY_JS
+SITE_JS += OVERLAY_CTRL_JS
 SITE_JS += LIVE_TAPE_JS
 SITE_CSS += V2_CSS
 SITE_CSS += CARDS_CSS
+SITE_CSS += OVERLAY_CSS
 
 
 # ============================================================
@@ -6063,6 +6564,19 @@ def setup_web_tables(g):
             updated_by INTEGER,
             updated_at INTEGER,
             PRIMARY KEY(guild_id, card_id, pair)
+        )
+    """)
+    # Stream overlay: what the OBS overlay shows (one row per server)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS overlay_state (
+            guild_id INTEGER PRIMARY KEY,
+            card_id INTEGER,
+            pair TEXT,
+            show TEXT NOT NULL DEFAULT 'lt-a',
+            swap INTEGER NOT NULL DEFAULT 0,
+            auto INTEGER NOT NULL DEFAULT 1,
+            updated_by INTEGER,
+            updated_at INTEGER
         )
     """)
     db.execute("""
@@ -9067,6 +9581,58 @@ def add_page_routes(app, bot, g, serve, html_response):
         g["discipline_query"]("DELETE FROM commentary_titles WHERE guild_id = ? AND card_id = ? AND pair = ?", (gd.id, card_id, pair), write=True)
         return {"ok": True, "message": "No longer a title fight."}
 
+    async def overlay_page(request):
+        logo = ""
+        try:
+            logo = g["asset_url"](g["LOGO_FILE"]) if g.get("asset_url") else ""
+        except Exception:
+            pass
+        return web.Response(text=OVERLAY_PAGE.replace("__LOGO__", esc(logo or "")), content_type="text/html", charset="utf-8",
+                            headers={"Cache-Control": "no-store"})
+
+    async def overlay_api(request):
+        gd = guild()
+        if gd is None or not bot.is_ready():
+            return jres({"ok": False}, 503)
+        try:
+            data = await asyncio.to_thread(overlay_payload, Ctx(g, gd))
+        except Exception as error:
+            print(f"Overlay state failed: {error}")
+            return jres({"ok": False}, 500)
+        return jres(dict(data, ok=True))
+
+    @action_route(bot, g, need="commentary", bucket="overlay", limit=120, window=60)
+    async def overlay_set(viewer, body, request):
+        gd = guild()
+        ctx = Ctx(g, gd)
+        state = overlay_state(ctx)
+        card_id = _int(body.get("card_id"), 0) or state["card_id"]
+        if card_id and not ctx.q("SELECT id FROM card_notices WHERE guild_id = ? AND id = ?", (gd.id, card_id)):
+            raise ActionError("That card couldn't be found.")
+        pair = state["pair"] if card_id == state["card_id"] else ""
+        message = "Overlay updated"
+        if "pair" in body:
+            pair = str(body.get("pair") or "")
+            if pair and not re.fullmatch(r"\d+-\d+", pair):
+                raise ActionError("That fight couldn't be found.")
+            message = "Now showing this fight"
+        show = state["show"]
+        if "show" in body:
+            show = str(body.get("show") or "")
+            if show not in OVERLAY_SHOWS:
+                raise ActionError("Pick something to show.")
+            message = {"off": "Overlay hidden", "result": "Showing the result"}.get(show, "Showing on stream")
+        swap = bool(body["swap"]) if "swap" in body else state["swap"]
+        auto = bool(body["auto"]) if "auto" in body else state["auto"]
+        if "swap" in body:
+            message = "Corners swapped" if swap else "Corners back to normal"
+        if "auto" in body:
+            message = "Results will pop up by themselves" if auto else "Results only show when you press Result"
+        g["discipline_query"]("INSERT OR REPLACE INTO overlay_state (guild_id, card_id, pair, show, swap, auto, updated_by, updated_at) "
+                              "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                              (gd.id, card_id, pair, show, 1 if swap else 0, 1 if auto else 0, viewer.user_id, time.time_ns()), write=True)
+        return {"ok": True, "message": message}
+
     async def stats_page(request):
         return await personal(request, "Site stats", render_stats, "senior", "Site stats are for Head Moderators and above.")
 
@@ -9258,11 +9824,13 @@ def add_page_routes(app, bot, g, serve, html_response):
                           ("/records", records), ("/awards", awards), ("/week", week), ("/app", app_page), ("/offline", offline),
                           ("/manifest.webmanifest", manifest), ("/sw.js", service_worker), ("/icon.svg", icon_svg),
                           ("/icon-192.png", icon), ("/icon-512.png", icon), ("/api/home", home_panel), ("/api/staff/fight", staff_fight_info),
-                          ("/api/staff/notes", staff_notes_list), ("/commentary", commentary_page)):
+                          ("/api/staff/notes", staff_notes_list), ("/commentary", commentary_page),
+                          ("/overlay", overlay_page), ("/api/overlay/state", overlay_api)):
         app.router.add_get(path, handler)
     for path, handler in (("/api/tasks/claim", claim_tasks), ("/api/staff/fight", staff_fight), ("/api/staff/rank", staff_rank),
                           ("/api/staff/shop", staff_shop), ("/api/staff/notes", staff_notes_change),
-                          ("/api/commentary/note", commentary_note), ("/api/commentary/title", commentary_title)):
+                          ("/api/commentary/note", commentary_note), ("/api/commentary/title", commentary_title),
+                          ("/api/overlay/set", overlay_set)):
         app.router.add_post(path, handler)
 
 
@@ -9365,7 +9933,7 @@ def make_app(bot, g):
             response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
         try:
             if (request.method == "GET" and response.status == 200 and (response.content_type or "") == "text/html"
-                    and not request.path.startswith(("/api/", "/assets/", "/media/", "/auth/"))):
+                    and not request.path.startswith(("/api/", "/assets/", "/media/", "/auth/", "/overlay"))):
                 logged_in = SESSION_COOKIE in request.cookies
                 asyncio.get_running_loop().run_in_executor(None, record_view, g, request, logged_in)
                 if logged_in:
